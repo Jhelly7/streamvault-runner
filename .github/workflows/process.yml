@@ -1,0 +1,543 @@
+name: StreamVault Process
+
+# ── Secrets obrigatórios (Settings → Secrets → Actions) ───────────────────
+# CHACHA_KEY            — 32 bytes hex (mesmo do server.js)
+# CDN_DOMAIN            — ex: https://cdn.teudominio.com
+# TUNNEL_URL            — ex: https://tunnel.teudominio.com (porta 8080)
+# PIPELINE_API          — URL da API EdgeOne
+# ADMIN_API_KEY         — chave X-API-Key para PIPELINE_API
+# STORAGE_GITHUB_TOKEN  — PAT da conta storage (scope: repo)
+# STORAGE_GITHUB_OWNER  — username da conta storage
+# STORAGE_GITHUB_REPO   — repo da conta storage
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Job ID (tag da Release)'
+        required: true
+      video_url:
+        description: 'URL do vídeo (Modo A — runner descarrega)'
+        required: false
+        default: ''
+      seg_duration:
+        description: 'Duração segmento HLS (segundos)'
+        required: false
+        default: '4'
+      max_encode_height:
+        description: 'Altura máxima encode'
+        required: false
+        default: '720'
+      warm_concurrency:
+        description: 'Concorrência do warm'
+        required: false
+        default: '8'
+      metadata:
+        description: 'JSON: { contentId, title, description, type, year, lang }'
+        required: false
+        default: '{}'
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    env:
+      WORK_DIR:      /tmp/sv_work
+      CHACHA_KEY:    ${{ secrets.CHACHA_KEY }}
+      CDN_DOMAIN:    ${{ secrets.CDN_DOMAIN }}
+      TUNNEL_URL:    ${{ secrets.TUNNEL_URL }}
+      PIPELINE_API:  ${{ secrets.PIPELINE_API }}
+      ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+
+    steps:
+
+      # ── 0. Preparar dirs ───────────────────────────────────────────────────
+      - name: Preparar ambiente
+        run: |
+          mkdir -p $WORK_DIR/incoming $WORK_DIR/hls $WORK_DIR/thumbs
+          echo "JOB_ID=${{ inputs.job_id }}"             >> $GITHUB_ENV
+          echo "SEG_DURATION=${{ inputs.seg_duration }}" >> $GITHUB_ENV
+          echo "MAX_H=${{ inputs.max_encode_height }}"   >> $GITHUB_ENV
+          echo "WARM_C=${{ inputs.warm_concurrency }}"   >> $GITHUB_ENV
+
+      # ── 1. Instalar FFmpeg ─────────────────────────────────────────────────
+      - name: Instalar FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+
+      # ── 2. Instalar cryptography ───────────────────────────────────────────
+      - name: Instalar cryptography
+        run: pip install --quiet cryptography
+
+      # ── 3. Obter vídeo ─────────────────────────────────────────────────────
+      - name: '[Modo A] Descarregar vídeo via URL'
+        if: ${{ inputs.video_url != '' }}
+        run: |
+          curl -L --retry 3 --retry-delay 5 --progress-bar \
+            -o "$WORK_DIR/incoming/input.video" \
+            "${{ inputs.video_url }}"
+
+      - name: '[Modo B] Obter vídeo via Artifact'
+        if: ${{ inputs.video_url == '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: video-${{ inputs.job_id }}
+          path: ${{ env.WORK_DIR }}/incoming/
+
+      - name: Detectar ficheiro de vídeo
+        run: |
+          VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
+          VIDEO_PATH=""
+          for ext in $VIDEO_EXTS; do
+            FOUND=$(find "$WORK_DIR/incoming/" -maxdepth 1 -iname "*.${ext}" | head -1)
+            if [ -n "$FOUND" ]; then VIDEO_PATH="$FOUND"; break; fi
+          done
+          if [ -z "$VIDEO_PATH" ]; then
+            echo "ERRO: nenhum vídeo encontrado"; ls -la "$WORK_DIR/incoming/"; exit 1
+          fi
+          echo "VIDEO_PATH=$VIDEO_PATH" >> $GITHUB_ENV
+          echo "Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
+
+      # ── 4. Probe — fiel ao server.js probeVideo() ─────────────────────────
+      - name: Probe do vídeo
+        run: |
+          ffprobe -v quiet -print_format json \
+            -show_streams -show_format "$VIDEO_PATH" \
+            > "$WORK_DIR/probe.json"
+
+          python3 << 'PYEOF'
+          import json, os
+
+          d   = json.load(open(os.environ['WORK_DIR'] + '/probe.json'))
+          vs  = next((s for s in d['streams'] if s['codec_type'] == 'video'), {})
+          fmt = d['format']
+
+          # fps — fiel: r_frame_rate "num/den"
+          num, den = map(int, vs.get('r_frame_rate','24/1').split('/'))
+          fps = num / den if den else num
+
+          # codec_tag — fiel ao server.js
+          raw = vs.get('codec_tag_string','')
+          codec_tag = raw if (raw and '.' in raw) else 'avc1.640028'
+
+          probe = {
+            'duration': float(fmt.get('duration', 0)),
+            'width':    vs.get('width',  1920),
+            'height':   vs.get('height', 1080),
+            'codec':    vs.get('codec_name', 'h264'),
+            'codec_tag': codec_tag,
+            'fps':      fps,
+            'bitrate':  int(fmt.get('bit_rate', 0)),
+            'size':     int(fmt.get('size', 0)),
+          }
+          json.dump(probe, open(os.environ['WORK_DIR'] + '/probe_parsed.json','w'))
+
+          # effectiveHeight + willScale — fiel ao server.js
+          max_h      = int(os.environ['MAX_H'])
+          eff_h      = min(probe['height'], max_h)
+          will_scale = probe['height'] > max_h
+
+          # effectiveWidth — fiel ao server.js
+          if will_scale:
+            eff_w = round((probe['width'] / probe['height']) * eff_h / 2) * 2
+          else:
+            eff_w = probe['width']
+
+          # qualityLabel — fiel ao server.js detectQualityLabel()
+          h = eff_h
+          label = ('4k'    if h>=2160 else
+                   '1440p' if h>=1440 else
+                   '1080p' if h>=1080 else
+                   '720p'  if h>=720  else
+                   '480p'  if h>=480  else
+                   '360p'  if h>=360  else f'{h}p')
+
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"PROBE_DURATION={probe['duration']}\n")
+            f.write(f"PROBE_WIDTH={probe['width']}\n")
+            f.write(f"PROBE_HEIGHT={probe['height']}\n")
+            f.write(f"PROBE_CODEC={probe['codec']}\n")
+            f.write(f"PROBE_FPS={fps}\n")
+            f.write(f"PROBE_BITRATE={probe['bitrate']}\n")
+            f.write(f"EFF_HEIGHT={eff_h}\n")
+            f.write(f"EFF_WIDTH={eff_w}\n")
+            f.write(f"WILL_SCALE={'true' if will_scale else 'false'}\n")
+            f.write(f"QUALITY_LABEL={label}\n")
+
+          print(f"✓ {probe['width']}x{probe['height']} | {probe['codec']} | {fps:.2f}fps | {probe['duration']:.1f}s | {probe['bitrate']}bps")
+          print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale}")
+          PYEOF
+
+      # ── 5. HLS encode — fiel ao server.js encodeHLS() ────────────────────
+      - name: HLS encode (libx264 superfast CRF26 + AAC 128k)
+        run: |
+          HLS_DIR="$WORK_DIR/hls"
+          [ "$WILL_SCALE" = "true" ] && SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}" || SCALE_ARGS=""
+
+          ffmpeg -hide_banner -loglevel warning -stats \
+            -i "$VIDEO_PATH" \
+            $SCALE_ARGS \
+            -c:v libx264 -preset superfast -crf 26 -tune fastdecode \
+            -c:a aac -b:a 128k \
+            -f hls \
+            -hls_time ${SEG_DURATION} \
+            -hls_playlist_type vod \
+            -hls_segment_type mpegts \
+            -hls_flags independent_segments+split_by_time \
+            -hls_segment_filename "$HLS_DIR/seg%05d.ts" \
+            -y "$HLS_DIR/index.m3u8"
+
+          echo "✓ $(ls $HLS_DIR/*.ts | wc -l) segmentos .ts gerados"
+
+      # ── 6. Thumbnails — fiel ao server.js extractThumbnails() ─────────────
+      - name: Extrair thumbnails
+        run: |
+          python3 << 'PYEOF'
+          import subprocess, os, json
+
+          duration  = float(os.environ['PROBE_DURATION'])
+          video     = os.environ['VIDEO_PATH']
+          thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
+
+          # fiel ao server.js
+          if duration > 120:
+            times = [duration * p for p in [0.05, 0.2, 0.4, 0.6, 0.8, 0.95]]
+          else:
+            times = [min(5, duration * 0.5)]
+
+          thumbs = []
+          for i, t in enumerate(times):
+            out = f"{thumb_dir}/thumb_{i}.jpg"
+            r = subprocess.run([
+              'ffmpeg', '-hide_banner', '-loglevel', 'error',
+              '-ss', f'{t:.2f}', '-i', video,
+              '-vframes', '1', '-vf', 'scale=1280:-2',
+              '-q:v', '3', '-y', out,
+            ], capture_output=True)
+            if r.returncode == 0:
+              thumbs.append({'path': out, 'time': t, 'index': i})
+              print(f"  thumb_{i}.jpg @ {t:.1f}s")
+            else:
+              print(f"  ⚠ thumb_{i} falhou")
+
+          json.dump(thumbs, open(os.environ['WORK_DIR'] + '/thumbs_manifest.json','w'))
+          print(f"✓ {len(thumbs)} thumbnails")
+          PYEOF
+
+      # ── 7. ChaCha20-Poly1305 — fiel ao server.js encryptChaCha20() ────────
+      # Formato: nonce(12) + authTag(16) + ciphertext
+      - name: Encriptar segmentos .ts → .bin
+        run: |
+          python3 << 'PYEOF'
+          import os, json, secrets
+          from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+          key_hex = os.environ['CHACHA_KEY']
+          if len(key_hex) != 64:
+            raise ValueError('CHACHA_KEY inválido')
+
+          key    = bytes.fromhex(key_hex)
+          chacha = ChaCha20Poly1305(key)
+          hls_dir= os.environ['WORK_DIR'] + '/hls'
+
+          seg_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.ts'))
+          if not seg_files:
+            raise RuntimeError('Nenhum .ts encontrado')
+
+          nonce_map = {}
+          for fname in seg_files:
+            src      = os.path.join(hls_dir, fname)
+            bin_name = fname.replace('.ts', '.bin')
+            dst      = os.path.join(hls_dir, bin_name)
+            nonce    = secrets.token_bytes(12)
+
+            with open(src, 'rb') as f:
+              data = f.read()
+
+            # fiel ao server.js: nonce(12) + tag(16) + ciphertext
+            ct_tag     = chacha.encrypt(nonce, data, None)
+            ciphertext = ct_tag[:-16]
+            auth_tag   = ct_tag[-16:]
+
+            with open(dst, 'wb') as f:
+              f.write(nonce + auth_tag + ciphertext)
+
+            os.remove(src)
+            nonce_map[bin_name] = nonce.hex()
+            print(f"  {fname} → {bin_name}")
+
+          # nonces.json — fiel ao server.js
+          key_hex = os.environ['CHACHA_KEY']
+          out = {'key_id': key_hex[:8], 'nonces': nonce_map}
+          json.dump(out, open(os.environ['WORK_DIR'] + '/nonces.json','w'))
+          print(f"✓ {len(nonce_map)} segmentos encriptados")
+          PYEOF
+
+      # ── 8. Reescrever index.m3u8 — fiel ao server.js ──────────────────────
+      # seg00001.ts → CDN_DOMAIN/jobId/hls/quality/seg00001.bin
+      - name: Reescrever index.m3u8 com URLs CDN
+        run: |
+          python3 << 'PYEOF'
+          import re, os
+
+          hls_dir  = os.environ['WORK_DIR'] + '/hls'
+          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
+          job_id   = os.environ['JOB_ID']
+          quality  = os.environ['QUALITY_LABEL']
+
+          with open(hls_dir + '/index.m3u8') as f:
+            content = f.read()
+
+          # fiel ao server.js regex
+          content = re.sub(
+            r'^(seg\d+)\.ts$',
+            lambda m: f"{cdn_base}/{job_id}/hls/{quality}/{m.group(1)}.bin",
+            content, flags=re.MULTILINE
+          )
+
+          with open(hls_dir + '/index.m3u8', 'w') as f:
+            f.write(content)
+
+          print(f"✓ index.m3u8 → {cdn_base}/{job_id}/hls/{quality}/")
+          PYEOF
+
+      # ── 9. Gerar master.m3u8 — fiel ao server.js ──────────────────────────
+      - name: Gerar master.m3u8
+        run: |
+          mkdir -p "$WORK_DIR/hls_root"
+          python3 << 'PYEOF'
+          import os
+
+          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
+          job_id   = os.environ['JOB_ID']
+          quality  = os.environ['QUALITY_LABEL']
+          bitrate  = os.environ['PROBE_BITRATE'] or '4000000'
+          eff_w    = os.environ['EFF_WIDTH']
+          eff_h    = os.environ['EFF_HEIGHT']
+
+          # fiel ao server.js
+          master = '\n'.join([
+            '#EXTM3U',
+            '#EXT-X-VERSION:3',
+            '',
+            f'#EXT-X-STREAM-INF:BANDWIDTH={bitrate},RESOLUTION={eff_w}x{eff_h},CODECS="avc1.640028,mp4a.40.2"',
+            f'{cdn_base}/{job_id}/hls/{quality}/index.m3u8',
+          ])
+
+          with open(os.environ['WORK_DIR'] + '/master.m3u8', 'w') as f:
+            f.write(master)
+
+          print(f"✓ master.m3u8: {eff_w}x{eff_h} | {bitrate}bps")
+          PYEOF
+
+      # ── 10. Criar Release e upload assets ─────────────────────────────────
+      - name: Criar Release no repo de storage
+        env:
+          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
+          STORAGE_REPO:  ${{ secrets.STORAGE_GITHUB_REPO }}
+        run: |
+          TITLE=$(echo '${{ inputs.metadata }}' | python3 -c "
+          import json,sys
+          try: print(json.load(sys.stdin).get('title','Untitled'))
+          except: print('Untitled')
+          ")
+
+          RESPONSE=$(curl -sf -X POST \
+            -H "Authorization: Bearer $STORAGE_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$STORAGE_OWNER/$STORAGE_REPO/releases" \
+            -d "{
+              \"tag_name\": \"${JOB_ID}\",
+              \"name\": \"${TITLE}\",
+              \"body\": \"jobId=${JOB_ID} | quality=${QUALITY_LABEL}\",
+              \"draft\": false,
+              \"prerelease\": false
+            }")
+
+          UPLOAD_URL=$(echo "$RESPONSE" | python3 -c "
+          import json,sys; print(json.load(sys.stdin)['upload_url'].split('{')[0])
+          ")
+          echo "UPLOAD_URL=$UPLOAD_URL" >> $GITHUB_ENV
+          echo "✓ Release criada: tag=${JOB_ID}"
+
+      - name: Upload assets para a Release
+        env:
+          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
+        run: |
+          upload() {
+            local FILE="$1" NAME="$2" MIME="$3"
+            echo "  → $NAME ($(du -sh "$FILE" | cut -f1))"
+            HTTP=$(curl -sf -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $STORAGE_TOKEN" \
+              -H "Content-Type: $MIME" \
+              "${UPLOAD_URL}?name=${NAME}" \
+              --data-binary "@$FILE")
+            [ "$HTTP" = "201" ] || echo "  ⚠ HTTP $HTTP: $NAME"
+          }
+
+          upload "$WORK_DIR/master.m3u8"     "master.m3u8"  "application/vnd.apple.mpegurl"
+          upload "$WORK_DIR/hls/index.m3u8"  "index.m3u8"   "application/vnd.apple.mpegurl"
+          upload "$WORK_DIR/nonces.json"      "nonces.json"  "application/json"
+
+          for BIN in $(ls $WORK_DIR/hls/*.bin | sort); do
+            upload "$BIN" "$(basename $BIN)" "application/octet-stream"
+          done
+
+          for THUMB in $(ls $WORK_DIR/thumbs/*.jpg 2>/dev/null | sort); do
+            upload "$THUMB" "$(basename $THUMB)" "image/jpeg"
+          done
+
+          echo "✓ Upload completo"
+
+      # ── 11. Warm — fiel ao server.js warmDirect() 2 passagens ────────────
+      # Tunnel (porta 8080) serve os assets — CDN cacheia — warm confirma HITs
+      - name: Aquecer Cloudflare Cache (warmDirect)
+        run: |
+          python3 << 'PYEOF'
+          import os, json, asyncio, urllib.request
+
+          cdn_base  = os.environ['CDN_DOMAIN'].rstrip('/')
+          job_id    = os.environ['JOB_ID']
+          quality   = os.environ['QUALITY_LABEL']
+          warm_c    = int(os.environ['WARM_C'])
+          work_dir  = os.environ['WORK_DIR']
+
+          nonces = json.load(open(work_dir + '/nonces.json'))
+          thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
+
+          # Fiel ao server.js — mesma lista de cdnUrls
+          cdn_urls = (
+            [f"{cdn_base}/{job_id}/hls/master.m3u8",
+             f"{cdn_base}/{job_id}/nonces.json",
+             f"{cdn_base}/{job_id}/hls/{quality}/index.m3u8"] +
+            [f"{cdn_base}/{job_id}/hls/{quality}/{bn}" for bn in nonces['nonces']] +
+            [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
+          )
+
+          import concurrent.futures, urllib.request as ur
+
+          def fetch_url(url):
+            try:
+              req = ur.Request(url, headers={'Cache-Control': 'no-cache'})
+              with ur.urlopen(req, timeout=120) as r:
+                cf_status = r.headers.get('cf-cache-status','UNKNOWN')
+                r.read()
+                return {'url': url, 'status': cf_status, 'http': r.status}
+            except Exception as e:
+              return {'url': url, 'status': 'ERROR', 'error': str(e)}
+
+          def warm_pass(urls, label):
+            hits=0; misses=0; errors=0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=warm_c) as ex:
+              results = list(ex.map(fetch_url, urls))
+            for r in results:
+              if r['status'] == 'ERROR': errors += 1
+              elif r['status'] == 'HIT': hits += 1
+              else: misses += 1
+            print(f"✓ {label}: {misses} buscadas da origem | {hits} HITs | {errors} erros")
+            return hits, misses, errors
+
+          print(f"Aquecendo {len(cdn_urls)} URLs (concorrência {warm_c})...")
+          hits1, misses1, errors1 = warm_pass(cdn_urls, '1ª passagem')
+
+          if errors1 == len(cdn_urls):
+            print("⚠ Todas as URLs falharam — verifica se o tunnel está activo")
+          else:
+            import time; time.sleep(5)
+            hits2, misses2, errors2 = warm_pass(cdn_urls, '2ª passagem')
+            if hits2 < len(cdn_urls):
+              print(f"⚠ {len(cdn_urls) - hits2} URLs sem HIT")
+
+          # Guardar cdn_urls para o registo
+          json.dump(cdn_urls, open(work_dir + '/cdn_urls.json','w'))
+          PYEOF
+
+      # ── 12. Registar no EdgeOne — fiel ao server.js registerInKV() ────────
+      - name: Registar no EdgeOne (Turso + KV)
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request, urllib.error, datetime
+
+          pipeline_api = os.environ.get('PIPELINE_API','').rstrip('/')
+          if not pipeline_api:
+            print('⚠ PIPELINE_API não configurado — ignorado'); exit(0)
+
+          work_dir  = os.environ['WORK_DIR']
+          cdn_base  = os.environ['CDN_DOMAIN'].rstrip('/')
+          job_id    = os.environ['JOB_ID']
+          quality   = os.environ['QUALITY_LABEL']
+          seg_dur   = int(os.environ['SEG_DURATION'])
+          eff_w     = int(os.environ['EFF_WIDTH'])
+          eff_h     = int(os.environ['EFF_HEIGHT'])
+
+          try:    metadata = json.loads(os.environ.get('METADATA','{}'))
+          except: metadata = {}
+
+          probe    = json.load(open(work_dir + '/probe_parsed.json'))
+          nonces   = json.load(open(work_dir + '/nonces.json'))
+          thumbs   = json.load(open(work_dir + '/thumbs_manifest.json'))
+          cdn_urls = json.load(open(work_dir + '/cdn_urls.json'))
+
+          content_id = metadata.get('contentId', job_id)
+          seg_count  = len(nonces['nonces'])
+          # URLs CDN usam job_id — tag da Release onde os assets residem.
+          # content_id e apenas o identificador no Turso/KV; pode diferir do job_id.
+          thumb_urls = [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
+
+          # fiel ao server.js registerInKV — mesmo body
+          body = {
+            'contentId':    content_id,
+            'title':        metadata.get('title','Untitled'),
+            'description':  metadata.get('description',''),
+            'type':         metadata.get('type','movie'),
+            'year':         int(metadata.get('year') or datetime.datetime.now().year),
+            'lang':         metadata.get('lang','en'),
+            'duration':     round(probe['duration']),
+            'thumbnail':    thumb_urls[0] if thumb_urls else '',
+            'thumbnails':   thumb_urls,
+            'qualities':    [quality],
+            'width':        eff_w,
+            'height':       eff_h,
+            'codec':        probe['codec'],
+            'fps':          probe['fps'],
+            'bitrate':      probe['bitrate'],
+            'segmentCount': seg_count,
+            'segDuration':  seg_dur,
+            'videoID':      content_id,
+            'cdnUrls':      cdn_urls,
+            'encrypted':    True,
+            'encryption':   'chacha20-poly1305',
+            'segExt':       'bin',
+            'masterUrl':    f"{cdn_base}/{job_id}/hls/master.m3u8",
+            'noncesUrl':    f"{cdn_base}/{job_id}/nonces.json",
+          }
+
+          req = urllib.request.Request(
+            f"{pipeline_api}/api/pipeline/register",
+            data=json.dumps(body).encode(),
+            headers={
+              'Content-Type': 'application/json',
+              'X-API-Key':    os.environ.get('ADMIN_API_KEY',''),
+            },
+            method='POST'
+          )
+          try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+              print(f"✓ Conteúdo registado ({r.status})")
+          except urllib.error.HTTPError as e:
+            print(f"⚠ Registo falhou ({e.code}): {e.read().decode()[:200]}")
+          except Exception as e:
+            print(f"⚠ Registo falhou: {e}")
+          PYEOF
+        env:
+          METADATA: ${{ inputs.metadata }}
+
+      # ── 13. Cleanup — fiel ao server.js ───────────────────────────────────
+      - name: Cleanup
+        if: always()
+        run: rm -rf "$WORK_DIR" && echo "✓ Workspace limpo"
