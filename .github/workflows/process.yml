@@ -394,12 +394,47 @@ jobs:
 
           echo "✓ Upload completo"
 
-      # ── 11. Warm — fiel ao server.js warmDirect() 2 passagens ────────────
-      # Tunnel (porta 8080) serve os assets — CDN cacheia — warm confirma HITs
-      - name: Aquecer Cloudflare Cache (warmDirect)
+      # ── 11. Ligar Cloudflare Tunnel ──────────────────────────────────────
+      # O tunnel expõe /tmp/sv_work em cdn.pixgo.qzz.io durante o warm.
+      # O Cloudflare cacheia os assets a partir do runner (us-east).
+      # Após o warm o tunnel é desligado — os assets ficam em cache 1 ano.
+      - name: Ligar Cloudflare Tunnel
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          # Instalar cloudflared
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64             -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+          # Servir o directório PAI do WORK_DIR na porta 8080
+          # cdn.pixgo.qzz.io/{jobId}/hls/... → /tmp/sv_work/{jobId}/hls/...
+          # O tunnel aponta para localhost:8080/{jobId}/...
+          SERVE_DIR=$(dirname "$WORK_DIR")
+          python3 -m http.server 8080 --directory "$SERVE_DIR" &
+          echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
+          sleep 2
+
+          # Ligar tunnel em background
+          cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" &
+          echo "TUNNEL_PID=$!" >> $GITHUB_ENV
+
+          # Aguardar tunnel ficar activo
+          echo "Aguardando tunnel..."
+          for i in $(seq 1 15); do
+            STATUS=$(curl -sf -o /dev/null -w "%{http_code}"               "https://cdn.pixgo.qzz.io/${JOB_ID}/nonces.json" || echo "000")
+            if [ "$STATUS" = "200" ] || [ "$STATUS" = "404" ]; then
+              echo "✓ Tunnel activo (HTTP $STATUS)"
+              break
+            fi
+            echo "  aguardando... ($i/15)"
+            sleep 2
+          done
+
+      # ── 12. Warm — via tunnel → Cloudflare cacheia ───────────────────────
+      - name: Aquecer Cloudflare Cache (via tunnel)
         run: |
           python3 << 'PYEOF'
-          import os, json, asyncio, urllib.request
+          import os, json, concurrent.futures, urllib.request as ur, time
 
           cdn_base  = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id    = os.environ['JOB_ID']
@@ -410,7 +445,7 @@ jobs:
           nonces = json.load(open(work_dir + '/nonces.json'))
           thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
 
-          # Fiel ao server.js — mesma lista de cdnUrls
+          # Lista completa de CDN URLs — tunnel serve, Cloudflare cacheia
           cdn_urls = (
             [f"{cdn_base}/{job_id}/hls/master.m3u8",
              f"{cdn_base}/{job_id}/nonces.json",
@@ -419,15 +454,13 @@ jobs:
             [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
           )
 
-          import concurrent.futures, urllib.request as ur
-
           def fetch_url(url):
             try:
               req = ur.Request(url, headers={'Cache-Control': 'no-cache'})
               with ur.urlopen(req, timeout=120) as r:
-                cf_status = r.headers.get('cf-cache-status','UNKNOWN')
+                cf = r.headers.get('cf-cache-status','UNKNOWN')
                 r.read()
-                return {'url': url, 'status': cf_status, 'http': r.status}
+                return {'url': url, 'status': cf, 'http': r.status}
             except Exception as e:
               return {'url': url, 'status': 'ERROR', 'error': str(e)}
 
@@ -442,22 +475,32 @@ jobs:
             print(f"✓ {label}: {misses} buscadas da origem | {hits} HITs | {errors} erros")
             return hits, misses, errors
 
-          print(f"Aquecendo {len(cdn_urls)} URLs (concorrência {warm_c})...")
+          print(f"Aquecendo {len(cdn_urls)} URLs via tunnel (concorrência {warm_c})...")
           hits1, misses1, errors1 = warm_pass(cdn_urls, '1ª passagem')
 
           if errors1 == len(cdn_urls):
-            print("⚠ Todas as URLs falharam — verifica se o tunnel está activo")
+            print("⚠ Todas as URLs falharam — tunnel não está activo")
           else:
-            import time; time.sleep(5)
+            time.sleep(5)
             hits2, misses2, errors2 = warm_pass(cdn_urls, '2ª passagem')
             if hits2 < len(cdn_urls):
               print(f"⚠ {len(cdn_urls) - hits2} URLs sem HIT")
+            else:
+              print(f"✅ Cache aquecido com sucesso — {hits2} HITs confirmados")
 
           # Guardar cdn_urls para o registo
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json','w'))
           PYEOF
 
-      # ── 12. Registar no EdgeOne — fiel ao server.js registerInKV() ────────
+      # ── 13. Desligar tunnel ───────────────────────────────────────────────
+      - name: Desligar Cloudflare Tunnel
+        if: always()
+        run: |
+          [ -n "$TUNNEL_PID" ]      && kill "$TUNNEL_PID"      2>/dev/null || true
+          [ -n "$HTTP_SERVER_PID" ] && kill "$HTTP_SERVER_PID" 2>/dev/null || true
+          echo "✓ Tunnel e servidor HTTP desligados" 
+
+      # ── 14. Registar no EdgeOne — fiel ao server.js registerInKV() ────────
       - name: Registar no EdgeOne (Turso + KV)
         run: |
           python3 << 'PYEOF'
@@ -537,7 +580,7 @@ jobs:
         env:
           METADATA: ${{ inputs.metadata }}
 
-      # ── 13. Cleanup — fiel ao server.js ───────────────────────────────────
+      # ── 15. Cleanup — fiel ao server.js ───────────────────────────────────
       - name: Cleanup
         if: always()
         run: rm -rf "$WORK_DIR" && echo "✓ Workspace limpo"
