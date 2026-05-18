@@ -52,14 +52,31 @@ jobs:
 
     steps:
 
-      # ── 0. Preparar dirs ───────────────────────────────────────────────────
+      # ── 0. Preparar dirs + ligar tunnel antecipadamente ──────────────────
       - name: Preparar ambiente
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
           mkdir -p $WORK_DIR/incoming $WORK_DIR/hls $WORK_DIR/thumbs
           echo "JOB_ID=${{ inputs.job_id }}"             >> $GITHUB_ENV
           echo "SEG_DURATION=${{ inputs.seg_duration }}" >> $GITHUB_ENV
           echo "MAX_H=${{ inputs.max_encode_height }}"   >> $GITHUB_ENV
           echo "WARM_C=${{ inputs.warm_concurrency }}"   >> $GITHUB_ENV
+
+          # Instalar cloudflared e ligar tunnel já aqui
+          # O tunnel fica activo durante todo o job (~3-4 min antes do warm)
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64             -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+          # Servidor HTTP na porta 8080 — serve WORK_DIR pai
+          SERVE_DIR=$(dirname "$WORK_DIR")
+          python3 -m http.server 8080 --directory "$SERVE_DIR" &
+          echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
+
+          # Ligar tunnel em background
+          cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" &
+          echo "TUNNEL_PID=$!" >> $GITHUB_ENV
+          echo "✓ Tunnel iniciado em background — ficará activo durante todo o job" 
 
       # ── 1. Instalar FFmpeg ─────────────────────────────────────────────────
       - name: Instalar FFmpeg
@@ -394,45 +411,40 @@ jobs:
 
           echo "✓ Upload completo"
 
-      # ── 11. Ligar Cloudflare Tunnel ──────────────────────────────────────
-      # O tunnel expõe /tmp/sv_work em cdn.pixgo.qzz.io durante o warm.
-      # O Cloudflare cacheia os assets a partir do runner (us-east).
-      # Após o warm o tunnel é desligado — os assets ficam em cache 1 ano.
-      - name: Ligar Cloudflare Tunnel
-        env:
-          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      # ── 11. Verificar tunnel activo ──────────────────────────────────────
+      # O tunnel foi iniciado no Step 0 — aqui só confirmamos que está activo
+      # e a servir os ficheiros correctamente antes do warm.
+      - name: Verificar tunnel activo
         run: |
-          # Instalar cloudflared
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64             -o /usr/local/bin/cloudflared
-          chmod +x /usr/local/bin/cloudflared
-
-          # Servir o directório PAI do WORK_DIR na porta 8080
-          # cdn.pixgo.qzz.io/{jobId}/hls/... → /tmp/sv_work/{jobId}/hls/...
-          # O tunnel aponta para localhost:8080/{jobId}/...
-          SERVE_DIR=$(dirname "$WORK_DIR")
-          python3 -m http.server 8080 --directory "$SERVE_DIR" &
-          echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
-          sleep 2
-
-          # Ligar tunnel em background
-          cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" &
-          echo "TUNNEL_PID=$!" >> $GITHUB_ENV
-
-          # Aguardar tunnel ficar activo
-          echo "Aguardando tunnel..."
-          for i in $(seq 1 15); do
-            STATUS=$(curl -sf -o /dev/null -w "%{http_code}"               "https://cdn.pixgo.qzz.io/${JOB_ID}/nonces.json" || echo "000")
-            if [ "$STATUS" = "200" ] || [ "$STATUS" = "404" ]; then
-              echo "✓ Tunnel activo (HTTP $STATUS)"
+          echo "Verificando tunnel (iniciado há ~3-4 min)..."
+          TUNNEL_READY=0
+          for i in $(seq 1 20); do
+            BODY=$(curl -sf --max-time 5 \
+              "https://cdn.pixgo.qzz.io/${JOB_ID}/nonces.json" 2>/dev/null || echo "")
+            if echo "$BODY" | grep -q "key_id"; then
+              echo "✓ Tunnel activo e a servir ficheiros reais"
+              TUNNEL_READY=1
               break
             fi
-            echo "  aguardando... ($i/15)"
-            sleep 2
+            echo "  aguardando... ($i/20)"
+            sleep 3
           done
+          if [ "$TUNNEL_READY" = "0" ]; then
+            echo "⚠ Tunnel não está a servir ficheiros após 60s"
+            exit 1
+          fi
 
       # ── 12. Warm — via tunnel → Cloudflare cacheia ───────────────────────
       - name: Aquecer Cloudflare Cache (via tunnel)
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ZONE_ID:   ${{ secrets.CLOUDFLARE_ZONE_ID }}
         run: |
+          # Purgar cache do job anterior se existir (opcional — ignora erro)
+          if [ -n "$CF_API_TOKEN" ] && [ -n "$CF_ZONE_ID" ]; then
+            curl -sf -X POST               "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/purge_cache"               -H "Authorization: Bearer $CF_API_TOKEN"               -H "Content-Type: application/json"               --data "{"prefixes":["cdn.pixgo.qzz.io/$JOB_ID"]}"               > /dev/null && echo "✓ Cache purgado" || echo "⚠ Purge ignorado"
+          fi
+
           python3 << 'PYEOF'
           import os, json, concurrent.futures, urllib.request as ur, time
 
