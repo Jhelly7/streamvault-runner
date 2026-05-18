@@ -435,16 +435,13 @@ jobs:
           fi
 
       # ── 12. Warm — via tunnel → Cloudflare cacheia ───────────────────────
-      - name: Aquecer Cloudflare Cache (via tunnel)
-        env:
-          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ZONE_ID:   ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      # ── 12. Warm — GET simples ao CDN (Worker tenta tunnel primeiro) ──────
+      # Fiel ao server.js warmDirect() — GET simples às URLs CDN.
+      # O Worker v3.0 tenta o tunnel antes da Release:
+      #   MISS → Worker → tunnel activo (runner) → cacheia na edge ✅
+      #   MISS → Worker → tunnel inactivo → Release (fallback) ✅
+      - name: Aquecer Cloudflare Cache
         run: |
-          # Purgar cache do job anterior se existir (opcional — ignora erro)
-          if [ -n "$CF_API_TOKEN" ] && [ -n "$CF_ZONE_ID" ]; then
-            curl -sf -X POST               "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/purge_cache"               -H "Authorization: Bearer $CF_API_TOKEN"               -H "Content-Type: application/json"               --data "{"prefixes":["cdn.pixgo.qzz.io/$JOB_ID"]}"               > /dev/null && echo "✓ Cache purgado" || echo "⚠ Purge ignorado"
-          fi
-
           python3 << 'PYEOF'
           import os, json, concurrent.futures, urllib.request as ur, time
 
@@ -457,7 +454,7 @@ jobs:
           nonces = json.load(open(work_dir + '/nonces.json'))
           thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
 
-          # Lista completa de CDN URLs — tunnel serve, Cloudflare cacheia
+          # Lista completa de CDN URLs — fiel ao server.js
           cdn_urls = (
             [f"{cdn_base}/{job_id}/hls/master.m3u8",
              f"{cdn_base}/{job_id}/nonces.json",
@@ -487,18 +484,18 @@ jobs:
             print(f"✓ {label}: {misses} buscadas da origem | {hits} HITs | {errors} erros")
             return hits, misses, errors
 
-          print(f"Aquecendo {len(cdn_urls)} URLs via tunnel (concorrência {warm_c})...")
+          print(f"Aquecendo {len(cdn_urls)} URLs (concorrência {warm_c})...")
           hits1, misses1, errors1 = warm_pass(cdn_urls, '1ª passagem')
 
           if errors1 == len(cdn_urls):
-            print("⚠ Todas as URLs falharam — tunnel não está activo")
+            print("⚠ Todas as URLs falharam")
           else:
             time.sleep(5)
             hits2, misses2, errors2 = warm_pass(cdn_urls, '2ª passagem')
             if hits2 < len(cdn_urls):
               print(f"⚠ {len(cdn_urls) - hits2} URLs sem HIT")
             else:
-              print(f"✅ Cache aquecido com sucesso — {hits2} HITs confirmados")
+              print(f"✅ Cache aquecido — {hits2}/{len(cdn_urls)} HITs confirmados")
 
           # Guardar cdn_urls para o registo
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json','w'))
