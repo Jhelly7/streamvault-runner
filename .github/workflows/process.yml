@@ -43,7 +43,7 @@ jobs:
     timeout-minutes: 340
 
     env:
-      WORK_DIR:      /tmp/sv_work
+      WORK_DIR:      /tmp/sv_work/${{ inputs.job_id }}
       CHACHA_KEY:    ${{ secrets.CHACHA_KEY }}
       CDN_DOMAIN:    ${{ secrets.CDN_DOMAIN }}
       TUNNEL_URL:    ${{ secrets.TUNNEL_URL }}
@@ -68,9 +68,11 @@ jobs:
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
 
-          # Servidor HTTP na porta 8080 — serve WORK_DIR pai
-          SERVE_DIR=$(dirname "$WORK_DIR")
-          python3 -m http.server 8080 --directory "$SERVE_DIR" &
+          # Servidor HTTP na porta 8080
+          # WORK_DIR=/tmp/sv_work/{jobId}
+          # serve o directório PAI para que /{jobId}/hls/... resolva correctamente
+          # tunnel.pixgo.qzz.io/{jobId}/hls/seg.bin → /tmp/sv_work/{jobId}/hls/seg.bin ✅
+          python3 -m http.server 8080 --directory "$(dirname $WORK_DIR)" &
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
 
           # Ligar tunnel em background
