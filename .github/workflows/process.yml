@@ -2,7 +2,7 @@ name: StreamVault Process
 
 # ── Secrets obrigatórios (Settings → Secrets → Actions) ───────────────────
 # CHACHA_KEY            — 32 bytes hex (mesmo do server.js)
-# CDN_DOMAIN            — ex: https://cdn.teudominio.com
+# CDN_DOMAIN            — ex: https://cdn.pixgo.qzz.io
 # PIPELINE_API          — URL da API EdgeOne
 # ADMIN_API_KEY         — chave X-API-Key para PIPELINE_API
 # STORAGE_GITHUB_TOKEN  — PAT da conta storage (scope: repo)
@@ -64,14 +64,13 @@ jobs:
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
 
-          SERVE_DIR="$(dirname $WORK_DIR)"
-          export SERVE_DIR
+          # Servidor HTTP serve /tmp/sv_work — o job_id cria o subpath correto
+          # ex: /tmp/sv_work/{job_id}/hls/*.bin → cdn/{job_id}/hls/*.bin
           python3 - << 'PYEOF' &
           import http.server, os
-          serve_dir = os.environ.get('SERVE_DIR', '/tmp/sv_work')
           class CacheHandler(http.server.SimpleHTTPRequestHandler):
             def __init__(self, *a, **kw):
-              super().__init__(*a, directory=serve_dir, **kw)
+              super().__init__(*a, directory='/tmp/sv_work', **kw)
             def end_headers(self):
               self.send_header('Cache-Control', 'public, max-age=31536000, immutable')
               self.send_header('Access-Control-Allow-Origin', '*')
@@ -81,10 +80,33 @@ jobs:
           PYEOF
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
 
-          cloudflared tunnel --no-autoupdate run \
-            --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" &
+          # Config com ingress rule — token trata das credentials
+          mkdir -p ~/.cloudflared
+          CDN_HOST=$(echo "${{ secrets.CDN_DOMAIN }}" | sed 's|https\?://||')
+          cat > ~/.cloudflared/config.yml << EOF
+          ingress:
+            - hostname: ${CDN_HOST}
+              service: http://localhost:8080
+            - service: http_status:404
+          EOF
+
+          cloudflared tunnel --no-autoupdate \
+            --config ~/.cloudflared/config.yml \
+            run --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" &
           echo "TUNNEL_PID=$!" >> $GITHUB_ENV
-          echo "✓ Servidor HTTP + tunnel iniciados em background"
+
+          # Aguardar tunnel estar efectivamente pronto
+          echo "Aguardando tunnel..."
+          for i in $(seq 1 20); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              "${{ secrets.CDN_DOMAIN }}/" 2>/dev/null || echo "000")
+            echo "  Tentativa $i: HTTP $STATUS"
+            if [ "$STATUS" != "000" ] && [ "$STATUS" != "503" ] && [ "$STATUS" != "502" ]; then
+              echo "✓ Tunnel pronto (HTTP $STATUS)"
+              break
+            fi
+            sleep 3
+          done
 
       # ── 1. Instalar FFmpeg ─────────────────────────────────────────────────
       - name: Instalar FFmpeg
@@ -200,6 +222,9 @@ jobs:
           PYEOF
 
       # ── 5. HLS encode ──────────────────────────────────────────────────────
+      # FIX: segmentos ficam em $WORK_DIR/hls/ (flat) — sem subpasta {quality}
+      # O servidor HTTP serve /tmp/sv_work, portanto:
+      #   /tmp/sv_work/{job_id}/hls/seg00001.ts → cdn/{job_id}/hls/seg00001.bin ✓
       - name: HLS encode (libx264 superfast CRF26 + AAC 128k)
         run: |
           HLS_DIR="$WORK_DIR/hls"
@@ -300,6 +325,10 @@ jobs:
           PYEOF
 
       # ── 8. Reescrever index.m3u8 ───────────────────────────────────────────
+      # FIX: URLs sem subpasta /{quality}/ — bate com a estrutura real do disco
+      # disco:  $WORK_DIR/hls/seg00001.bin
+      # HTTP:   /tmp/sv_work/{job_id}/hls/seg00001.bin
+      # CDN:    {cdn}/{job_id}/hls/seg00001.bin  ✓
       - name: Reescrever index.m3u8 com URLs CDN
         run: |
           python3 << 'PYEOF'
@@ -308,24 +337,27 @@ jobs:
           hls_dir  = os.environ['WORK_DIR'] + '/hls'
           cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id   = os.environ['JOB_ID']
-          quality  = os.environ['QUALITY_LABEL']
 
           with open(hls_dir + '/index.m3u8') as f:
             content = f.read()
 
+          # seg00001.ts → {cdn}/{job_id}/hls/seg00001.bin
           content = re.sub(
             r'^(seg\d+)\.ts$',
-            lambda m: f"{cdn_base}/{job_id}/hls/{quality}/{m.group(1)}.bin",
+            lambda m: f"{cdn_base}/{job_id}/hls/{m.group(1)}.bin",
             content, flags=re.MULTILINE
           )
 
           with open(hls_dir + '/index.m3u8', 'w') as f:
             f.write(content)
 
-          print(f"✓ index.m3u8 → {cdn_base}/{job_id}/hls/{quality}/")
+          print(f"✓ index.m3u8 → {cdn_base}/{job_id}/hls/")
           PYEOF
 
       # ── 9. Gerar master.m3u8 ───────────────────────────────────────────────
+      # FIX: master.m3u8 fica em $WORK_DIR/ (não em hls/)
+      # disco:  /tmp/sv_work/{job_id}/master.m3u8
+      # CDN:    {cdn}/{job_id}/master.m3u8  ✓
       - name: Gerar master.m3u8
         run: |
           python3 << 'PYEOF'
@@ -343,13 +375,15 @@ jobs:
             '#EXT-X-VERSION:3',
             '',
             f'#EXT-X-STREAM-INF:BANDWIDTH={bitrate},RESOLUTION={eff_w}x{eff_h},CODECS="avc1.640028,mp4a.40.2"',
-            f'{cdn_base}/{job_id}/hls/{quality}/index.m3u8',
+            f'{cdn_base}/{job_id}/hls/index.m3u8',
           ])
 
+          # master.m3u8 na raiz do job — serve como /tmp/sv_work/{job_id}/master.m3u8
           with open(os.environ['WORK_DIR'] + '/master.m3u8', 'w') as f:
             f.write(master)
 
           print(f"✓ master.m3u8: {eff_w}x{eff_h} | {bitrate}bps")
+          print(f"  → CDN: {cdn_base}/{job_id}/master.m3u8")
           PYEOF
 
       # ── 10. Criar Release e upload assets ──────────────────────────────────
@@ -427,11 +461,17 @@ jobs:
           echo ""
           echo "=== Teste CDN — headers completos ==="
           curl -s -o /dev/null -D - \
-            "https://cdn.pixgo.qzz.io/$JOB_ID/nonces.json" \
+            "$CDN_DOMAIN/$JOB_ID/nonces.json" \
             | grep -E "^HTTP|cf-cache-status|cf-ray|cache-control|server|x-cache|location|content-type" \
             || echo "curl falhou"
 
       # ── 12. Warm ───────────────────────────────────────────────────────────
+      # FIX: URLs alinhadas com a estrutura real de dirs no disco
+      #   master:  {cdn}/{job_id}/master.m3u8          (era /hls/master.m3u8)
+      #   nonces:  {cdn}/{job_id}/nonces.json           ✓
+      #   index:   {cdn}/{job_id}/hls/index.m3u8        (era /hls/{quality}/index.m3u8)
+      #   segs:    {cdn}/{job_id}/hls/{bin}             (era /hls/{quality}/{bin})
+      #   thumbs:  {cdn}/{job_id}/thumbs/thumb_N.jpg    ✓
       - name: Aquecer Cloudflare Cache
         run: |
           python3 << 'PYEOF'
@@ -439,7 +479,6 @@ jobs:
 
           cdn_base  = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id    = os.environ['JOB_ID']
-          quality   = os.environ['QUALITY_LABEL']
           warm_c    = int(os.environ['WARM_C'])
           work_dir  = os.environ['WORK_DIR']
 
@@ -447,10 +486,12 @@ jobs:
           thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
 
           cdn_urls = (
-            [f"{cdn_base}/{job_id}/hls/master.m3u8",
-             f"{cdn_base}/{job_id}/nonces.json",
-             f"{cdn_base}/{job_id}/hls/{quality}/index.m3u8"] +
-            [f"{cdn_base}/{job_id}/hls/{quality}/{bn}" for bn in nonces['nonces']] +
+            [
+              f"{cdn_base}/{job_id}/master.m3u8",
+              f"{cdn_base}/{job_id}/nonces.json",
+              f"{cdn_base}/{job_id}/hls/index.m3u8",
+            ] +
+            [f"{cdn_base}/{job_id}/hls/{bn}"        for bn in nonces['nonces']] +
             [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
           )
 
@@ -489,7 +530,7 @@ jobs:
           hits1, misses1, errors1, ns1 = warm_pass(cdn_urls, '1ª passagem')
 
           if errors1 == len(cdn_urls):
-            print("⚠ Todas as URLs falharam")
+            print("⚠ Todas as URLs falharam — verificar tunnel e ingress rule")
           else:
             if ns1 > 0:
               print(f"⚠ Origem sem Cache-Control público — Cloudflare não guarda")
@@ -568,7 +609,7 @@ jobs:
             'encrypted':    True,
             'encryption':   'chacha20-poly1305',
             'segExt':       'bin',
-            'masterUrl':    f"{cdn_base}/{job_id}/hls/master.m3u8",
+            'masterUrl':    f"{cdn_base}/{job_id}/master.m3u8",
             'noncesUrl':    f"{cdn_base}/{job_id}/nonces.json",
           }
 
