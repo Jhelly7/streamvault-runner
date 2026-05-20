@@ -52,11 +52,6 @@ jobs:
     steps:
 
       # ── 0. Preparar dirs + servidor HTTP + tunnel ──────────────────────────
-      # Arquitectura do warm:
-      #   runner:8080 (disco local) ← tunnel (2º conector) ← Cloudflare ← warm GET
-      # O Render NÃO é tocado durante o warm — só em MISS reais de utilizadores.
-      # O tunnel conecta aqui e fica activo durante os steps 1-10 (encode, upload, etc.)
-      # Quando o warm arranca no step 11, o tunnel já está há minutos activo.
       - name: Preparar ambiente
         run: |
           mkdir -p $WORK_DIR/incoming $WORK_DIR/hls $WORK_DIR/thumbs
@@ -65,13 +60,10 @@ jobs:
           echo "MAX_H=${{ inputs.max_encode_height }}"   >> $GITHUB_ENV
           echo "WARM_C=${{ inputs.warm_concurrency }}"   >> $GITHUB_ENV
 
-          # Instalar cloudflared
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
 
-          # Servidor HTTP com Cache-Control correcto
-          # python3 -m http.server não envia Cache-Control — Cloudflare não guardaria
           SERVE_DIR="$(dirname $WORK_DIR)"
           export SERVE_DIR
           python3 - << 'PYEOF' &
@@ -89,9 +81,6 @@ jobs:
           PYEOF
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
 
-          # Ligar segundo conector ao tunnel
-          # O tunnel fica activo em background durante todo o job
-          # Quando o warm arranca (step 11), já está há minutos conectado
           cloudflared tunnel --no-autoupdate run \
             --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" &
           echo "TUNNEL_PID=$!" >> $GITHUB_ENV
@@ -112,9 +101,17 @@ jobs:
       - name: '[Modo A] Descarregar vídeo via URL'
         if: ${{ inputs.video_url != '' }}
         run: |
-          curl -L --retry 3 --retry-delay 5 --progress-bar \
+          curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
             -o "$WORK_DIR/incoming/input.video" \
             "${{ inputs.video_url }}"
+
+          SIZE=$(stat -c%s "$WORK_DIR/incoming/input.video" 2>/dev/null || echo 0)
+          echo "✓ Download: $(du -sh $WORK_DIR/incoming/input.video | cut -f1) ($SIZE bytes)"
+          if [ "$SIZE" -lt 10000 ]; then
+            echo "⚠ Ficheiro demasiado pequeno — download falhou"
+            cat "$WORK_DIR/incoming/input.video" || true
+            exit 1
+          fi
 
       - name: '[Modo B] Obter vídeo via Artifact'
         if: ${{ inputs.video_url == '' }}
@@ -297,8 +294,7 @@ jobs:
             nonce_map[bin_name] = nonce.hex()
             print(f"  {fname} → {bin_name}")
 
-          key_hex = os.environ['CHACHA_KEY']
-          out = {'key_id': key_hex[:8], 'nonces': nonce_map}
+          out = {'key_id': os.environ['CHACHA_KEY'][:8], 'nonces': nonce_map}
           json.dump(out, open(os.environ['WORK_DIR'] + '/nonces.json','w'))
           print(f"✓ {len(nonce_map)} segmentos encriptados")
           PYEOF
@@ -332,7 +328,6 @@ jobs:
       # ── 9. Gerar master.m3u8 ───────────────────────────────────────────────
       - name: Gerar master.m3u8
         run: |
-          mkdir -p "$WORK_DIR/hls_root"
           python3 << 'PYEOF'
           import os
 
@@ -418,7 +413,7 @@ jobs:
 
           echo "✓ Upload completo"
 
-      # ── 11. Debug tunnel — diagnóstico antes do warm ───────────────────────
+      # ── 11. Debug tunnel ───────────────────────────────────────────────────
       - name: Debug tunnel
         run: |
           echo "=== Tunnel PID: $TUNNEL_PID ==="
@@ -436,15 +431,7 @@ jobs:
             | grep -E "^HTTP|cf-cache-status|cf-ray|cache-control|server|x-cache|location|content-type" \
             || echo "curl falhou"
 
-          echo ""
-          echo "=== Tunnel info ==="
-          cloudflared tunnel --no-autoupdate info \
-            --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" 2>&1 | head -20 || true
-
       # ── 12. Warm ───────────────────────────────────────────────────────────
-      # Arquitectura: runner:8080 (disco) ← tunnel (2º conector) ← Cloudflare ← GET
-      # O tunnel foi iniciado no step 0 e está activo há vários minutos.
-      # O Render NÃO é contactado durante o warm.
       - name: Aquecer Cloudflare Cache
         run: |
           python3 << 'PYEOF'
@@ -471,7 +458,7 @@ jobs:
             try:
               req = ur.Request(url)
               with ur.urlopen(req, timeout=120) as r:
-                body      = r.read()  # body completo — obrigatório para Cloudflare guardar
+                body      = r.read()
                 cf_status = r.headers.get('cf-cache-status', 'UNKNOWN')
                 cc        = r.headers.get('cache-control', 'none')
                 return {'url': url, 'status': cf_status, 'cc': cc, 'http': r.status, 'size': len(body)}
@@ -494,7 +481,7 @@ jobs:
                 if 'no-store' in cc or 'private' in cc:
                   no_store += 1
                   if no_store <= 3:
-                    print(f"  ⚠ origem sem cache público: {r['url'].split('/')[-1]} [{cc}]")
+                    print(f"  ⚠ sem cache público: {r['url'].split('/')[-1]} [{cc}]")
             print(f"✓ {label}: {misses} MISS | {hits} HIT | {errors} erros | {no_store} sem cache-control")
             return hits, misses, errors, no_store
 
@@ -502,27 +489,25 @@ jobs:
           hits1, misses1, errors1, ns1 = warm_pass(cdn_urls, '1ª passagem')
 
           if errors1 == len(cdn_urls):
-            print("⚠ Todas as URLs falharam — ver Debug tunnel acima para diagnóstico")
+            print("⚠ Todas as URLs falharam")
           else:
             if ns1 > 0:
-              print(f"\n⚠ Origem sem Cache-Control público — Cloudflare não guarda.")
-              print(f"  Verificar proxy.js: Cache-Control: public, max-age=31536000, immutable\n")
+              print(f"⚠ Origem sem Cache-Control público — Cloudflare não guarda")
 
             time.sleep(5)
             hits2, misses2, errors2, ns2 = warm_pass(cdn_urls, '2ª passagem')
 
             if hits2 == len(cdn_urls):
-              print(f"\n✅ Cache aquecido — {hits2}/{len(cdn_urls)} HITs confirmados")
+              print(f"✅ Cache aquecido — {hits2}/{len(cdn_urls)} HITs confirmados")
             elif hits2 > 0:
-              print(f"\n⚠ Cache parcial — {hits2}/{len(cdn_urls)} HITs ({len(cdn_urls)-hits2} ainda MISS)")
+              print(f"⚠ Cache parcial — {hits2}/{len(cdn_urls)} HITs")
             else:
-              print(f"\n✗ Cache não aqueceu — 0 HITs na 2ª passagem")
-              print(f"  Verificar Cache Rules no Cloudflare Dashboard")
+              print(f"✗ Cache não aqueceu — 0 HITs na 2ª passagem")
 
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json','w'))
           PYEOF
 
-      # ── 13. Desligar tunnel e servidor HTTP ────────────────────────────────
+      # ── 13. Desligar tunnel ────────────────────────────────────────────────
       - name: Desligar Cloudflare Tunnel
         if: always()
         run: |
