@@ -3,12 +3,12 @@ name: StreamVault Process
 # ── Secrets obrigatórios (Settings → Secrets → Actions) ───────────────────
 # CHACHA_KEY            — 32 bytes hex (mesmo do server.js)
 # CDN_DOMAIN            — ex: https://cdn.teudominio.com
-# TUNNEL_URL            — ex: https://tunnel.teudominio.com (porta 8080)
 # PIPELINE_API          — URL da API EdgeOne
 # ADMIN_API_KEY         — chave X-API-Key para PIPELINE_API
 # STORAGE_GITHUB_TOKEN  — PAT da conta storage (scope: repo)
 # STORAGE_GITHUB_OWNER  — username da conta storage
 # STORAGE_GITHUB_REPO   — repo da conta storage
+# CLOUDFLARE_TUNNEL_TOKEN — token do tunnel cloudflared
 
 on:
   workflow_dispatch:
@@ -46,13 +46,17 @@ jobs:
       WORK_DIR:      /tmp/sv_work/${{ inputs.job_id }}
       CHACHA_KEY:    ${{ secrets.CHACHA_KEY }}
       CDN_DOMAIN:    ${{ secrets.CDN_DOMAIN }}
-      TUNNEL_URL:    ${{ secrets.TUNNEL_URL }}
       PIPELINE_API:  ${{ secrets.PIPELINE_API }}
       ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
 
     steps:
 
-      # ── 0. Preparar dirs ───────────────────────────────────────────────────
+      # ── 0. Preparar dirs + servidor HTTP + tunnel ──────────────────────────
+      # Arquitectura do warm:
+      #   runner:8080 (disco local) ← tunnel (2º conector) ← Cloudflare ← warm GET
+      # O Render NÃO é tocado durante o warm — só em MISS reais de utilizadores.
+      # O tunnel conecta aqui e fica activo durante os steps 1-10 (encode, upload, etc.)
+      # Quando o warm arranca no step 11, o tunnel já está há minutos activo.
       - name: Preparar ambiente
         run: |
           mkdir -p $WORK_DIR/incoming $WORK_DIR/hls $WORK_DIR/thumbs
@@ -61,42 +65,37 @@ jobs:
           echo "MAX_H=${{ inputs.max_encode_height }}"   >> $GITHUB_ENV
           echo "WARM_C=${{ inputs.warm_concurrency }}"   >> $GITHUB_ENV
 
+          # Instalar cloudflared
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
 
-          # Servidor HTTP com Cache-Control correcto para a Cloudflare guardar
-          # python3 -m http.server NÃO envia Cache-Control — assets nunca ficam em cache
+          # Servidor HTTP com Cache-Control correcto
+          # python3 -m http.server não envia Cache-Control — Cloudflare não guardaria
           SERVE_DIR="$(dirname $WORK_DIR)"
+          export SERVE_DIR
           python3 - << 'PYEOF' &
-          import http.server, os, sys
-
+          import http.server, os
           serve_dir = os.environ.get('SERVE_DIR', '/tmp/sv_work')
-
           class CacheHandler(http.server.SimpleHTTPRequestHandler):
             def __init__(self, *a, **kw):
               super().__init__(*a, directory=serve_dir, **kw)
-
             def end_headers(self):
-              # Sem este header a Cloudflare recusa guardar — causa raiz do warm não funcionar
               self.send_header('Cache-Control', 'public, max-age=31536000, immutable')
               self.send_header('Access-Control-Allow-Origin', '*')
               super().end_headers()
-
-            def log_message(self, *a):
-              pass  # silenciar logs do runner
-
+            def log_message(self, *a): pass
           http.server.HTTPServer(('', 8080), CacheHandler).serve_forever()
           PYEOF
-
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
 
-          # Ligar segundo conector ao tunnel pixel
-          # Cloudflare roteia MISS para o conector mais próximo/rápido (runner)
-          # Runner serve do disco → Cloudflare cacheia → origem pouco usada
-          cloudflared tunnel --no-autoupdate run --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" &
+          # Ligar segundo conector ao tunnel
+          # O tunnel fica activo em background durante todo o job
+          # Quando o warm arranca (step 11), já está há minutos conectado
+          cloudflared tunnel --no-autoupdate run \
+            --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" &
           echo "TUNNEL_PID=$!" >> $GITHUB_ENV
-          echo "✓ Servidor HTTP (Cache-Control: public) + tunnel iniciados"
+          echo "✓ Servidor HTTP + tunnel iniciados em background"
 
       # ── 1. Instalar FFmpeg ─────────────────────────────────────────────────
       - name: Instalar FFmpeg
@@ -138,7 +137,7 @@ jobs:
           echo "VIDEO_PATH=$VIDEO_PATH" >> $GITHUB_ENV
           echo "Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
 
-      # ── 4. Probe — fiel ao server.js probeVideo() ─────────────────────────
+      # ── 4. Probe ───────────────────────────────────────────────────────────
       - name: Probe do vídeo
         run: |
           ffprobe -v quiet -print_format json \
@@ -152,11 +151,9 @@ jobs:
           vs  = next((s for s in d['streams'] if s['codec_type'] == 'video'), {})
           fmt = d['format']
 
-          # fps — fiel: r_frame_rate "num/den"
           num, den = map(int, vs.get('r_frame_rate','24/1').split('/'))
           fps = num / den if den else num
 
-          # codec_tag — fiel ao server.js
           raw = vs.get('codec_tag_string','')
           codec_tag = raw if (raw and '.' in raw) else 'avc1.640028'
 
@@ -172,18 +169,15 @@ jobs:
           }
           json.dump(probe, open(os.environ['WORK_DIR'] + '/probe_parsed.json','w'))
 
-          # effectiveHeight + willScale — fiel ao server.js
           max_h      = int(os.environ['MAX_H'])
           eff_h      = min(probe['height'], max_h)
           will_scale = probe['height'] > max_h
 
-          # effectiveWidth — fiel ao server.js
           if will_scale:
             eff_w = round((probe['width'] / probe['height']) * eff_h / 2) * 2
           else:
             eff_w = probe['width']
 
-          # qualityLabel — fiel ao server.js detectQualityLabel()
           h = eff_h
           label = ('4k'    if h>=2160 else
                    '1440p' if h>=1440 else
@@ -208,7 +202,7 @@ jobs:
           print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale}")
           PYEOF
 
-      # ── 5. HLS encode — fiel ao server.js encodeHLS() ────────────────────
+      # ── 5. HLS encode ──────────────────────────────────────────────────────
       - name: HLS encode (libx264 superfast CRF26 + AAC 128k)
         run: |
           HLS_DIR="$WORK_DIR/hls"
@@ -229,7 +223,7 @@ jobs:
 
           echo "✓ $(ls $HLS_DIR/*.ts | wc -l) segmentos .ts gerados"
 
-      # ── 6. Thumbnails — fiel ao server.js extractThumbnails() ─────────────
+      # ── 6. Thumbnails ──────────────────────────────────────────────────────
       - name: Extrair thumbnails
         run: |
           python3 << 'PYEOF'
@@ -239,7 +233,6 @@ jobs:
           video     = os.environ['VIDEO_PATH']
           thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
 
-          # fiel ao server.js
           if duration > 120:
             times = [duration * p for p in [0.05, 0.2, 0.4, 0.6, 0.8, 0.95]]
           else:
@@ -264,8 +257,7 @@ jobs:
           print(f"✓ {len(thumbs)} thumbnails")
           PYEOF
 
-      # ── 7. ChaCha20-Poly1305 — fiel ao server.js encryptChaCha20() ────────
-      # Formato: nonce(12) + authTag(16) + ciphertext
+      # ── 7. ChaCha20-Poly1305 ───────────────────────────────────────────────
       - name: Encriptar segmentos .ts → .bin
         run: |
           python3 << 'PYEOF'
@@ -294,7 +286,6 @@ jobs:
             with open(src, 'rb') as f:
               data = f.read()
 
-            # fiel ao server.js: nonce(12) + tag(16) + ciphertext
             ct_tag     = chacha.encrypt(nonce, data, None)
             ciphertext = ct_tag[:-16]
             auth_tag   = ct_tag[-16:]
@@ -306,15 +297,13 @@ jobs:
             nonce_map[bin_name] = nonce.hex()
             print(f"  {fname} → {bin_name}")
 
-          # nonces.json — fiel ao server.js
           key_hex = os.environ['CHACHA_KEY']
           out = {'key_id': key_hex[:8], 'nonces': nonce_map}
           json.dump(out, open(os.environ['WORK_DIR'] + '/nonces.json','w'))
           print(f"✓ {len(nonce_map)} segmentos encriptados")
           PYEOF
 
-      # ── 8. Reescrever index.m3u8 — fiel ao server.js ──────────────────────
-      # seg00001.ts → CDN_DOMAIN/jobId/hls/quality/seg00001.bin
+      # ── 8. Reescrever index.m3u8 ───────────────────────────────────────────
       - name: Reescrever index.m3u8 com URLs CDN
         run: |
           python3 << 'PYEOF'
@@ -328,7 +317,6 @@ jobs:
           with open(hls_dir + '/index.m3u8') as f:
             content = f.read()
 
-          # fiel ao server.js regex
           content = re.sub(
             r'^(seg\d+)\.ts$',
             lambda m: f"{cdn_base}/{job_id}/hls/{quality}/{m.group(1)}.bin",
@@ -341,7 +329,7 @@ jobs:
           print(f"✓ index.m3u8 → {cdn_base}/{job_id}/hls/{quality}/")
           PYEOF
 
-      # ── 9. Gerar master.m3u8 — fiel ao server.js ──────────────────────────
+      # ── 9. Gerar master.m3u8 ───────────────────────────────────────────────
       - name: Gerar master.m3u8
         run: |
           mkdir -p "$WORK_DIR/hls_root"
@@ -355,7 +343,6 @@ jobs:
           eff_w    = os.environ['EFF_WIDTH']
           eff_h    = os.environ['EFF_HEIGHT']
 
-          # fiel ao server.js
           master = '\n'.join([
             '#EXTM3U',
             '#EXT-X-VERSION:3',
@@ -370,7 +357,7 @@ jobs:
           print(f"✓ master.m3u8: {eff_w}x{eff_h} | {bitrate}bps")
           PYEOF
 
-      # ── 10. Criar Release e upload assets ─────────────────────────────────
+      # ── 10. Criar Release e upload assets ──────────────────────────────────
       - name: Criar Release no repo de storage
         env:
           STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
@@ -431,10 +418,33 @@ jobs:
 
           echo "✓ Upload completo"
 
-      # ── 11. Warm — runner serve com Cache-Control correcto ─────────────────
-      # FIX 1: python3 -m http.server substituído por servidor com Cache-Control (step 0)
-      # FIX 2: removido Cache-Control: no-cache dos requests — impedia a Cloudflare de guardar
-      # FIX 3: r.read() completo antes de fechar — body parcial = cache incompleto na Cloudflare
+      # ── 11. Debug tunnel — diagnóstico antes do warm ───────────────────────
+      - name: Debug tunnel
+        run: |
+          echo "=== Tunnel PID: $TUNNEL_PID ==="
+          ps aux | grep cloudflared | grep -v grep || echo "⚠ cloudflared NÃO está a correr"
+
+          echo ""
+          echo "=== Teste servidor HTTP local porta 8080 ==="
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/ 2>/dev/null || echo "000")
+          echo "HTTP local: $STATUS"
+
+          echo ""
+          echo "=== Teste CDN — headers completos ==="
+          curl -s -o /dev/null -D - \
+            "https://cdn.pixgo.qzz.io/$JOB_ID/nonces.json" \
+            | grep -E "^HTTP|cf-cache-status|cf-ray|cache-control|server|x-cache|location|content-type" \
+            || echo "curl falhou"
+
+          echo ""
+          echo "=== Tunnel info ==="
+          cloudflared tunnel --no-autoupdate info \
+            --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" 2>&1 | head -20 || true
+
+      # ── 12. Warm ───────────────────────────────────────────────────────────
+      # Arquitectura: runner:8080 (disco) ← tunnel (2º conector) ← Cloudflare ← GET
+      # O tunnel foi iniciado no step 0 e está activo há vários minutos.
+      # O Render NÃO é contactado durante o warm.
       - name: Aquecer Cloudflare Cache
         run: |
           python3 << 'PYEOF'
@@ -449,7 +459,6 @@ jobs:
           nonces = json.load(open(work_dir + '/nonces.json'))
           thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
 
-          # Lista completa de CDN URLs — fiel ao server.js
           cdn_urls = (
             [f"{cdn_base}/{job_id}/hls/master.m3u8",
              f"{cdn_base}/{job_id}/nonces.json",
@@ -460,19 +469,12 @@ jobs:
 
           def fetch_url(url):
             try:
-              # SEM Cache-Control: no-cache — esse header dizia à Cloudflare para não guardar
               req = ur.Request(url)
               with ur.urlopen(req, timeout=120) as r:
-                body = r.read()  # consumir body completo — obrigatório para cache guardar
-                cf_status  = r.headers.get('cf-cache-status', 'UNKNOWN')
-                cache_ctrl = r.headers.get('cache-control', 'none')
-                return {
-                  'url':    url,
-                  'status': cf_status,
-                  'cc':     cache_ctrl,
-                  'http':   r.status,
-                  'size':   len(body),
-                }
+                body      = r.read()  # body completo — obrigatório para Cloudflare guardar
+                cf_status = r.headers.get('cf-cache-status', 'UNKNOWN')
+                cc        = r.headers.get('cache-control', 'none')
+                return {'url': url, 'status': cf_status, 'cc': cc, 'http': r.status, 'size': len(body)}
             except Exception as e:
               return {'url': url, 'status': 'ERROR', 'error': str(e)}
 
@@ -496,32 +498,15 @@ jobs:
             print(f"✓ {label}: {misses} MISS | {hits} HIT | {errors} erros | {no_store} sem cache-control")
             return hits, misses, errors, no_store
 
-          # Aguardar conector activo — SEM Cache-Control: no-cache
-          print("Aguardando conector do runner ficar activo...")
-          for i in range(20):
-            try:
-              req = ur.Request(f"{cdn_base}/{job_id}/nonces.json")
-              with ur.urlopen(req, timeout=5) as r:
-                body = r.read().decode()
-                cf  = r.headers.get('cf-cache-status', '?')
-                cc  = r.headers.get('cache-control', 'none')
-                if 'key_id' in body:
-                  print(f"✓ Conector activo ({i*3}s) | cf-cache-status: {cf} | cache-control: {cc}")
-                  break
-            except: pass
-            print(f"  aguardando... ({i+1}/20)")
-            time.sleep(3)
-
-          print(f"\nAquecendo {len(cdn_urls)} URLs (concorrência {warm_c})...")
+          print(f"Aquecendo {len(cdn_urls)} URLs (concorrência {warm_c})...")
           hits1, misses1, errors1, ns1 = warm_pass(cdn_urls, '1ª passagem')
 
           if errors1 == len(cdn_urls):
-            print("⚠ Todas as URLs falharam — verificar tunnel e servidor HTTP")
+            print("⚠ Todas as URLs falharam — ver Debug tunnel acima para diagnóstico")
           else:
             if ns1 > 0:
-              print(f"\n⚠ ATENÇÃO: origem a devolver Cache-Control sem cache público.")
-              print(f"  O warm aquece o PoP mas a Cloudflare não guarda os assets.")
-              print(f"  Verificar servidor HTTP no step 0.\n")
+              print(f"\n⚠ Origem sem Cache-Control público — Cloudflare não guarda.")
+              print(f"  Verificar proxy.js: Cache-Control: public, max-age=31536000, immutable\n")
 
             time.sleep(5)
             hits2, misses2, errors2, ns2 = warm_pass(cdn_urls, '2ª passagem')
@@ -537,7 +522,7 @@ jobs:
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json','w'))
           PYEOF
 
-      # ── 12. Desligar conector do runner ────────────────────────────────────
+      # ── 13. Desligar tunnel e servidor HTTP ────────────────────────────────
       - name: Desligar Cloudflare Tunnel
         if: always()
         run: |
@@ -545,7 +530,7 @@ jobs:
           [ -n "$HTTP_SERVER_PID" ] && kill "$HTTP_SERVER_PID" 2>/dev/null || true
           echo "✓ Tunnel e servidor HTTP desligados"
 
-      # ── 13. Registar no EdgeOne — fiel ao server.js registerInKV() ────────
+      # ── 14. Registar no EdgeOne ────────────────────────────────────────────
       - name: Registar no EdgeOne (Turso + KV)
         run: |
           python3 << 'PYEOF'
@@ -573,11 +558,8 @@ jobs:
 
           content_id = metadata.get('contentId', job_id)
           seg_count  = len(nonces['nonces'])
-          # URLs CDN usam job_id — tag da Release onde os assets residem.
-          # content_id é apenas o identificador no Turso/KV; pode diferir do job_id.
           thumb_urls = [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
 
-          # fiel ao server.js registerInKV — mesmo body
           body = {
             'contentId':    content_id,
             'title':        metadata.get('title','Untitled'),
@@ -625,7 +607,7 @@ jobs:
         env:
           METADATA: ${{ inputs.metadata }}
 
-      # ── 14. Cleanup — fiel ao server.js ───────────────────────────────────
+      # ── 15. Cleanup ────────────────────────────────────────────────────────
       - name: Cleanup
         if: always()
         run: rm -rf "$WORK_DIR" && echo "✓ Workspace limpo"
