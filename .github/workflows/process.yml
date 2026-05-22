@@ -17,7 +17,7 @@ on:
         description: 'Job ID (tag da Release)'
         required: true
       video_url:
-        description: 'URL do vídeo (Modo A — runner descarrega)'
+        description: 'URL do vídeo — HTTP(S), magnet:, .torrent, youtube.com'
         required: false
         default: ''
       seg_duration:
@@ -36,6 +36,10 @@ on:
         description: 'JSON: { contentId, title, description, type, year, lang }'
         required: false
         default: '{}'
+      thumbnail_url:
+        description: 'URL da thumbnail (JPG/PNG) — vazio = gera 6 frames automático'
+        required: false
+        default: ''
 
 jobs:
   process:
@@ -115,24 +119,56 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg
           ffmpeg -version | head -1
 
-      # ── 2. Instalar cryptography ───────────────────────────────────────────
-      - name: Instalar cryptography
-        run: pip install --quiet cryptography
+      # ── 2. Instalar dependências Python + aria2 ────────────────────────────
+      # ALTERAÇÃO: adicionado yt-dlp e aria2c (torrent + youtube)
+      - name: Instalar dependências
+        run: |
+          pip install --quiet cryptography yt-dlp
+          sudo apt-get install -y --no-install-recommends aria2
 
       # ── 3. Obter vídeo ─────────────────────────────────────────────────────
-      - name: '[Modo A] Descarregar vídeo via URL'
+      # ALTERAÇÃO: step unificado — magnet/torrent → aria2c | youtube → yt-dlp | https → curl
+      - name: '[Modo A] Descarregar vídeo'
         if: ${{ inputs.video_url != '' }}
         run: |
-          curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
-            -o "$WORK_DIR/incoming/input.video" \
-            "${{ inputs.video_url }}"
+          URL="${{ inputs.video_url }}"
 
-          SIZE=$(stat -c%s "$WORK_DIR/incoming/input.video" 2>/dev/null || echo 0)
-          echo "✓ Download: $(du -sh $WORK_DIR/incoming/input.video | cut -f1) ($SIZE bytes)"
-          if [ "$SIZE" -lt 10000 ]; then
-            echo "⚠ Ficheiro demasiado pequeno — download falhou"
-            cat "$WORK_DIR/incoming/input.video" || true
-            exit 1
+          if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]]; then
+            echo "→ Modo torrent (aria2c)"
+            aria2c \
+              --dir="$WORK_DIR/incoming" \
+              --seed-time=0 \
+              --max-connection-per-server=4 \
+              --bt-stop-timeout=600 \
+              "$URL"
+
+          elif [[ "$URL" == *youtube.com* ]] || [[ "$URL" == *youtu.be* ]]; then
+            echo "→ Modo YouTube (yt-dlp)"
+            yt-dlp \
+              --format "bestvideo[height<=$MAX_H]+bestaudio/best[height<=$MAX_H]" \
+              --merge-output-format mp4 \
+              --write-thumbnail \
+              --convert-thumbnails jpg \
+              --output "$WORK_DIR/incoming/%(title)s.%(ext)s" \
+              --no-playlist \
+              "$URL"
+            # Sinalizar que thumbnail foi extraída pelo yt-dlp
+            YT_THUMB=$(find "$WORK_DIR/incoming/" -maxdepth 1 -iname "*.jpg" | head -1)
+            [ -n "$YT_THUMB" ] && echo "YT_THUMB_PATH=$YT_THUMB" >> $GITHUB_ENV
+
+          else
+            echo "→ Modo URL directa (curl)"
+            curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
+              -o "$WORK_DIR/incoming/input.video" \
+              "$URL"
+
+            SIZE=$(stat -c%s "$WORK_DIR/incoming/input.video" 2>/dev/null || echo 0)
+            echo "✓ Download: $(du -sh $WORK_DIR/incoming/input.video | cut -f1) ($SIZE bytes)"
+            if [ "$SIZE" -lt 10000 ]; then
+              echo "⚠ Ficheiro demasiado pequeno — download falhou"
+              cat "$WORK_DIR/incoming/input.video" || true
+              exit 1
+            fi
           fi
 
       - name: '[Modo B] Obter vídeo via Artifact'
@@ -142,12 +178,13 @@ jobs:
           name: video-${{ inputs.job_id }}
           path: ${{ env.WORK_DIR }}/incoming/
 
+      # ALTERAÇÃO: procura recursiva (sem -maxdepth 1) para torrent com subpastas
       - name: Detectar ficheiro de vídeo
         run: |
           VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
           VIDEO_PATH=""
           for ext in $VIDEO_EXTS; do
-            FOUND=$(find "$WORK_DIR/incoming/" -maxdepth 1 -iname "*.${ext}" | head -1)
+            FOUND=$(find "$WORK_DIR/incoming/" -iname "*.${ext}" | head -1)
             if [ -n "$FOUND" ]; then VIDEO_PATH="$FOUND"; break; fi
           done
           if [ -z "$VIDEO_PATH" ]; then
@@ -225,59 +262,99 @@ jobs:
       # FIX: segmentos ficam em $WORK_DIR/hls/ (flat) — sem subpasta {quality}
       # O servidor HTTP serve /tmp/sv_work, portanto:
       #   /tmp/sv_work/{job_id}/hls/seg00001.ts → cdn/{job_id}/hls/seg00001.bin ✓
+      #
+      # FIX segmentos grandes: -g força keyframes exactos a cada fps×seg_duration frames.
+      # Remove split_by_time — era ele que causava segmentos gigantes em vídeos longos
+      # porque o ffmpeg aguardava o próximo keyframe natural antes de cortar.
+      # Resultado: segmentos previsíveis (~2-4 MB a 720p) — elimina loop infinito no player.
       - name: HLS encode (libx264 superfast CRF26 + AAC 128k)
         run: |
           HLS_DIR="$WORK_DIR/hls"
           [ "$WILL_SCALE" = "true" ] && SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}" || SCALE_ARGS=""
 
+          # Keyframe interval exacto: fps × seg_duration (arredondado para cima)
+          GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
+          echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s)"
+
           ffmpeg -hide_banner -loglevel warning -stats \
             -i "$VIDEO_PATH" \
             $SCALE_ARGS \
             -c:v libx264 -preset superfast -crf 26 -tune fastdecode \
+            -g $GOP -keyint_min ${SEG_DURATION} \
             -c:a aac -b:a 128k \
             -f hls \
             -hls_time ${SEG_DURATION} \
             -hls_playlist_type vod \
             -hls_segment_type mpegts \
-            -hls_flags independent_segments+split_by_time \
+            -hls_flags independent_segments \
             -hls_segment_filename "$HLS_DIR/seg%05d.ts" \
             -y "$HLS_DIR/index.m3u8"
 
           echo "✓ $(ls $HLS_DIR/*.ts | wc -l) segmentos .ts gerados"
 
       # ── 6. Thumbnails ──────────────────────────────────────────────────────
-      - name: Extrair thumbnails
+      # ALTERAÇÃO: 3 modos —
+      #   1. thumbnail_url preenchido → curl da imagem submetida
+      #   2. YouTube → usa thumb extraída pelo yt-dlp (--write-thumbnail)
+      #   3. vazio / outro source → mantém arquitectura original (6 frames)
+      - name: Obter thumbnails
         run: |
           python3 << 'PYEOF'
-          import subprocess, os, json
+          import subprocess, os, json, shutil
 
-          duration  = float(os.environ['PROBE_DURATION'])
-          video     = os.environ['VIDEO_PATH']
-          thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
-
-          if duration > 120:
-            times = [duration * p for p in [0.05, 0.2, 0.4, 0.6, 0.8, 0.95]]
-          else:
-            times = [min(5, duration * 0.5)]
+          thumb_dir    = os.environ['WORK_DIR'] + '/thumbs'
+          duration     = float(os.environ['PROBE_DURATION'])
+          video        = os.environ['VIDEO_PATH']
+          thumb_url    = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
+          yt_thumb     = os.environ.get('YT_THUMB_PATH', '').strip()
 
           thumbs = []
-          for i, t in enumerate(times):
-            out = f"{thumb_dir}/thumb_{i}.jpg"
+
+          # ── Modo 1: thumbnail submetida via URL ──
+          if thumb_url:
+            out = f"{thumb_dir}/thumb_0.jpg"
             r = subprocess.run([
-              'ffmpeg', '-hide_banner', '-loglevel', 'error',
-              '-ss', f'{t:.2f}', '-i', video,
-              '-vframes', '1', '-vf', 'scale=1280:-2',
-              '-q:v', '3', '-y', out,
+              'curl', '-L', '--retry', '3', '--fail', '-o', out, thumb_url
             ], capture_output=True)
             if r.returncode == 0:
-              thumbs.append({'path': out, 'time': t, 'index': i})
-              print(f"  thumb_{i}.jpg @ {t:.1f}s")
+              thumbs.append({'path': out, 'time': 0, 'index': 0})
+              print(f"✓ Thumbnail submetida: {thumb_url}")
             else:
-              print(f"  ⚠ thumb_{i} falhou")
+              print(f"⚠ Falhou download da thumbnail — fallback para 6 frames")
+
+          # ── Modo 2: thumbnail do YouTube (yt-dlp --write-thumbnail) ──
+          elif yt_thumb and os.path.exists(yt_thumb):
+            dst = f"{thumb_dir}/thumb_0.jpg"
+            shutil.copy(yt_thumb, dst)
+            thumbs.append({'path': dst, 'time': 0, 'index': 0})
+            print(f"✓ Thumbnail YouTube: {yt_thumb}")
+
+          # ── Modo 3: gerar 6 frames (arquitectura original) ──
+          if not thumbs:
+            if duration > 120:
+              times = [duration * p for p in [0.05, 0.2, 0.4, 0.6, 0.8, 0.95]]
+            else:
+              times = [min(5, duration * 0.5)]
+
+            for i, t in enumerate(times):
+              out = f"{thumb_dir}/thumb_{i}.jpg"
+              r = subprocess.run([
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-ss', f'{t:.2f}', '-i', video,
+                '-vframes', '1', '-vf', 'scale=1280:-2',
+                '-q:v', '3', '-y', out,
+              ], capture_output=True)
+              if r.returncode == 0:
+                thumbs.append({'path': out, 'time': t, 'index': i})
+                print(f"  thumb_{i}.jpg @ {t:.1f}s")
+              else:
+                print(f"  ⚠ thumb_{i} falhou")
 
           json.dump(thumbs, open(os.environ['WORK_DIR'] + '/thumbs_manifest.json','w'))
-          print(f"✓ {len(thumbs)} thumbnails")
+          print(f"✓ {len(thumbs)} thumbnail(s)")
           PYEOF
+        env:
+          INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
 
       # ── 7. ChaCha20-Poly1305 ───────────────────────────────────────────────
       - name: Encriptar segmentos .ts → .bin
