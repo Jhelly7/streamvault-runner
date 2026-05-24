@@ -68,8 +68,6 @@ jobs:
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
 
-          # Servidor HTTP serve /tmp/sv_work — o job_id cria o subpath correto
-          # ex: /tmp/sv_work/{job_id}/hls/*.bin → cdn/{job_id}/hls/*.bin
           python3 - << 'PYEOF' &
           import http.server, os
           class CacheHandler(http.server.SimpleHTTPRequestHandler):
@@ -84,7 +82,6 @@ jobs:
           PYEOF
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
 
-          # Config com ingress rule — token trata das credentials
           mkdir -p ~/.cloudflared
           CDN_HOST=$(echo "${{ secrets.CDN_DOMAIN }}" | sed 's|https\?://||')
           cat > ~/.cloudflared/config.yml << EOF
@@ -99,7 +96,6 @@ jobs:
             run --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" &
           echo "TUNNEL_PID=$!" >> $GITHUB_ENV
 
-          # Aguardar tunnel estar efectivamente pronto
           echo "Aguardando tunnel..."
           for i in $(seq 1 20); do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -120,14 +116,12 @@ jobs:
           ffmpeg -version | head -1
 
       # ── 2. Instalar dependências Python + aria2 ────────────────────────────
-      # ALTERAÇÃO: adicionado yt-dlp e aria2c (torrent + youtube)
       - name: Instalar dependências
         run: |
           pip install --quiet cryptography yt-dlp
           sudo apt-get install -y --no-install-recommends aria2
 
       # ── 3. Obter vídeo ─────────────────────────────────────────────────────
-      # ALTERAÇÃO: step unificado — magnet/torrent → aria2c | youtube → yt-dlp | https → curl
       - name: '[Modo A] Descarregar vídeo'
         if: ${{ inputs.video_url != '' }}
         run: |
@@ -152,7 +146,6 @@ jobs:
               --output "$WORK_DIR/incoming/%(title)s.%(ext)s" \
               --no-playlist \
               "$URL"
-            # Sinalizar que thumbnail foi extraída pelo yt-dlp
             YT_THUMB=$(find "$WORK_DIR/incoming/" -maxdepth 1 -iname "*.jpg" | head -1)
             [ -n "$YT_THUMB" ] && echo "YT_THUMB_PATH=$YT_THUMB" >> $GITHUB_ENV
 
@@ -178,7 +171,6 @@ jobs:
           name: video-${{ inputs.job_id }}
           path: ${{ env.WORK_DIR }}/incoming/
 
-      # ALTERAÇÃO: procura recursiva (sem -maxdepth 1) para torrent com subpastas
       - name: Detectar ficheiro de vídeo
         run: |
           VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
@@ -259,20 +251,11 @@ jobs:
           PYEOF
 
       # ── 5. HLS encode ──────────────────────────────────────────────────────
-      # FIX: segmentos ficam em $WORK_DIR/hls/ (flat) — sem subpasta {quality}
-      # O servidor HTTP serve /tmp/sv_work, portanto:
-      #   /tmp/sv_work/{job_id}/hls/seg00001.ts → cdn/{job_id}/hls/seg00001.bin ✓
-      #
-      # FIX segmentos grandes: -g força keyframes exactos a cada fps×seg_duration frames.
-      # Remove split_by_time — era ele que causava segmentos gigantes em vídeos longos
-      # porque o ffmpeg aguardava o próximo keyframe natural antes de cortar.
-      # Resultado: segmentos previsíveis (~2-4 MB a 720p) — elimina loop infinito no player.
       - name: HLS encode (libx264 superfast CRF26 + AAC 128k)
         run: |
           HLS_DIR="$WORK_DIR/hls"
           [ "$WILL_SCALE" = "true" ] && SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}" || SCALE_ARGS=""
 
-          # Keyframe interval exacto: fps × seg_duration (arredondado para cima)
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
           echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s)"
 
@@ -293,10 +276,6 @@ jobs:
           echo "✓ $(ls $HLS_DIR/*.ts | wc -l) segmentos .ts gerados"
 
       # ── 6. Thumbnails ──────────────────────────────────────────────────────
-      # ALTERAÇÃO: 3 modos —
-      #   1. thumbnail_url preenchido → curl da imagem submetida
-      #   2. YouTube → usa thumb extraída pelo yt-dlp (--write-thumbnail)
-      #   3. vazio / outro source → mantém arquitectura original (6 frames)
       - name: Obter thumbnails
         run: |
           python3 << 'PYEOF'
@@ -310,7 +289,6 @@ jobs:
 
           thumbs = []
 
-          # ── Modo 1: thumbnail submetida via URL ──
           if thumb_url:
             out = f"{thumb_dir}/thumb_0.jpg"
             r = subprocess.run([
@@ -322,14 +300,12 @@ jobs:
             else:
               print(f"⚠ Falhou download da thumbnail — fallback para 6 frames")
 
-          # ── Modo 2: thumbnail do YouTube (yt-dlp --write-thumbnail) ──
           elif yt_thumb and os.path.exists(yt_thumb):
             dst = f"{thumb_dir}/thumb_0.jpg"
             shutil.copy(yt_thumb, dst)
             thumbs.append({'path': dst, 'time': 0, 'index': 0})
             print(f"✓ Thumbnail YouTube: {yt_thumb}")
 
-          # ── Modo 3: gerar 6 frames (arquitectura original) ──
           if not thumbs:
             if duration > 120:
               times = [duration * p for p in [0.05, 0.2, 0.4, 0.6, 0.8, 0.95]]
@@ -356,56 +332,84 @@ jobs:
         env:
           INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
 
-      # ── 7. ChaCha20-Poly1305 ───────────────────────────────────────────────
+      # ── 7. Encriptar segmentos .ts → .bin (chunk format v2) ───────────────
+      #
+      # Novo formato .bin — chunk-encrypted:
+      #   [4B]  n_chunks  (uint32 LE)
+      #   por cada chunk:
+      #     [12B] nonce
+      #     [4B]  chunk_len (uint32 LE)
+      #     [N B] ciphertext ChaCha20 (counter=1)
+      #
+      # Chunk size: 64KB de plaintext — cada chunk decripta em <5ms no Worker.
+      # Overhead: 16 bytes por chunk (12 nonce + 4 len) — negligível.
+      # Counter=1: compatível com Worker JS (ctr=1), consistente com RFC 8439.
+      #
+      # Retrocompatibilidade: o Worker v4 detecta o formato pelo header n_chunks
+      # e cai no path legado para ficheiros antigos (nonce+auth_tag+ciphertext).
+      #
+      # nonces.json mantido por compatibilidade com o registo no EdgeOne,
+      # mas o Worker já não o usa — os nonces estão embutidos em cada chunk.
       - name: Encriptar segmentos .ts → .bin
         run: |
           python3 << 'PYEOF'
-          import os, json, secrets
-          from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+          import os, json, secrets, struct
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 
           key_hex = os.environ['CHACHA_KEY']
           if len(key_hex) != 64:
             raise ValueError('CHACHA_KEY inválido')
 
-          key    = bytes.fromhex(key_hex)
-          chacha = ChaCha20Poly1305(key)
-          hls_dir= os.environ['WORK_DIR'] + '/hls'
+          key     = bytes.fromhex(key_hex)
+          hls_dir = os.environ['WORK_DIR'] + '/hls'
+
+          CHUNK_SIZE = 65536  # 64KB de plaintext por chunk
+
+          def encrypt_segment(data, key):
+            chunks = [data[i:i+CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
+            out    = [struct.pack('<I', len(chunks))]
+            for chunk in chunks:
+              nonce       = secrets.token_bytes(12)
+              # counter=1 em 4B LE + nonce 12B = 16B nonce field (RFC 8439 compatível)
+              nonce_field = struct.pack('<I', 1) + nonce
+              ct          = Cipher(algorithms.ChaCha20(key, nonce_field), None).encryptor().update(chunk)
+              out.append(nonce)
+              out.append(struct.pack('<I', len(ct)))
+              out.append(ct)
+            return b''.join(out)
 
           seg_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.ts'))
           if not seg_files:
             raise RuntimeError('Nenhum .ts encontrado')
 
+          # nonces.json mantido por compatibilidade — registo EdgeOne usa este ficheiro
           nonce_map = {}
+
           for fname in seg_files:
             src      = os.path.join(hls_dir, fname)
             bin_name = fname.replace('.ts', '.bin')
             dst      = os.path.join(hls_dir, bin_name)
-            nonce    = secrets.token_bytes(12)
 
             with open(src, 'rb') as f:
               data = f.read()
 
-            ct_tag     = chacha.encrypt(nonce, data, None)
-            ciphertext = ct_tag[:-16]
-            auth_tag   = ct_tag[-16:]
+            encrypted = encrypt_segment(data, key)
 
             with open(dst, 'wb') as f:
-              f.write(nonce + auth_tag + ciphertext)
+              f.write(encrypted)
 
             os.remove(src)
-            nonce_map[bin_name] = nonce.hex()
-            print(f"  {fname} → {bin_name}")
+            n_chunks = struct.unpack('<I', encrypted[:4])[0]
+            # nonce_map guarda placeholder — nonces reais estão embutidos no .bin
+            nonce_map[bin_name] = f'chunked:{n_chunks}'
+            print(f"  {fname} → {bin_name} ({len(data)//1024}KB → {n_chunks} chunks)")
 
-          out = {'key_id': os.environ['CHACHA_KEY'][:8], 'nonces': nonce_map}
+          out = {'key_id': os.environ['CHACHA_KEY'][:8], 'format': 'chunk-v2', 'nonces': nonce_map}
           json.dump(out, open(os.environ['WORK_DIR'] + '/nonces.json','w'))
-          print(f"✓ {len(nonce_map)} segmentos encriptados")
+          print(f"✓ {len(seg_files)} segmentos encriptados (chunk format v2, counter=1)")
           PYEOF
 
       # ── 8. Reescrever index.m3u8 ───────────────────────────────────────────
-      # FIX: URLs sem subpasta /{quality}/ — bate com a estrutura real do disco
-      # disco:  $WORK_DIR/hls/seg00001.bin
-      # HTTP:   /tmp/sv_work/{job_id}/hls/seg00001.bin
-      # CDN:    {cdn}/{job_id}/hls/seg00001.bin  ✓
       - name: Reescrever index.m3u8 com URLs CDN
         run: |
           python3 << 'PYEOF'
@@ -418,7 +422,6 @@ jobs:
           with open(hls_dir + '/index.m3u8') as f:
             content = f.read()
 
-          # seg00001.ts → {cdn}/{job_id}/hls/seg00001.bin
           content = re.sub(
             r'^(seg\d+)\.ts$',
             lambda m: f"{cdn_base}/{job_id}/hls/{m.group(1)}.bin",
@@ -432,9 +435,6 @@ jobs:
           PYEOF
 
       # ── 9. Gerar master.m3u8 ───────────────────────────────────────────────
-      # FIX: master.m3u8 fica em $WORK_DIR/ (não em hls/)
-      # disco:  /tmp/sv_work/{job_id}/master.m3u8
-      # CDN:    {cdn}/{job_id}/master.m3u8  ✓
       - name: Gerar master.m3u8
         run: |
           python3 << 'PYEOF'
@@ -455,7 +455,6 @@ jobs:
             f'{cdn_base}/{job_id}/hls/index.m3u8',
           ])
 
-          # master.m3u8 na raiz do job — serve como /tmp/sv_work/{job_id}/master.m3u8
           with open(os.environ['WORK_DIR'] + '/master.m3u8', 'w') as f:
             f.write(master)
 
@@ -543,12 +542,6 @@ jobs:
             || echo "curl falhou"
 
       # ── 12. Warm ───────────────────────────────────────────────────────────
-      # FIX: URLs alinhadas com a estrutura real de dirs no disco
-      #   master:  {cdn}/{job_id}/master.m3u8          (era /hls/master.m3u8)
-      #   nonces:  {cdn}/{job_id}/nonces.json           ✓
-      #   index:   {cdn}/{job_id}/hls/index.m3u8        (era /hls/{quality}/index.m3u8)
-      #   segs:    {cdn}/{job_id}/hls/{bin}             (era /hls/{quality}/{bin})
-      #   thumbs:  {cdn}/{job_id}/thumbs/thumb_N.jpg    ✓
       - name: Aquecer Cloudflare Cache
         run: |
           python3 << 'PYEOF'
@@ -568,14 +561,13 @@ jobs:
               f"{cdn_base}/{job_id}/nonces.json",
               f"{cdn_base}/{job_id}/hls/index.m3u8",
             ] +
-            [f"{cdn_base}/{job_id}/hls/{bn}"        for bn in nonces['nonces']] +
+            [f"{cdn_base}/{job_id}/hls/{bn}"             for bn in nonces['nonces']] +
             [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
           )
 
           def fetch_url(url):
             try:
-              req = ur.Request(url)
-              with ur.urlopen(req, timeout=120) as r:
+              with ur.urlopen(ur.Request(url), timeout=120) as r:
                 body      = r.read()
                 cf_status = r.headers.get('cf-cache-status', 'UNKNOWN')
                 cc        = r.headers.get('cache-control', 'none')
@@ -611,10 +603,8 @@ jobs:
           else:
             if ns1 > 0:
               print(f"⚠ Origem sem Cache-Control público — Cloudflare não guarda")
-
             time.sleep(5)
             hits2, misses2, errors2, ns2 = warm_pass(cdn_urls, '2ª passagem')
-
             if hits2 == len(cdn_urls):
               print(f"✅ Cache aquecido — {hits2}/{len(cdn_urls)} HITs confirmados")
             elif hits2 > 0:
@@ -684,7 +674,7 @@ jobs:
             'videoID':      content_id,
             'cdnUrls':      cdn_urls,
             'encrypted':    True,
-            'encryption':   'chacha20-poly1305',
+            'encryption':   'chacha20-chunk-v2',
             'segExt':       'bin',
             'masterUrl':    f"{cdn_base}/{job_id}/master.m3u8",
             'noncesUrl':    f"{cdn_base}/{job_id}/nonces.json",
