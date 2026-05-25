@@ -250,8 +250,18 @@ jobs:
           print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale}")
           PYEOF
 
-      # ── 5. HLS encode ──────────────────────────────────────────────────────
-      - name: HLS encode (libx264 superfast CRF26 + AAC 128k)
+      # ── 5. HLS encode — fMP4 ───────────────────────────────────────────────
+      #
+      # MUDANÇA vs versão anterior: -hls_segment_type mpegts → fmp4
+      #
+      # Com MPEG-TS o hls.js não consegue processar chunks parciais porque
+      # não determina timestamps sem o segmento completo.
+      # Com fMP4 cada chunk de 64KB decriptado tem moof+mdat próprio —
+      # MSE-válido imediatamente — permitindo onProgress chunk a chunk no player.
+      #
+      # Gera também init.mp4 (init segment fMP4) que é encriptado → init.bin
+      # e referenciado no index.m3u8 via #EXT-X-MAP:URI.
+      - name: HLS encode (fMP4 + libx264 superfast CRF26 + AAC 128k)
         run: |
           HLS_DIR="$WORK_DIR/hls"
           [ "$WILL_SCALE" = "true" ] && SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}" || SCALE_ARGS=""
@@ -268,12 +278,14 @@ jobs:
             -f hls \
             -hls_time ${SEG_DURATION} \
             -hls_playlist_type vod \
-            -hls_segment_type mpegts \
+            -hls_segment_type fmp4 \
+            -hls_fmp4_init_filename "init.mp4" \
             -hls_flags independent_segments \
-            -hls_segment_filename "$HLS_DIR/seg%05d.ts" \
+            -hls_segment_filename "$HLS_DIR/seg%05d.m4s" \
             -y "$HLS_DIR/index.m3u8"
 
-          echo "✓ $(ls $HLS_DIR/*.ts | wc -l) segmentos .ts gerados"
+          echo "✓ $(ls $HLS_DIR/*.m4s | wc -l) segmentos .m4s gerados (fMP4)"
+          echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
       # ── 6. Thumbnails ──────────────────────────────────────────────────────
       - name: Obter thumbnails
@@ -332,25 +344,18 @@ jobs:
         env:
           INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
 
-      # ── 7. Encriptar segmentos .ts → .bin (chunk format v2) ───────────────
+      # ── 7. Encriptar init.mp4 + segmentos .m4s → .bin (chunk format v2) ───
       #
-      # Novo formato .bin — chunk-encrypted:
+      # Formato .bin chunk-v2 inalterado:
       #   [4B]  n_chunks  (uint32 LE)
       #   por cada chunk:
       #     [12B] nonce
       #     [4B]  chunk_len (uint32 LE)
       #     [N B] ciphertext ChaCha20 (counter=1)
       #
-      # Chunk size: 64KB de plaintext — cada chunk decripta em <5ms no Worker.
-      # Overhead: 16 bytes por chunk (12 nonce + 4 len) — negligível.
-      # Counter=1: compatível com Worker JS (ctr=1), consistente com RFC 8439.
-      #
-      # Retrocompatibilidade: o Worker v4 detecta o formato pelo header n_chunks
-      # e cai no path legado para ficheiros antigos (nonce+auth_tag+ciphertext).
-      #
-      # nonces.json mantido por compatibilidade com o registo no EdgeOne,
-      # mas o Worker já não o usa — os nonces estão embutidos em cada chunk.
-      - name: Encriptar segmentos .ts → .bin
+      # Encripta também o init.mp4 → init.bin.
+      # nonces.json mantido por compatibilidade com registo EdgeOne.
+      - name: Encriptar init.mp4 + segmentos .m4s → .bin
         run: |
           python3 << 'PYEOF'
           import os, json, secrets, struct
@@ -370,7 +375,6 @@ jobs:
             out    = [struct.pack('<I', len(chunks))]
             for chunk in chunks:
               nonce       = secrets.token_bytes(12)
-              # counter=1 em 4B LE + nonce 12B = 16B nonce field (RFC 8439 compatível)
               nonce_field = struct.pack('<I', 1) + nonce
               ct          = Cipher(algorithms.ChaCha20(key, nonce_field), None).encryptor().update(chunk)
               out.append(nonce)
@@ -378,16 +382,30 @@ jobs:
               out.append(ct)
             return b''.join(out)
 
-          seg_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.ts'))
-          if not seg_files:
-            raise RuntimeError('Nenhum .ts encontrado')
-
-          # nonces.json mantido por compatibilidade — registo EdgeOne usa este ficheiro
           nonce_map = {}
+
+          # Encriptar init.mp4 → init.bin
+          init_src = os.path.join(hls_dir, 'init.mp4')
+          init_dst = os.path.join(hls_dir, 'init.bin')
+          if os.path.exists(init_src):
+            with open(init_src, 'rb') as f:
+              data = f.read()
+            encrypted = encrypt_segment(data, key)
+            with open(init_dst, 'wb') as f:
+              f.write(encrypted)
+            os.remove(init_src)
+            n_chunks = struct.unpack('<I', encrypted[:4])[0]
+            nonce_map['init.bin'] = f'chunked:{n_chunks}'
+            print(f"  init.mp4 → init.bin ({len(data)//1024}KB → {n_chunks} chunks)")
+
+          # Encriptar segmentos .m4s → .bin
+          seg_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.m4s'))
+          if not seg_files:
+            raise RuntimeError('Nenhum .m4s encontrado')
 
           for fname in seg_files:
             src      = os.path.join(hls_dir, fname)
-            bin_name = fname.replace('.ts', '.bin')
+            bin_name = fname.replace('.m4s', '.bin')
             dst      = os.path.join(hls_dir, bin_name)
 
             with open(src, 'rb') as f:
@@ -400,16 +418,19 @@ jobs:
 
             os.remove(src)
             n_chunks = struct.unpack('<I', encrypted[:4])[0]
-            # nonce_map guarda placeholder — nonces reais estão embutidos no .bin
             nonce_map[bin_name] = f'chunked:{n_chunks}'
             print(f"  {fname} → {bin_name} ({len(data)//1024}KB → {n_chunks} chunks)")
 
           out = {'key_id': os.environ['CHACHA_KEY'][:8], 'format': 'chunk-v2', 'nonces': nonce_map}
           json.dump(out, open(os.environ['WORK_DIR'] + '/nonces.json','w'))
-          print(f"✓ {len(seg_files)} segmentos encriptados (chunk format v2, counter=1)")
+          print(f"✓ {len(seg_files)} segmentos + init encriptados (chunk format v2, fMP4)")
           PYEOF
 
-      # ── 8. Reescrever index.m3u8 ───────────────────────────────────────────
+      # ── 8. Reescrever index.m3u8 com URLs CDN ─────────────────────────────
+      #
+      # fMP4 gera no m3u8:
+      #   #EXT-X-MAP:URI="init.mp4"  → reescrito para init.bin no CDN
+      #   seg00001.m4s               → reescrito para seg00001.bin no CDN
       - name: Reescrever index.m3u8 com URLs CDN
         run: |
           python3 << 'PYEOF'
@@ -422,8 +443,16 @@ jobs:
           with open(hls_dir + '/index.m3u8') as f:
             content = f.read()
 
+          # Reescrever URI do init segment
           content = re.sub(
-            r'^(seg\d+)\.ts$',
+            r'#EXT-X-MAP:URI="init\.mp4"',
+            f'#EXT-X-MAP:URI="{cdn_base}/{job_id}/hls/init.bin"',
+            content
+          )
+
+          # Reescrever URIs dos segmentos .m4s → .bin
+          content = re.sub(
+            r'^(seg\d+)\.m4s$',
             lambda m: f"{cdn_base}/{job_id}/hls/{m.group(1)}.bin",
             content, flags=re.MULTILINE
           )
@@ -431,10 +460,12 @@ jobs:
           with open(hls_dir + '/index.m3u8', 'w') as f:
             f.write(content)
 
-          print(f"✓ index.m3u8 → {cdn_base}/{job_id}/hls/")
+          print(f"✓ index.m3u8 reescrito (fMP4) → {cdn_base}/{job_id}/hls/")
           PYEOF
 
       # ── 9. Gerar master.m3u8 ───────────────────────────────────────────────
+      #
+      # fMP4 requer EXT-X-VERSION:6 e CODECS com mp4a.40.2
       - name: Gerar master.m3u8
         run: |
           python3 << 'PYEOF'
@@ -449,7 +480,7 @@ jobs:
 
           master = '\n'.join([
             '#EXTM3U',
-            '#EXT-X-VERSION:3',
+            '#EXT-X-VERSION:6',
             '',
             f'#EXT-X-STREAM-INF:BANDWIDTH={bitrate},RESOLUTION={eff_w}x{eff_h},CODECS="avc1.640028,mp4a.40.2"',
             f'{cdn_base}/{job_id}/hls/index.m3u8',
@@ -458,7 +489,7 @@ jobs:
           with open(os.environ['WORK_DIR'] + '/master.m3u8', 'w') as f:
             f.write(master)
 
-          print(f"✓ master.m3u8: {eff_w}x{eff_h} | {bitrate}bps")
+          print(f"✓ master.m3u8: {eff_w}x{eff_h} | {bitrate}bps (EXT-X-VERSION:6 fMP4)")
           print(f"  → CDN: {cdn_base}/{job_id}/master.m3u8")
           PYEOF
 
@@ -560,8 +591,9 @@ jobs:
               f"{cdn_base}/{job_id}/master.m3u8",
               f"{cdn_base}/{job_id}/nonces.json",
               f"{cdn_base}/{job_id}/hls/index.m3u8",
+              f"{cdn_base}/{job_id}/hls/init.bin",
             ] +
-            [f"{cdn_base}/{job_id}/hls/{bn}"             for bn in nonces['nonces']] +
+            [f"{cdn_base}/{job_id}/hls/{bn}" for bn in nonces['nonces'] if bn != 'init.bin'] +
             [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
           )
 
@@ -650,7 +682,7 @@ jobs:
           cdn_urls = json.load(open(work_dir + '/cdn_urls.json'))
 
           content_id = metadata.get('contentId', job_id)
-          seg_count  = len(nonces['nonces'])
+          seg_count  = len([k for k in nonces['nonces'] if k != 'init.bin'])
           thumb_urls = [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
 
           body = {
@@ -675,6 +707,7 @@ jobs:
             'cdnUrls':      cdn_urls,
             'encrypted':    True,
             'encryption':   'chacha20-chunk-v2',
+            'container':    'fmp4',
             'segExt':       'bin',
             'masterUrl':    f"{cdn_base}/{job_id}/master.m3u8",
             'noncesUrl':    f"{cdn_base}/{job_id}/nonces.json",
