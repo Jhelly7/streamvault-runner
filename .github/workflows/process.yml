@@ -151,7 +151,15 @@ jobs:
 
           else
             echo "→ Modo URL directa (curl)"
-            curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
+            curl -L --max-redirs 500 \
+              --retry 5 --retry-delay 10 --retry-max-time 300 \
+              --progress-bar --fail \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+              -H "Accept: */*" \
+              -H "Accept-Language: pt-BR,pt;q=0.9,en;q=0.8" \
+              -H "Accept-Encoding: identity" \
+              -H "Connection: keep-alive" \
+              -H "Referer: https://dattebane.com/" \
               -o "$WORK_DIR/incoming/input.video" \
               "$URL"
 
