@@ -414,7 +414,12 @@ jobs:
       # ── 10. Criar Release e upload assets ──────────────────────────────────
       #
       # Mede o tamanho total dos assets ANTES de qualquer chamada à API.
-      # Se ultrapassar 1.8 GB → UPLOAD_SKIP=true, salta tudo, workflow continua.
+      # Se ultrapassar 1.5 GB → UPLOAD_SKIP=true, salta tudo, workflow continua.
+      # O limite é conservador (1.5 GB) para evitar falhas a meio do upload:
+      # o GitHub Releases tem limite de 2 GB por release mas conta overhead
+      # de metadados por asset, pelo que filmes grandes falham antes do limite
+      # nominal. Filmes grandes ficam servidos exclusivamente pelo cache
+      # do Cloudflare (aquecido no step 12).
       - name: Criar Release e upload assets
         id: upload_assets
         continue-on-error: true
@@ -433,7 +438,13 @@ jobs:
           job_id        = os.environ['JOB_ID']
           quality       = os.environ['QUALITY_LABEL']
           github_env    = os.environ['GITHUB_ENV']
-          RELEASE_LIMIT = 1_800 * 1024 * 1024
+
+          # ── Limite conservador: 1.5 GB ────────────────────────────────────
+          # O GitHub Releases suporta até 2 GB por release, mas o overhead de
+          # metadados por asset faz falhar antes do limite nominal em filmes
+          # com muitos segmentos. 1.5 GB garante que nunca falha a meio.
+          RELEASE_LIMIT = 1_500 * 1024 * 1024
+
           assets = []
           for fpath, mime in [
             (os.path.join(work_dir, 'master.m3u8'), 'application/vnd.apple.mpegurl'),
@@ -449,15 +460,19 @@ jobs:
           if os.path.isdir(thumb_dir):
             for f in sorted(f for f in os.listdir(thumb_dir) if f.endswith('.jpg')):
               assets.append((os.path.join(thumb_dir, f), f, 'image/jpeg'))
+
           total_bytes = sum(os.path.getsize(p) for p, _, _ in assets)
           total_mb    = total_bytes / (1024 * 1024)
-          print(f"  Total assets: {len(assets)} ficheiros | {total_mb:.1f} MB")
+          limit_mb    = RELEASE_LIMIT / (1024 * 1024)
+          print(f"  Total assets: {len(assets)} ficheiros | {total_mb:.1f} MB (limite: {limit_mb:.0f} MB)")
+
           if total_bytes > RELEASE_LIMIT:
-            print(f"  ⚠ {total_mb:.0f} MB > limite 1800 MB — upload ignorado")
-            print(f"  → warm e EdgeOne continuam via CDN/tunnel")
+            print(f"  ⚠ {total_mb:.0f} MB > {limit_mb:.0f} MB — upload ignorado")
+            print(f"  → conteúdo servido exclusivamente pelo cache Cloudflare")
             with open(github_env, 'a') as f:
               f.write("UPLOAD_SKIP=true\n")
             sys.exit(0)
+
           try:
             meta = json.loads(os.environ.get('METADATA', '{}'))
           except Exception:
