@@ -66,7 +66,9 @@ jobs:
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
-          python3 -c "
+
+          # Servidor HTTP — escrito em ficheiro para evitar problemas de quoting
+          python3 << 'PYEOF'
 import http.server, os
 
 class CacheHandler(http.server.SimpleHTTPRequestHandler):
@@ -79,7 +81,7 @@ class CacheHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a): pass
 
 http.server.HTTPServer(('', 8080), CacheHandler).serve_forever()
-" &
+PYEOF
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
 
           mkdir -p ~/.cloudflared
@@ -238,6 +240,8 @@ PYEOF
           [ "$WILL_SCALE" = "true" ] && SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}" || SCALE_ARGS=""
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
           echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s)"
+          # Keepalive: bate no servidor HTTP local a cada 30s para manter o
+          # tunnel do Cloudflare activo durante o encode (pode demorar horas).
           (while true; do
             curl -sf http://localhost:8080/ -o /dev/null 2>/dev/null || true
             sleep 30
@@ -453,6 +457,7 @@ job_id        = os.environ['JOB_ID']
 quality       = os.environ['QUALITY_LABEL']
 github_env    = os.environ['GITHUB_ENV']
 
+# Limite conservador: 1.5 GB
 RELEASE_LIMIT = 1_500 * 1024 * 1024
 
 assets = []
@@ -561,7 +566,7 @@ PYEOF
           echo "HTTP local: $HTTP_LOCAL"
           if [ "$HTTP_LOCAL" = "000" ]; then
             echo "⚠ Servidor HTTP morto — a reiniciar..."
-            python3 -c "
+            python3 << 'PYEOF'
 import http.server, os
 
 class CacheHandler(http.server.SimpleHTTPRequestHandler):
@@ -574,7 +579,7 @@ class CacheHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a): pass
 
 http.server.HTTPServer(('', 8080), CacheHandler).serve_forever()
-" &
+PYEOF
             echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
           fi
 
