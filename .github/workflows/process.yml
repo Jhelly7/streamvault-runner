@@ -66,8 +66,11 @@ jobs:
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
-          python3 - << 'PYEOF' &
+          
+          # Iniciar servidor HTTP Python em background
+          cat > /tmp/http_server.py << 'PYEOF'
 import http.server, os
+
 class CacheHandler(http.server.SimpleHTTPRequestHandler):
   def __init__(self, *a, **kw):
     super().__init__(*a, directory='/tmp/sv_work', **kw)
@@ -76,9 +79,12 @@ class CacheHandler(http.server.SimpleHTTPRequestHandler):
     self.send_header('Access-Control-Allow-Origin', '*')
     super().end_headers()
   def log_message(self, *a): pass
+
 http.server.HTTPServer(('', 8080), CacheHandler).serve_forever()
 PYEOF
+          python3 /tmp/http_server.py &
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
+          
           mkdir -p ~/.cloudflared
           CDN_HOST=$(echo "${{ secrets.CDN_DOMAIN }}" | sed 's|https\?://||')
           cat > ~/.cloudflared/config.yml << EOF
@@ -109,13 +115,11 @@ PYEOF
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ffmpeg
           ffmpeg -version | head -1
-
       # ── 2. Instalar dependências Python + aria2 ────────────────────────────
       - name: Instalar dependências
         run: |
           pip install --quiet cryptography yt-dlp
           sudo apt-get install -y --no-install-recommends aria2
-
       # ── 3. Obter vídeo ─────────────────────────────────────────────────────
       - name: '[Modo A] Descarregar vídeo'
         if: ${{ inputs.video_url != '' }}
@@ -154,7 +158,6 @@ PYEOF
               exit 1
             fi
           fi
-
       - name: '[Modo B] Obter vídeo via Artifact'
         if: ${{ inputs.video_url == '' }}
         uses: actions/download-artifact@v4
@@ -175,7 +178,6 @@ PYEOF
           fi
           echo "VIDEO_PATH=$VIDEO_PATH" >> $GITHUB_ENV
           echo "Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
-
       # ── 4. Probe ───────────────────────────────────────────────────────────
       - name: Probe do vídeo
         run: |
@@ -238,7 +240,6 @@ PYEOF
           [ "$WILL_SCALE" = "true" ] && SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}" || SCALE_ARGS=""
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
           echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s)"
-
           # Keepalive: bate no servidor HTTP local a cada 30s para manter o
           # tunnel do Cloudflare activo durante o encode (pode demorar horas).
           (while true; do
@@ -246,7 +247,6 @@ PYEOF
             sleep 30
           done) &
           KEEPALIVE_PID=$!
-
           ffmpeg -hide_banner -loglevel warning -stats \
             -i "$VIDEO_PATH" \
             $SCALE_ARGS \
@@ -261,11 +261,9 @@ PYEOF
             -hls_flags independent_segments \
             -hls_segment_filename "$HLS_DIR/seg%05d.m4s" \
             -y "$HLS_DIR/index.m3u8"
-
           kill "$KEEPALIVE_PID" 2>/dev/null || true
           echo "✓ $(ls $HLS_DIR/*.m4s | wc -l) segmentos .m4s gerados (fMP4)"
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
-
       # ── 6. Thumbnails ──────────────────────────────────────────────────────
       - name: Obter thumbnails
         env:
@@ -544,25 +542,13 @@ PYEOF
             echo "TUNNEL_PID=$NEW_PID" >> $GITHUB_ENV
             echo "  Novo PID: $NEW_PID"
           fi
-
           echo ""
           echo "=== Teste servidor HTTP local porta 8080 ==="
           HTTP_LOCAL=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/ 2>/dev/null || echo "000")
           echo "HTTP local: $HTTP_LOCAL"
           if [ "$HTTP_LOCAL" = "000" ]; then
             echo "⚠ Servidor HTTP morto — a reiniciar..."
-            python3 - << 'PYEOF' &
-import http.server, os
-class CacheHandler(http.server.SimpleHTTPRequestHandler):
-  def __init__(self, *a, **kw):
-    super().__init__(*a, directory='/tmp/sv_work', **kw)
-  def end_headers(self):
-    self.send_header('Cache-Control', 'public, max-age=31536000, immutable')
-    self.send_header('Access-Control-Allow-Origin', '*')
-    super().end_headers()
-  def log_message(self, *a): pass
-http.server.HTTPServer(('', 8080), CacheHandler).serve_forever()
-PYEOF
+            python3 /tmp/http_server.py &
             echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
           fi
 
@@ -660,7 +646,6 @@ PYEOF
           [ -n "$TUNNEL_PID" ]      && kill "$TUNNEL_PID"      2>/dev/null || true
           [ -n "$HTTP_SERVER_PID" ] && kill "$HTTP_SERVER_PID" 2>/dev/null || true
           echo "✓ Tunnel e servidor HTTP desligados"
-
       # ── 14. Registar no EdgeOne ────────────────────────────────────────────
       - name: Registar no EdgeOne (Turso + KV)
         env:
