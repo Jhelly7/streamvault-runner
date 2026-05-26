@@ -289,6 +289,8 @@ jobs:
 
       # ── 6. Thumbnails ──────────────────────────────────────────────────────
       - name: Obter thumbnails
+        env:
+          INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
         run: |
           python3 << 'PYEOF'
           import subprocess, os, json, shutil
@@ -341,8 +343,6 @@ jobs:
           json.dump(thumbs, open(os.environ['WORK_DIR'] + '/thumbs_manifest.json','w'))
           print(f"✓ {len(thumbs)} thumbnail(s)")
           PYEOF
-        env:
-          INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
 
       # ── 7. Encriptar init.mp4 + segmentos .m4s → .bin (chunk format v2) ───
       #
