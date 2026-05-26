@@ -117,7 +117,7 @@ jobs:
       # ── 2. Instalar dependências Python + aria2 ────────────────────────────
       - name: Instalar dependências
         run: |
-          pip install --quiet cryptography yt-dlp
+          pip install --quiet --upgrade cryptography "yt-dlp[default]"
           sudo apt-get install -y --no-install-recommends aria2
 
       # ── 3. Obter vídeo ─────────────────────────────────────────────────────
@@ -142,6 +142,10 @@ jobs:
               --convert-thumbnails jpg \
               --output "$WORK_DIR/incoming/%(title)s.%(ext)s" \
               --no-playlist \
+              --extractor-retries 5 \
+              --retries 5 \
+              --no-check-certificates \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
               "$URL"
             YT_THUMB=$(find "$WORK_DIR/incoming/" -maxdepth 1 -iname "*.jpg" | head -1)
             [ -n "$YT_THUMB" ] && echo "YT_THUMB_PATH=$YT_THUMB" >> $GITHUB_ENV
@@ -282,14 +286,32 @@ jobs:
           thumbs = []
           if thumb_url:
             out = f"{thumb_dir}/thumb_0.jpg"
+            # Tentar primeiro com curl (User-Agent de navegador)
             r = subprocess.run([
-              'curl', '-L', '--retry', '3', '--fail', '-o', out, thumb_url
+              'curl', '-L', '--retry', '5', '--retry-delay', '3',
+              '--max-time', '45',
+              '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              '-H', 'Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+              '-H', 'Accept-Language: pt-BR,pt;q=0.9,en;q=0.8',
+              '-H', 'Sec-Fetch-Dest: image',
+              '-H', 'Sec-Fetch-Mode: no-cors',
+              '-H', 'Sec-Fetch-Site: cross-site',
+              '-o', out, thumb_url
             ], capture_output=True)
-            if r.returncode == 0:
+            # Se falhar, tentar com wget como fallback
+            if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1000:
+              if os.path.exists(out): os.remove(out)
+              r = subprocess.run([
+                'wget', '--timeout=30', '--tries=5',
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                '-O', out, thumb_url
+              ], capture_output=True)
+            if os.path.exists(out) and os.path.getsize(out) > 1000:
               thumbs.append({'path': out, 'time': 0, 'index': 0})
               print(f"✓ Thumbnail submetida: {thumb_url}")
             else:
               print(f"⚠ Falhou download da thumbnail — fallback para 6 frames")
+              if os.path.exists(out): os.remove(out)
           elif yt_thumb and os.path.exists(yt_thumb):
             dst = f"{thumb_dir}/thumb_0.jpg"
             shutil.copy(yt_thumb, dst)
