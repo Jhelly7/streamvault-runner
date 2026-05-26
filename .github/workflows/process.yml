@@ -68,30 +68,31 @@ jobs:
           chmod +x /usr/local/bin/cloudflared
 
           # Servidor HTTP — escrito em ficheiro para evitar problemas de quoting
-          python3 << 'PYEOF'
-import http.server, os
-
-class CacheHandler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *a, **kw):
-        super().__init__(*a, directory='/tmp/sv_work', **kw)
-    def end_headers(self):
-        self.send_header('Cache-Control', 'public, max-age=31536000, immutable')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        super().end_headers()
-    def log_message(self, *a): pass
-
-http.server.HTTPServer(('', 8080), CacheHandler).serve_forever()
-PYEOF
+          printf '%s\n' \
+            'import http.server, os' \
+            '' \
+            'class CacheHandler(http.server.SimpleHTTPRequestHandler):' \
+            '    def __init__(self, *a, **kw):' \
+            '        super().__init__(*a, directory="/tmp/sv_work", **kw)' \
+            '    def end_headers(self):' \
+            '        self.send_header("Cache-Control", "public, max-age=31536000, immutable")' \
+            '        self.send_header("Access-Control-Allow-Origin", "*")' \
+            '        super().end_headers()' \
+            '    def log_message(self, *a): pass' \
+            '' \
+            'http.server.HTTPServer(("", 8080), CacheHandler).serve_forever()' \
+            > /tmp/http_server.py
+          python3 /tmp/http_server.py &
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
 
           mkdir -p ~/.cloudflared
           CDN_HOST=$(echo "${{ secrets.CDN_DOMAIN }}" | sed 's|https\?://||')
           cat > ~/.cloudflared/config.yml << EOF
-ingress:
-  - hostname: ${CDN_HOST}
-    service: http://localhost:8080
-  - service: http_status:404
-EOF
+          ingress:
+            - hostname: ${CDN_HOST}
+              service: http://localhost:8080
+            - service: http_status:404
+          EOF
           cloudflared tunnel --no-autoupdate \
             --config ~/.cloudflared/config.yml \
             run --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" &
@@ -566,20 +567,7 @@ PYEOF
           echo "HTTP local: $HTTP_LOCAL"
           if [ "$HTTP_LOCAL" = "000" ]; then
             echo "⚠ Servidor HTTP morto — a reiniciar..."
-            python3 << 'PYEOF'
-import http.server, os
-
-class CacheHandler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *a, **kw):
-        super().__init__(*a, directory='/tmp/sv_work', **kw)
-    def end_headers(self):
-        self.send_header('Cache-Control', 'public, max-age=31536000, immutable')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        super().end_headers()
-    def log_message(self, *a): pass
-
-http.server.HTTPServer(('', 8080), CacheHandler).serve_forever()
-PYEOF
+            python3 /tmp/http_server.py &
             echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
           fi
 
