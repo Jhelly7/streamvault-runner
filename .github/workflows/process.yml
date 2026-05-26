@@ -495,175 +495,127 @@ jobs:
 
       # ── 10. Criar Release e upload assets ──────────────────────────────────
       #
-      # FIX: upload com retry+backoff, timeout explícito por ficheiro,
-      # continue-on-error para não abortar warm/EdgeOne em caso de falha.
-      # Ficheiros grandes (>2GB de vídeo = muitos .bin) podem demorar;
-      # o step fica ⚠ amarelo se algum falhar mas o workflow continua.
-      - name: Criar Release no repo de storage
-        id: create_release
+      # Estratégia: medir o tamanho total dos assets ANTES de qualquer chamada
+      # à API. Se o total ultrapassar 1.8GB (limite seguro da GitHub Release API)
+      # o upload é ignorado por completo — UPLOAD_SKIP=true — e o workflow
+      # continua normalmente para warm e EdgeOne, que funcionam via CDN/tunnel
+      # independentemente do Release.
+      # Abaixo do limite faz upload directo sem retry nem overhead desnecessário.
+      - name: Criar Release e upload assets
+        id: upload_assets
+        continue-on-error: true
         env:
           STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
           STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
           STORAGE_REPO:  ${{ secrets.STORAGE_GITHUB_REPO }}
         run: |
-          TITLE=$(echo '${{ inputs.metadata }}' | python3 -c "
-          import json,sys
-          try: print(json.load(sys.stdin).get('title','Untitled'))
-          except: print('Untitled')
-          ")
-
-          RESPONSE=$(curl -sf -X POST \
-            -H "Authorization: Bearer $STORAGE_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/$STORAGE_OWNER/$STORAGE_REPO/releases" \
-            -d "{
-              \"tag_name\": \"${JOB_ID}\",
-              \"name\": \"${TITLE}\",
-              \"body\": \"jobId=${JOB_ID} | quality=${QUALITY_LABEL}\",
-              \"draft\": false,
-              \"prerelease\": false
-            }")
-
-          UPLOAD_URL=$(echo "$RESPONSE" | python3 -c "
-          import json,sys; print(json.load(sys.stdin)['upload_url'].split('{')[0])
-          ")
-          echo "UPLOAD_URL=$UPLOAD_URL" >> $GITHUB_ENV
-          echo "upload_url=$UPLOAD_URL" >> $GITHUB_OUTPUT
-          echo "✓ Release criada: tag=${JOB_ID}"
-
-      - name: Upload assets para a Release
-        id: upload_assets
-        # Nunca aborta o workflow — warm (step 12) e EdgeOne (step 14) correm sempre
-        continue-on-error: true
-        env:
-          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
-        run: |
           python3 << 'PYEOF'
-          import os, subprocess, time, sys
+          import os, subprocess, sys, json
 
-          upload_url    = os.environ['UPLOAD_URL']
-          storage_token = os.environ['STORAGE_TOKEN']
           work_dir      = os.environ['WORK_DIR']
+          storage_token = os.environ['STORAGE_TOKEN']
+          storage_owner = os.environ['STORAGE_OWNER']
+          storage_repo  = os.environ['STORAGE_REPO']
+          job_id        = os.environ['JOB_ID']
+          quality       = os.environ['QUALITY_LABEL']
+          github_env    = os.environ['GITHUB_ENV']
 
-          # ── Upload com retry e backoff exponencial ─────────────────────────
-          # Retorna True se bem-sucedido, False após esgotar tentativas.
-          # Nunca levanta excepção — o loop de ficheiros continua sempre.
-          def upload(file_path, asset_name, mime, max_retries=4, timeout=300):
-            for attempt in range(1, max_retries + 1):
-              try:
-                result = subprocess.run([
-                  'curl',
-                  '--silent', '--show-error',
-                  '--output', '/dev/null',
-                  '--write-out', '%{http_code}',
-                  '--request', 'POST',
-                  '--header', f'Authorization: Bearer {storage_token}',
-                  '--header', f'Content-Type: {mime}',
-                  '--max-time', str(timeout),   # timeout absoluto por ficheiro
-                  '--retry', '0',               # retries geridos aqui, não pelo curl
-                  f'{upload_url}?name={asset_name}',
-                  '--data-binary', f'@{file_path}',
-                ], capture_output=True, text=True, timeout=timeout + 15)
+          RELEASE_LIMIT = 1_800 * 1024 * 1024  # 1.8 GB — margem segura abaixo dos 2 GB da API
 
-                http_code = result.stdout.strip()
-
-                if http_code == '201':
-                  size_kb = os.path.getsize(file_path) // 1024
-                  print(f"  ✓ {asset_name} ({size_kb}KB)")
-                  return True
-
-                # 422 = asset já existe nesta Release (re-run) — trata como ok
-                if http_code == '422':
-                  print(f"  ⚠ {asset_name} já existe na Release (422) — ignorado")
-                  return True
-
-                print(f"  ✗ {asset_name} HTTP {http_code} (tentativa {attempt}/{max_retries})")
-
-              except subprocess.TimeoutExpired:
-                print(f"  ✗ {asset_name} timeout após {timeout}s (tentativa {attempt}/{max_retries})")
-              except Exception as e:
-                print(f"  ✗ {asset_name} erro inesperado: {e} (tentativa {attempt}/{max_retries})")
-
-              if attempt < max_retries:
-                wait = 2 ** attempt    # backoff: 2s → 4s → 8s
-                print(f"    aguardando {wait}s antes de nova tentativa...")
-                time.sleep(wait)
-
-            return False
-
-          # ── Lista ordenada de assets ───────────────────────────────────────
+          # ── Construir lista de assets ──────────────────────────────────────
           assets = []
 
-          # Manifestos + metadados (pequenos, prioritários)
           for fname, mime in [
-            ('master.m3u8', 'application/vnd.apple.mpegurl'),
-            ('nonces.json', 'application/json'),
+            (os.path.join(work_dir, 'master.m3u8'), 'application/vnd.apple.mpegurl'),
+            (os.path.join(work_dir, 'hls', 'index.m3u8'), 'application/vnd.apple.mpegurl'),
+            (os.path.join(work_dir, 'nonces.json'), 'application/json'),
           ]:
-            p = os.path.join(work_dir, fname)
-            if os.path.exists(p):
-              assets.append((p, fname, mime))
+            if os.path.exists(fname):
+              assets.append((fname, os.path.basename(fname), mime))
 
-          p_index = os.path.join(work_dir, 'hls', 'index.m3u8')
-          if os.path.exists(p_index):
-            assets.append((p_index, 'index.m3u8', 'application/vnd.apple.mpegurl'))
-
-          # Segmentos encriptados — sorted para ordem determinística
           hls_dir = os.path.join(work_dir, 'hls')
-          bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin'))
-          for fname in bin_files:
-            assets.append((os.path.join(hls_dir, fname), fname, 'application/octet-stream'))
+          for f in sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin')):
+            assets.append((os.path.join(hls_dir, f), f, 'application/octet-stream'))
 
-          # Thumbnails
           thumb_dir = os.path.join(work_dir, 'thumbs')
           if os.path.isdir(thumb_dir):
-            for fname in sorted(f for f in os.listdir(thumb_dir) if f.endswith('.jpg')):
-              assets.append((os.path.join(thumb_dir, fname), fname, 'image/jpeg'))
+            for f in sorted(f for f in os.listdir(thumb_dir) if f.endswith('.jpg')):
+              assets.append((os.path.join(thumb_dir, f), f, 'image/jpeg'))
 
-          # ── Executar uploads ───────────────────────────────────────────────
-          total  = len(assets)
-          ok     = 0
-          failed = []
+          # ── Medir tamanho total antes de qualquer chamada à API ────────────
+          total_bytes = sum(os.path.getsize(p) for p, _, _ in assets)
+          total_mb    = total_bytes / (1024 * 1024)
+          print(f"  Total assets: {len(assets)} ficheiros | {total_mb:.1f} MB")
 
-          print(f"A enviar {total} assets para a Release...")
+          if total_bytes > RELEASE_LIMIT:
+            print(f"  ⚠ {total_mb:.0f} MB > limite 1800 MB — upload ignorado")
+            print(f"  → warm e EdgeOne continuam via CDN/tunnel")
+            with open(github_env, 'a') as f:
+              f.write("UPLOAD_SKIP=true\n")
+            sys.exit(0)
 
+          # ── Criar Release ──────────────────────────────────────────────────
+          try:
+            meta = json.loads(os.environ.get('METADATA', '{}'))
+          except Exception:
+            meta = {}
+          title = meta.get('title', 'Untitled')
+
+          r = subprocess.run([
+            'curl', '-sf', '-X', 'POST',
+            '-H', f'Authorization: Bearer {storage_token}',
+            '-H', 'Accept: application/vnd.github+json',
+            '-H', 'X-GitHub-Api-Version: 2022-11-28',
+            f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases',
+            '-d', json.dumps({
+              'tag_name':   job_id,
+              'name':       title,
+              'body':       f'jobId={job_id} | quality={quality}',
+              'draft':      False,
+              'prerelease': False,
+            }),
+          ], capture_output=True, text=True)
+
+          if r.returncode != 0:
+            print(f"  ✗ Falha ao criar Release: {r.stderr.strip()}")
+            with open(github_env, 'a') as f:
+              f.write("UPLOAD_SKIP=true\n")
+            sys.exit(0)
+
+          upload_url = json.loads(r.stdout)['upload_url'].split('{')[0]
+          print(f"  ✓ Release criada: tag={job_id}")
+
+          # ── Upload directo — sem retry, sem overhead ───────────────────────
+          ok = 0
           for file_path, asset_name, mime in assets:
-            if upload(file_path, asset_name, mime):
+            size_kb = os.path.getsize(file_path) // 1024
+            r = subprocess.run([
+              'curl', '-sf',
+              '-o', '/dev/null', '-w', '%{http_code}',
+              '-X', 'POST',
+              '-H', f'Authorization: Bearer {storage_token}',
+              '-H', f'Content-Type: {mime}',
+              '--max-time', '120',
+              f'{upload_url}?name={asset_name}',
+              '--data-binary', f'@{file_path}',
+            ], capture_output=True, text=True)
+
+            code = r.stdout.strip()
+            if code == '201':
+              print(f"  ✓ {asset_name} ({size_kb}KB)")
               ok += 1
             else:
-              failed.append(asset_name)
+              print(f"  ✗ {asset_name} HTTP {code} — abortando upload")
+              with open(github_env, 'a') as f:
+                f.write("UPLOAD_SKIP=true\n")
+              sys.exit(0)
 
-          # ── Sumário ────────────────────────────────────────────────────────
-          print(f"\n── Sumário upload ──────────────────────────────")
-          print(f"  ✓ {ok}/{total} assets enviados com sucesso")
-
-          if failed:
-            print(f"  ✗ {len(failed)} falharam:")
-            for name in failed:
-              print(f"      - {name}")
-            # Persiste lista de falhas para o step de diagnóstico
-            with open(os.path.join(work_dir, 'upload_failures.txt'), 'w') as fh:
-              fh.write('\n'.join(failed))
-            # exit(1) marca o step como ⚠ (falhou), mas continue-on-error
-            # impede que o workflow pare — warm e EdgeOne continuam.
-            sys.exit(1)
-          else:
-            print(f"  ✅ Upload completo sem erros")
+          print(f"  ✅ {ok}/{len(assets)} assets enviados")
+          with open(github_env, 'a') as f:
+            f.write("UPLOAD_SKIP=false\n")
           PYEOF
-
-      # Diagnóstico: corre sempre, resume o resultado do upload
-      - name: Verificar resultado do upload
-        if: always()
-        run: |
-          FAIL_FILE="$WORK_DIR/upload_failures.txt"
-          if [ -f "$FAIL_FILE" ]; then
-            echo "⚠ Assets que falharam o upload (podem ser re-enviados manualmente à Release):"
-            cat "$FAIL_FILE"
-            echo ""
-            echo "As fases seguintes (warm + EdgeOne) continuam normalmente."
-          else
-            echo "✓ Todos os assets foram enviados com sucesso."
-          fi
+        env:
+          METADATA: ${{ inputs.metadata }}
 
       # ── 11. Debug tunnel ───────────────────────────────────────────────────
       - name: Debug tunnel
