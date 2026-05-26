@@ -63,11 +63,9 @@ jobs:
           echo "SEG_DURATION=${{ inputs.seg_duration }}" >> $GITHUB_ENV
           echo "MAX_H=${{ inputs.max_encode_height }}"   >> $GITHUB_ENV
           echo "WARM_C=${{ inputs.warm_concurrency }}"   >> $GITHUB_ENV
-
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
-
           python3 - << 'PYEOF' &
           import http.server, os
           class CacheHandler(http.server.SimpleHTTPRequestHandler):
@@ -81,7 +79,6 @@ jobs:
           http.server.HTTPServer(('', 8080), CacheHandler).serve_forever()
           PYEOF
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
-
           mkdir -p ~/.cloudflared
           CDN_HOST=$(echo "${{ secrets.CDN_DOMAIN }}" | sed 's|https\?://||')
           cat > ~/.cloudflared/config.yml << EOF
@@ -90,12 +87,10 @@ jobs:
               service: http://localhost:8080
             - service: http_status:404
           EOF
-
           cloudflared tunnel --no-autoupdate \
             --config ~/.cloudflared/config.yml \
             run --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" &
           echo "TUNNEL_PID=$!" >> $GITHUB_ENV
-
           echo "Aguardando tunnel..."
           for i in $(seq 1 20); do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -126,7 +121,6 @@ jobs:
         if: ${{ inputs.video_url != '' }}
         run: |
           URL="${{ inputs.video_url }}"
-
           if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]]; then
             echo "→ Modo torrent (aria2c)"
             aria2c \
@@ -135,7 +129,6 @@ jobs:
               --max-connection-per-server=4 \
               --bt-stop-timeout=600 \
               "$URL"
-
           elif [[ "$URL" == *youtube.com* ]] || [[ "$URL" == *youtu.be* ]]; then
             echo "→ Modo YouTube (yt-dlp)"
             yt-dlp \
@@ -148,13 +141,11 @@ jobs:
               "$URL"
             YT_THUMB=$(find "$WORK_DIR/incoming/" -maxdepth 1 -iname "*.jpg" | head -1)
             [ -n "$YT_THUMB" ] && echo "YT_THUMB_PATH=$YT_THUMB" >> $GITHUB_ENV
-
           else
             echo "→ Modo URL directa (curl)"
             curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
               -o "$WORK_DIR/incoming/input.video" \
               "$URL"
-
             SIZE=$(stat -c%s "$WORK_DIR/incoming/input.video" 2>/dev/null || echo 0)
             echo "✓ Download: $(du -sh $WORK_DIR/incoming/input.video | cut -f1) ($SIZE bytes)"
             if [ "$SIZE" -lt 10000 ]; then
@@ -191,20 +182,15 @@ jobs:
           ffprobe -v quiet -print_format json \
             -show_streams -show_format "$VIDEO_PATH" \
             > "$WORK_DIR/probe.json"
-
           python3 << 'PYEOF'
           import json, os
-
           d   = json.load(open(os.environ['WORK_DIR'] + '/probe.json'))
           vs  = next((s for s in d['streams'] if s['codec_type'] == 'video'), {})
           fmt = d['format']
-
           num, den = map(int, vs.get('r_frame_rate','24/1').split('/'))
           fps = num / den if den else num
-
           raw = vs.get('codec_tag_string','')
           codec_tag = raw if (raw and '.' in raw) else 'avc1.640028'
-
           probe = {
             'duration': float(fmt.get('duration', 0)),
             'width':    vs.get('width',  1920),
@@ -216,16 +202,13 @@ jobs:
             'size':     int(fmt.get('size', 0)),
           }
           json.dump(probe, open(os.environ['WORK_DIR'] + '/probe_parsed.json','w'))
-
           max_h      = int(os.environ['MAX_H'])
           eff_h      = min(probe['height'], max_h)
           will_scale = probe['height'] > max_h
-
           if will_scale:
             eff_w = round((probe['width'] / probe['height']) * eff_h / 2) * 2
           else:
             eff_w = probe['width']
-
           h = eff_h
           label = ('4k'    if h>=2160 else
                    '1440p' if h>=1440 else
@@ -233,7 +216,6 @@ jobs:
                    '720p'  if h>=720  else
                    '480p'  if h>=480  else
                    '360p'  if h>=360  else f'{h}p')
-
           with open(os.environ['GITHUB_ENV'], 'a') as f:
             f.write(f"PROBE_DURATION={probe['duration']}\n")
             f.write(f"PROBE_WIDTH={probe['width']}\n")
@@ -245,30 +227,17 @@ jobs:
             f.write(f"EFF_WIDTH={eff_w}\n")
             f.write(f"WILL_SCALE={'true' if will_scale else 'false'}\n")
             f.write(f"QUALITY_LABEL={label}\n")
-
           print(f"✓ {probe['width']}x{probe['height']} | {probe['codec']} | {fps:.2f}fps | {probe['duration']:.1f}s | {probe['bitrate']}bps")
           print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale}")
           PYEOF
 
       # ── 5. HLS encode — fMP4 ───────────────────────────────────────────────
-      #
-      # MUDANÇA vs versão anterior: -hls_segment_type mpegts → fmp4
-      #
-      # Com MPEG-TS o hls.js não consegue processar chunks parciais porque
-      # não determina timestamps sem o segmento completo.
-      # Com fMP4 cada chunk de 64KB decriptado tem moof+mdat próprio —
-      # MSE-válido imediatamente — permitindo onProgress chunk a chunk no player.
-      #
-      # Gera também init.mp4 (init segment fMP4) que é encriptado → init.bin
-      # e referenciado no index.m3u8 via #EXT-X-MAP:URI.
       - name: HLS encode (fMP4 + libx264 superfast CRF26 + AAC 128k)
         run: |
           HLS_DIR="$WORK_DIR/hls"
           [ "$WILL_SCALE" = "true" ] && SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}" || SCALE_ARGS=""
-
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
           echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s)"
-
           ffmpeg -hide_banner -loglevel warning -stats \
             -i "$VIDEO_PATH" \
             $SCALE_ARGS \
@@ -283,7 +252,6 @@ jobs:
             -hls_flags independent_segments \
             -hls_segment_filename "$HLS_DIR/seg%05d.m4s" \
             -y "$HLS_DIR/index.m3u8"
-
           echo "✓ $(ls $HLS_DIR/*.m4s | wc -l) segmentos .m4s gerados (fMP4)"
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
@@ -294,15 +262,12 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import subprocess, os, json, shutil
-
           thumb_dir    = os.environ['WORK_DIR'] + '/thumbs'
           duration     = float(os.environ['PROBE_DURATION'])
           video        = os.environ['VIDEO_PATH']
           thumb_url    = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
           yt_thumb     = os.environ.get('YT_THUMB_PATH', '').strip()
-
           thumbs = []
-
           if thumb_url:
             out = f"{thumb_dir}/thumb_0.jpg"
             r = subprocess.run([
@@ -313,19 +278,16 @@ jobs:
               print(f"✓ Thumbnail submetida: {thumb_url}")
             else:
               print(f"⚠ Falhou download da thumbnail — fallback para 6 frames")
-
           elif yt_thumb and os.path.exists(yt_thumb):
             dst = f"{thumb_dir}/thumb_0.jpg"
             shutil.copy(yt_thumb, dst)
             thumbs.append({'path': dst, 'time': 0, 'index': 0})
             print(f"✓ Thumbnail YouTube: {yt_thumb}")
-
           if not thumbs:
             if duration > 120:
               times = [duration * p for p in [0.05, 0.2, 0.4, 0.6, 0.8, 0.95]]
             else:
               times = [min(5, duration * 0.5)]
-
             for i, t in enumerate(times):
               out = f"{thumb_dir}/thumb_{i}.jpg"
               r = subprocess.run([
@@ -339,37 +301,22 @@ jobs:
                 print(f"  thumb_{i}.jpg @ {t:.1f}s")
               else:
                 print(f"  ⚠ thumb_{i} falhou")
-
           json.dump(thumbs, open(os.environ['WORK_DIR'] + '/thumbs_manifest.json','w'))
           print(f"✓ {len(thumbs)} thumbnail(s)")
           PYEOF
 
       # ── 7. Encriptar init.mp4 + segmentos .m4s → .bin (chunk format v2) ───
-      #
-      # Formato .bin chunk-v2 inalterado:
-      #   [4B]  n_chunks  (uint32 LE)
-      #   por cada chunk:
-      #     [12B] nonce
-      #     [4B]  chunk_len (uint32 LE)
-      #     [N B] ciphertext ChaCha20 (counter=1)
-      #
-      # Encripta também o init.mp4 → init.bin.
-      # nonces.json mantido por compatibilidade com registo EdgeOne.
       - name: Encriptar init.mp4 + segmentos .m4s → .bin
         run: |
           python3 << 'PYEOF'
           import os, json, secrets, struct
           from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
-
           key_hex = os.environ['CHACHA_KEY']
           if len(key_hex) != 64:
             raise ValueError('CHACHA_KEY inválido')
-
           key     = bytes.fromhex(key_hex)
           hls_dir = os.environ['WORK_DIR'] + '/hls'
-
-          CHUNK_SIZE = 65536  # 64KB de plaintext por chunk
-
+          CHUNK_SIZE = 65536
           def encrypt_segment(data, key):
             chunks = [data[i:i+CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
             out    = [struct.pack('<I', len(chunks))]
@@ -381,10 +328,7 @@ jobs:
               out.append(struct.pack('<I', len(ct)))
               out.append(ct)
             return b''.join(out)
-
           nonce_map = {}
-
-          # Encriptar init.mp4 → init.bin
           init_src = os.path.join(hls_dir, 'init.mp4')
           init_dst = os.path.join(hls_dir, 'init.bin')
           if os.path.exists(init_src):
@@ -397,87 +341,63 @@ jobs:
             n_chunks = struct.unpack('<I', encrypted[:4])[0]
             nonce_map['init.bin'] = f'chunked:{n_chunks}'
             print(f"  init.mp4 → init.bin ({len(data)//1024}KB → {n_chunks} chunks)")
-
-          # Encriptar segmentos .m4s → .bin
           seg_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.m4s'))
           if not seg_files:
             raise RuntimeError('Nenhum .m4s encontrado')
-
           for fname in seg_files:
             src      = os.path.join(hls_dir, fname)
             bin_name = fname.replace('.m4s', '.bin')
             dst      = os.path.join(hls_dir, bin_name)
-
             with open(src, 'rb') as f:
               data = f.read()
-
             encrypted = encrypt_segment(data, key)
-
             with open(dst, 'wb') as f:
               f.write(encrypted)
-
             os.remove(src)
             n_chunks = struct.unpack('<I', encrypted[:4])[0]
             nonce_map[bin_name] = f'chunked:{n_chunks}'
             print(f"  {fname} → {bin_name} ({len(data)//1024}KB → {n_chunks} chunks)")
-
           out = {'key_id': os.environ['CHACHA_KEY'][:8], 'format': 'chunk-v2', 'nonces': nonce_map}
           json.dump(out, open(os.environ['WORK_DIR'] + '/nonces.json','w'))
           print(f"✓ {len(seg_files)} segmentos + init encriptados (chunk format v2, fMP4)")
           PYEOF
 
       # ── 8. Reescrever index.m3u8 com URLs CDN ─────────────────────────────
-      #
-      # fMP4 gera no m3u8:
-      #   #EXT-X-MAP:URI="init.mp4"  → reescrito para init.bin no CDN
-      #   seg00001.m4s               → reescrito para seg00001.bin no CDN
       - name: Reescrever index.m3u8 com URLs CDN
         run: |
           python3 << 'PYEOF'
           import re, os
-
           hls_dir  = os.environ['WORK_DIR'] + '/hls'
           cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id   = os.environ['JOB_ID']
-
           with open(hls_dir + '/index.m3u8') as f:
             content = f.read()
-
-          # Reescrever URI do init segment
           content = re.sub(
             r'#EXT-X-MAP:URI="init\.mp4"',
             f'#EXT-X-MAP:URI="{cdn_base}/{job_id}/hls/init.bin"',
             content
           )
-
-          # Reescrever URIs dos segmentos .m4s → .bin
           content = re.sub(
             r'^(seg\d+)\.m4s$',
             lambda m: f"{cdn_base}/{job_id}/hls/{m.group(1)}.bin",
             content, flags=re.MULTILINE
           )
-
           with open(hls_dir + '/index.m3u8', 'w') as f:
             f.write(content)
-
           print(f"✓ index.m3u8 reescrito (fMP4) → {cdn_base}/{job_id}/hls/")
           PYEOF
 
       # ── 9. Gerar master.m3u8 ───────────────────────────────────────────────
-      #
-      # fMP4 requer EXT-X-VERSION:6 e CODECS com mp4a.40.2
       - name: Gerar master.m3u8
         run: |
           python3 << 'PYEOF'
           import os
-
           cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id   = os.environ['JOB_ID']
           quality  = os.environ['QUALITY_LABEL']
           bitrate  = os.environ['PROBE_BITRATE'] or '4000000'
           eff_w    = os.environ['EFF_WIDTH']
           eff_h    = os.environ['EFF_HEIGHT']
-
           master = '\n'.join([
             '#EXTM3U',
             '#EXT-X-VERSION:6',
@@ -485,22 +405,16 @@ jobs:
             f'#EXT-X-STREAM-INF:BANDWIDTH={bitrate},RESOLUTION={eff_w}x{eff_h},CODECS="avc1.640028,mp4a.40.2"',
             f'{cdn_base}/{job_id}/hls/index.m3u8',
           ])
-
           with open(os.environ['WORK_DIR'] + '/master.m3u8', 'w') as f:
             f.write(master)
-
           print(f"✓ master.m3u8: {eff_w}x{eff_h} | {bitrate}bps (EXT-X-VERSION:6 fMP4)")
           print(f"  → CDN: {cdn_base}/{job_id}/master.m3u8")
           PYEOF
 
       # ── 10. Criar Release e upload assets ──────────────────────────────────
       #
-      # Estratégia: medir o tamanho total dos assets ANTES de qualquer chamada
-      # à API. Se o total ultrapassar 1.8GB (limite seguro da GitHub Release API)
-      # o upload é ignorado por completo — UPLOAD_SKIP=true — e o workflow
-      # continua normalmente para warm e EdgeOne, que funcionam via CDN/tunnel
-      # independentemente do Release.
-      # Abaixo do limite faz upload directo sem retry nem overhead desnecessário.
+      # Mede o tamanho total dos assets ANTES de qualquer chamada à API.
+      # Se ultrapassar 1.8 GB → UPLOAD_SKIP=true, salta tudo, workflow continua.
       - name: Criar Release e upload assets
         id: upload_assets
         continue-on-error: true
@@ -512,7 +426,6 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os, subprocess, sys, json
-
           work_dir      = os.environ['WORK_DIR']
           storage_token = os.environ['STORAGE_TOKEN']
           storage_owner = os.environ['STORAGE_OWNER']
@@ -520,48 +433,36 @@ jobs:
           job_id        = os.environ['JOB_ID']
           quality       = os.environ['QUALITY_LABEL']
           github_env    = os.environ['GITHUB_ENV']
-
-          RELEASE_LIMIT = 1_800 * 1024 * 1024  # 1.8 GB — margem segura abaixo dos 2 GB da API
-
-          # ── Construir lista de assets ──────────────────────────────────────
+          RELEASE_LIMIT = 1_800 * 1024 * 1024
           assets = []
-
-          for fname, mime in [
+          for fpath, mime in [
             (os.path.join(work_dir, 'master.m3u8'), 'application/vnd.apple.mpegurl'),
             (os.path.join(work_dir, 'hls', 'index.m3u8'), 'application/vnd.apple.mpegurl'),
             (os.path.join(work_dir, 'nonces.json'), 'application/json'),
           ]:
-            if os.path.exists(fname):
-              assets.append((fname, os.path.basename(fname), mime))
-
+            if os.path.exists(fpath):
+              assets.append((fpath, os.path.basename(fpath), mime))
           hls_dir = os.path.join(work_dir, 'hls')
           for f in sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin')):
             assets.append((os.path.join(hls_dir, f), f, 'application/octet-stream'))
-
           thumb_dir = os.path.join(work_dir, 'thumbs')
           if os.path.isdir(thumb_dir):
             for f in sorted(f for f in os.listdir(thumb_dir) if f.endswith('.jpg')):
               assets.append((os.path.join(thumb_dir, f), f, 'image/jpeg'))
-
-          # ── Medir tamanho total antes de qualquer chamada à API ────────────
           total_bytes = sum(os.path.getsize(p) for p, _, _ in assets)
           total_mb    = total_bytes / (1024 * 1024)
           print(f"  Total assets: {len(assets)} ficheiros | {total_mb:.1f} MB")
-
           if total_bytes > RELEASE_LIMIT:
             print(f"  ⚠ {total_mb:.0f} MB > limite 1800 MB — upload ignorado")
             print(f"  → warm e EdgeOne continuam via CDN/tunnel")
             with open(github_env, 'a') as f:
               f.write("UPLOAD_SKIP=true\n")
             sys.exit(0)
-
-          # ── Criar Release ──────────────────────────────────────────────────
           try:
             meta = json.loads(os.environ.get('METADATA', '{}'))
           except Exception:
             meta = {}
           title = meta.get('title', 'Untitled')
-
           r = subprocess.run([
             'curl', '-sf', '-X', 'POST',
             '-H', f'Authorization: Bearer {storage_token}',
@@ -576,17 +477,13 @@ jobs:
               'prerelease': False,
             }),
           ], capture_output=True, text=True)
-
           if r.returncode != 0:
             print(f"  ✗ Falha ao criar Release: {r.stderr.strip()}")
             with open(github_env, 'a') as f:
               f.write("UPLOAD_SKIP=true\n")
             sys.exit(0)
-
           upload_url = json.loads(r.stdout)['upload_url'].split('{')[0]
           print(f"  ✓ Release criada: tag={job_id}")
-
-          # ── Upload directo — sem retry, sem overhead ───────────────────────
           ok = 0
           for file_path, asset_name, mime in assets:
             size_kb = os.path.getsize(file_path) // 1024
@@ -600,7 +497,6 @@ jobs:
               f'{upload_url}?name={asset_name}',
               '--data-binary', f'@{file_path}',
             ], capture_output=True, text=True)
-
             code = r.stdout.strip()
             if code == '201':
               print(f"  ✓ {asset_name} ({size_kb}KB)")
@@ -610,7 +506,6 @@ jobs:
               with open(github_env, 'a') as f:
                 f.write("UPLOAD_SKIP=true\n")
               sys.exit(0)
-
           print(f"  ✅ {ok}/{len(assets)} assets enviados")
           with open(github_env, 'a') as f:
             f.write("UPLOAD_SKIP=false\n")
@@ -621,12 +516,10 @@ jobs:
         run: |
           echo "=== Tunnel PID: $TUNNEL_PID ==="
           ps aux | grep cloudflared | grep -v grep || echo "⚠ cloudflared NÃO está a correr"
-
           echo ""
           echo "=== Teste servidor HTTP local porta 8080 ==="
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/ 2>/dev/null || echo "000")
           echo "HTTP local: $STATUS"
-
           echo ""
           echo "=== Teste CDN — headers completos ==="
           curl -s -o /dev/null -D - \
@@ -639,15 +532,12 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os, json, concurrent.futures, urllib.request as ur, time
-
           cdn_base  = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id    = os.environ['JOB_ID']
           warm_c    = int(os.environ['WARM_C'])
           work_dir  = os.environ['WORK_DIR']
-
           nonces = json.load(open(work_dir + '/nonces.json'))
           thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
-
           cdn_urls = (
             [
               f"{cdn_base}/{job_id}/master.m3u8",
@@ -658,7 +548,6 @@ jobs:
             [f"{cdn_base}/{job_id}/hls/{bn}" for bn in nonces['nonces'] if bn != 'init.bin'] +
             [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
           )
-
           def fetch_url(url):
             try:
               with ur.urlopen(ur.Request(url), timeout=120) as r:
@@ -668,7 +557,6 @@ jobs:
                 return {'url': url, 'status': cf_status, 'cc': cc, 'http': r.status, 'size': len(body)}
             except Exception as e:
               return {'url': url, 'status': 'ERROR', 'error': str(e)}
-
           def warm_pass(urls, label):
             hits=0; misses=0; errors=0; no_store=0
             with concurrent.futures.ThreadPoolExecutor(max_workers=warm_c) as ex:
@@ -688,10 +576,8 @@ jobs:
                     print(f"  ⚠ sem cache público: {r['url'].split('/')[-1]} [{cc}]")
             print(f"✓ {label}: {misses} MISS | {hits} HIT | {errors} erros | {no_store} sem cache-control")
             return hits, misses, errors, no_store
-
           print(f"Aquecendo {len(cdn_urls)} URLs (concorrência {warm_c})...")
           hits1, misses1, errors1, ns1 = warm_pass(cdn_urls, '1ª passagem')
-
           if errors1 == len(cdn_urls):
             print("⚠ Todas as URLs falharam — verificar tunnel e ingress rule")
           else:
@@ -705,7 +591,6 @@ jobs:
               print(f"⚠ Cache parcial — {hits2}/{len(cdn_urls)} HITs")
             else:
               print(f"✗ Cache não aqueceu — 0 HITs na 2ª passagem")
-
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json','w'))
           PYEOF
 
@@ -719,14 +604,14 @@ jobs:
 
       # ── 14. Registar no EdgeOne ────────────────────────────────────────────
       - name: Registar no EdgeOne (Turso + KV)
+        env:
+          METADATA: ${{ inputs.metadata }}
         run: |
           python3 << 'PYEOF'
           import json, os, urllib.request, urllib.error, datetime
-
           pipeline_api = os.environ.get('PIPELINE_API','').rstrip('/')
           if not pipeline_api:
             print('⚠ PIPELINE_API não configurado — ignorado'); exit(0)
-
           work_dir  = os.environ['WORK_DIR']
           cdn_base  = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id    = os.environ['JOB_ID']
@@ -734,19 +619,15 @@ jobs:
           seg_dur   = int(os.environ['SEG_DURATION'])
           eff_w     = int(os.environ['EFF_WIDTH'])
           eff_h     = int(os.environ['EFF_HEIGHT'])
-
           try:    metadata = json.loads(os.environ.get('METADATA','{}'))
           except: metadata = {}
-
           probe    = json.load(open(work_dir + '/probe_parsed.json'))
           nonces   = json.load(open(work_dir + '/nonces.json'))
           thumbs   = json.load(open(work_dir + '/thumbs_manifest.json'))
           cdn_urls = json.load(open(work_dir + '/cdn_urls.json'))
-
           content_id = metadata.get('contentId', job_id)
           seg_count  = len([k for k in nonces['nonces'] if k != 'init.bin'])
           thumb_urls = [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
-
           body = {
             'contentId':    content_id,
             'title':        metadata.get('title','Untitled'),
@@ -774,7 +655,6 @@ jobs:
             'masterUrl':    f"{cdn_base}/{job_id}/master.m3u8",
             'noncesUrl':    f"{cdn_base}/{job_id}/nonces.json",
           }
-
           req = urllib.request.Request(
             f"{pipeline_api}/api/pipeline/register",
             data=json.dumps(body).encode(),
