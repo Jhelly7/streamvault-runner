@@ -508,6 +508,7 @@ jobs:
           STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
           STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
           STORAGE_REPO:  ${{ secrets.STORAGE_GITHUB_REPO }}
+          METADATA:      ${{ inputs.metadata }}
         run: |
           python3 << 'PYEOF'
           import os, subprocess, sys, json
@@ -614,8 +615,6 @@ jobs:
           with open(github_env, 'a') as f:
             f.write("UPLOAD_SKIP=false\n")
           PYEOF
-        env:
-          METADATA: ${{ inputs.metadata }}
 
       # ── 11. Debug tunnel ───────────────────────────────────────────────────
       - name: Debug tunnel
@@ -793,8 +792,6 @@ jobs:
           except Exception as e:
             print(f"⚠ Registo falhou: {e}")
           PYEOF
-        env:
-          METADATA: ${{ inputs.metadata }}
 
       # ── 15. Cleanup ────────────────────────────────────────────────────────
       - name: Cleanup
