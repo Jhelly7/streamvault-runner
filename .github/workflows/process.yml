@@ -118,9 +118,8 @@ jobs:
       - name: Instalar dependências
         run: |
           pip install --quiet --upgrade cryptography
-          # libtorrent: bindings Python para libtorrent-rasterbar (engine do torrra)
-          # python-libtorrent é o pacote PyPI oficial com wheels pré-compilados
-          pip install --quiet python-libtorrent
+          # python3-libtorrent não existe no PyPI — instalar via apt (pacote oficial Ubuntu)
+          sudo apt-get install -y --no-install-recommends python3-libtorrent
           # Verificar instalação
           python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
