@@ -17,7 +17,7 @@ on:
         description: 'Job ID (tag da Release)'
         required: true
       video_url:
-        description: 'URL do vídeo — HTTP(S), magnet:, .torrent, youtube.com'
+        description: 'URL do vídeo — HTTP(S), magnet:, .torrent'
         required: false
         default: ''
       seg_duration:
@@ -37,7 +37,7 @@ on:
         required: false
         default: '{}'
       thumbnail_url:
-        description: 'URL da thumbnail (JPG/PNG) — vazio = gera 6 frames automático'
+        description: 'URL da thumbnail (JPG/PNG) — vazio = gera 1 frame a ~7% do vídeo'
         required: false
         default: ''
 
@@ -66,7 +66,7 @@ jobs:
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
-          # Servidor HTTP — escrito em ficheiro para evitar problemas de quoting
+          # Servidor HTTP
           printf '%s\n' \
             'import http.server, os' \
             '' \
@@ -114,42 +114,125 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg
           ffmpeg -version | head -1
 
-      # ── 2. Instalar dependências Python + aria2 ────────────────────────────
+      # ── 2. Instalar dependências Python + libtorrent ───────────────────────
       - name: Instalar dependências
         run: |
-          pip install --quiet --upgrade cryptography "yt-dlp[default]"
-          sudo apt-get install -y --no-install-recommends aria2
+          pip install --quiet --upgrade cryptography
+          # libtorrent: bindings Python para libtorrent-rasterbar (engine do torrra)
+          # python-libtorrent é o pacote PyPI oficial com wheels pré-compilados
+          pip install --quiet python-libtorrent
+          # Verificar instalação
+          python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
       # ── 3. Obter vídeo ─────────────────────────────────────────────────────
       - name: '[Modo A] Descarregar vídeo'
         if: ${{ inputs.video_url != '' }}
         run: |
           URL="${{ inputs.video_url }}"
-          if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]]; then
-            echo "→ Modo torrent (aria2c)"
-            aria2c \
-              --dir="$WORK_DIR/incoming" \
-              --seed-time=0 \
-              --max-connection-per-server=4 \
-              --bt-stop-timeout=600 \
-              "$URL"
-          elif [[ "$URL" == *youtube.com* ]] || [[ "$URL" == *youtu.be* ]]; then
-            echo "→ Modo YouTube (yt-dlp com cliente mweb)"
-            yt-dlp \
-              --extractor-args "youtube:player_client=default,mweb" \
-              --format "bestvideo[height<=$MAX_H]+bestaudio/best[height<=$MAX_H]" \
-              --merge-output-format mp4 \
-              --write-thumbnail \
-              --convert-thumbnails jpg \
-              --output "$WORK_DIR/incoming/%(title)s.%(ext)s" \
-              --no-playlist \
-              --extractor-retries 5 \
-              --retries 5 \
-              --no-check-certificates \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              "$URL"
-            YT_THUMB=$(find "$WORK_DIR/incoming/" -maxdepth 1 -iname "*.jpg" | head -1)
-            [ -n "$YT_THUMB" ] && echo "YT_THUMB_PATH=$YT_THUMB" >> $GITHUB_ENV
+          if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
+            echo "→ Modo torrent (libtorrent Python — engine do torrra)"
+            python3 << 'PYEOF'
+          import libtorrent as lt
+          import os, sys, time, pathlib
+
+          url      = os.environ['video_url_env']
+          dest_dir = os.environ['WORK_DIR'] + '/incoming'
+          MAX_WAIT = 3600   # 1 hora máximo
+          SEED_RATIO_STOP = 0.0   # não seeder — parar logo após completar
+
+          ses = lt.session({
+            'listen_interfaces': '0.0.0.0:6881',
+            'alert_mask': lt.alert.category_t.status_notification |
+                          lt.alert.category_t.error_notification,
+          })
+
+          # Configurações de performance para CI
+          ses.apply_settings({
+            'connections_limit':         200,
+            'active_downloads':          1,
+            'active_seeds':              0,
+            'seed_time_limit':           0,
+            'share_ratio_limit':         0,
+            'seeding_time_ratio_limit':  0,
+          })
+
+          params = lt.add_torrent_params()
+          params.save_path = dest_dir
+
+          if url.startswith('magnet:') or 'infohash:' in url:
+            params = lt.parse_magnet_uri(url)
+            params.save_path = dest_dir
+            print(f"  Adicionando magnet: {url[:80]}...")
+          else:
+            # Ficheiro .torrent — descarregar primeiro
+            import urllib.request
+            torrent_path = '/tmp/input.torrent'
+            print(f"  Descarregando .torrent de: {url}")
+            urllib.request.urlretrieve(url, torrent_path)
+            info = lt.torrent_info(torrent_path)
+            params.ti = info
+            print(f"  Torrent: {info.name()} ({info.total_size() // (1024*1024)} MB)")
+
+          handle = ses.add_torrent(params)
+          handle.set_sequential_download(True)
+
+          print(f"  Destino: {dest_dir}")
+          last_pct = -1
+          start_t  = time.time()
+          stall_t  = time.time()
+          stall_bytes = 0
+
+          while True:
+            s = handle.status()
+            pct = int(s.progress * 100)
+
+            if pct != last_pct:
+              dl_kb   = s.download_rate // 1024
+              peers   = s.num_peers
+              elapsed = int(time.time() - start_t)
+              print(f"  [{elapsed:4d}s] {pct:3d}% | {dl_kb:6d} KB/s | peers: {peers}")
+              last_pct = pct
+
+            # Detectar stall (sem progresso por 5 min com peers disponíveis)
+            current_bytes = int(s.progress * (s.total_wanted or 1))
+            if current_bytes > stall_bytes:
+              stall_bytes = current_bytes
+              stall_t     = time.time()
+            elif s.num_peers > 0 and (time.time() - stall_t) > 300:
+              print('⚠ Sem progresso por 5 min — continuando...')
+              stall_t = time.time()
+
+            if s.is_seeding or s.progress >= 1.0:
+              print(f"✓ Download completo ({int(time.time()-start_t)}s)")
+              break
+
+            if (time.time() - start_t) > MAX_WAIT:
+              print(f'⚠ Timeout após {MAX_WAIT}s — progresso: {pct}%')
+              if pct == 0:
+                sys.exit(1)
+              # Continuar com o que tiver se >50%
+              if pct < 50:
+                sys.exit(1)
+              print('  Download parcial (>50%) — continuando...')
+              break
+
+            ses.wait_for_alert(1000)
+
+          # Remover torrent sem apagar ficheiros
+          ses.remove_torrent(handle, 0)
+
+          # Listar o que foi descarregado
+          files = list(pathlib.Path(dest_dir).rglob('*'))
+          video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
+          videos = [f for f in files if f.suffix.lower() in video_exts]
+          print(f"  Ficheiros descarregados: {len(files)}")
+          for v in videos:
+            print(f"  → Vídeo: {v} ({v.stat().st_size // (1024*1024)} MB)")
+          if not videos:
+            print('⚠ Nenhum vídeo encontrado no torrent')
+            for f in files:
+              print(f'  {f} ({f.stat().st_size} bytes)')
+          PYEOF
           else
             echo "→ Modo URL directa (curl)"
             curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
@@ -163,6 +246,8 @@ jobs:
               exit 1
             fi
           fi
+        env:
+          video_url_env: ${{ inputs.video_url }}
 
       - name: '[Modo B] Obter vídeo via Artifact'
         if: ${{ inputs.video_url == '' }}
@@ -198,17 +283,18 @@ jobs:
           fmt = d['format']
           num, den = map(int, vs.get('r_frame_rate','24/1').split('/'))
           fps = num / den if den else num
-          raw = vs.get('codec_tag_string','')
-          codec_tag = raw if (raw and '.' in raw) else 'avc1.640028'
+          # codec_tag para master.m3u8 — sempre avc1 porque vamos forçar h264
+          codec_tag = 'avc1.640028'
+          src_codec = vs.get('codec_name', 'unknown')
           probe = {
-            'duration': float(fmt.get('duration', 0)),
-            'width':    vs.get('width',  1920),
-            'height':   vs.get('height', 1080),
-            'codec':    vs.get('codec_name', 'h264'),
+            'duration':  float(fmt.get('duration', 0)),
+            'width':     vs.get('width',  1920),
+            'height':    vs.get('height', 1080),
+            'codec':     src_codec,
             'codec_tag': codec_tag,
-            'fps':      fps,
-            'bitrate':  int(fmt.get('bit_rate', 0)),
-            'size':     int(fmt.get('size', 0)),
+            'fps':       fps,
+            'bitrate':   int(fmt.get('bit_rate', 0)),
+            'size':      int(fmt.get('size', 0)),
           }
           json.dump(probe, open(os.environ['WORK_DIR'] + '/probe_parsed.json','w'))
           max_h      = int(os.environ['MAX_H'])
@@ -236,19 +322,29 @@ jobs:
             f.write(f"EFF_WIDTH={eff_w}\n")
             f.write(f"WILL_SCALE={'true' if will_scale else 'false'}\n")
             f.write(f"QUALITY_LABEL={label}\n")
-          print(f"✓ {probe['width']}x{probe['height']} | {probe['codec']} | {fps:.2f}fps | {probe['duration']:.1f}s | {probe['bitrate']}bps")
-          print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale}")
+          needs_transcode = src_codec not in ('h264', 'avc', 'avc1')
+          print(f"✓ {probe['width']}x{probe['height']} | codec entrada: {src_codec} | {fps:.2f}fps | {probe['duration']:.1f}s")
+          print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale} | transcode necessário: {needs_transcode}")
           PYEOF
 
-      # ── 5. HLS encode — fMP4 ───────────────────────────────────────────────
+      # ── 5. HLS encode — fMP4 ──────────────────────────────────────────────
+      # NOTA: Forçamos sempre -c:v libx264 independentemente do codec de entrada.
+      # Isto garante compatibilidade máxima em browsers/players (hls.js, Safari,
+      # Android, iOS). Codecs como HEVC, AV1, VP9, MPEG-2, etc. são re-encodados.
+      # O custo extra de CPU é aceitável; o ganho em compatibilidade é total.
       - name: HLS encode (fMP4 + libx264 superfast CRF26 + AAC 128k)
         run: |
           HLS_DIR="$WORK_DIR/hls"
-          [ "$WILL_SCALE" = "true" ] && SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}" || SCALE_ARGS=""
+          # Escala se necessário
+          if [ "$WILL_SCALE" = "true" ]; then
+            SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}"
+          else
+            SCALE_ARGS=""
+          fi
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
           echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s)"
-          # Keepalive: bate no servidor HTTP local a cada 30s para manter o
-          # tunnel do Cloudflare activo durante o encode (pode demorar horas).
+          echo "  Re-encode para h264 (codec entrada: ${PROBE_CODEC}) — compatibilidade universal"
+          # Keepalive: mantém tunnel activo durante encode longo
           (while true; do
             curl -sf http://localhost:8080/ -o /dev/null 2>/dev/null || true
             sleep 30
@@ -258,8 +354,10 @@ jobs:
             -i "$VIDEO_PATH" \
             $SCALE_ARGS \
             -c:v libx264 -preset superfast -crf 26 -tune fastdecode \
+            -profile:v high -level 4.0 \
+            -pix_fmt yuv420p \
             -g $GOP -keyint_min ${SEG_DURATION} \
-            -c:a aac -b:a 128k \
+            -c:a aac -b:a 128k -ac 2 \
             -f hls \
             -hls_time ${SEG_DURATION} \
             -hls_playlist_type vod \
@@ -269,75 +367,120 @@ jobs:
             -hls_segment_filename "$HLS_DIR/seg%05d.m4s" \
             -y "$HLS_DIR/index.m3u8"
           kill "$KEEPALIVE_PID" 2>/dev/null || true
-          echo "✓ $(ls $HLS_DIR/*.m4s | wc -l) segmentos .m4s gerados (fMP4)"
+          echo "✓ $(ls $HLS_DIR/*.m4s | wc -l) segmentos .m4s gerados (fMP4 h264)"
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
       # ── 6. Thumbnails ──────────────────────────────────────────────────────
+      # Lógica:
+      #   - thumbnail_url fornecida → descarregar e validar (JPG/PNG real ≥ 5 KB)
+      #   - sem thumbnail_url       → 1 frame a 7% da duração via ffmpeg
+      # Não gerar 6 frames automáticos em vídeos grandes porque em ficheiros
+      # problemáticos o ffmpeg pode produzir texto em vez de imagem.
       - name: Obter thumbnails
         env:
           INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
         run: |
           python3 << 'PYEOF'
-          import subprocess, os, json, shutil
-          thumb_dir    = os.environ['WORK_DIR'] + '/thumbs'
-          duration     = float(os.environ['PROBE_DURATION'])
-          video        = os.environ['VIDEO_PATH']
-          thumb_url    = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
-          yt_thumb     = os.environ.get('YT_THUMB_PATH', '').strip()
-          thumbs = []
+          import subprocess, os, json
+
+          thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
+          duration  = float(os.environ['PROBE_DURATION'])
+          video     = os.environ['VIDEO_PATH']
+          thumb_url = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
+          thumbs    = []
+
+          def is_valid_image(path, min_bytes=5000):
+            """Verifica que o ficheiro é realmente uma imagem JPG/PNG e não texto."""
+            if not os.path.exists(path):
+              return False
+            size = os.path.getsize(path)
+            if size < min_bytes:
+              return False
+            with open(path, 'rb') as f:
+              header = f.read(12)
+            # JPG: FF D8 FF | PNG: 89 50 4E 47
+            return header[:3] == b'\xff\xd8\xff' or header[:4] == b'\x89PNG'
+
+          def extract_frame(video, out_path, time_pct=0.07):
+            """Extrai 1 frame a time_pct% da duração, resize para 1280px de largura."""
+            t = max(1.0, duration * time_pct)
+            r = subprocess.run([
+              'ffmpeg', '-hide_banner', '-loglevel', 'error',
+              '-ss', f'{t:.2f}', '-i', video,
+              '-vframes', '1',
+              '-vf', 'scale=1280:-2',
+              '-q:v', '2',
+              '-y', out_path,
+            ], capture_output=True)
+            return r.returncode == 0 and is_valid_image(out_path)
+
           if thumb_url:
             out = f"{thumb_dir}/thumb_0.jpg"
-            # Tentar primeiro com curl (User-Agent de navegador)
+            print(f"  Descarregando thumbnail: {thumb_url}")
+            # Tentativa 1: curl com User-Agent de browser
             r = subprocess.run([
               'curl', '-L', '--retry', '5', '--retry-delay', '3',
-              '--max-time', '45',
+              '--max-time', '60',
               '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
               '-H', 'Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
               '-H', 'Accept-Language: pt-BR,pt;q=0.9,en;q=0.8',
               '-H', 'Sec-Fetch-Dest: image',
               '-H', 'Sec-Fetch-Mode: no-cors',
               '-H', 'Sec-Fetch-Site: cross-site',
-              '-o', out, thumb_url
+              '-o', out, thumb_url,
             ], capture_output=True)
-            # Se falhar, tentar com wget como fallback
-            if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1000:
-              if os.path.exists(out): os.remove(out)
-              r = subprocess.run([
+            # Tentativa 2: wget como fallback
+            if not is_valid_image(out):
+              if os.path.exists(out):
+                os.remove(out)
+              r2 = subprocess.run([
                 'wget', '--timeout=30', '--tries=5',
                 '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                '-O', out, thumb_url
+                '-O', out, thumb_url,
               ], capture_output=True)
-            if os.path.exists(out) and os.path.getsize(out) > 1000:
-              thumbs.append({'path': out, 'time': 0, 'index': 0})
-              print(f"✓ Thumbnail submetida: {thumb_url}")
-            else:
-              print(f"⚠ Falhou download da thumbnail — fallback para 6 frames")
-              if os.path.exists(out): os.remove(out)
-          elif yt_thumb and os.path.exists(yt_thumb):
-            dst = f"{thumb_dir}/thumb_0.jpg"
-            shutil.copy(yt_thumb, dst)
-            thumbs.append({'path': dst, 'time': 0, 'index': 0})
-            print(f"✓ Thumbnail YouTube: {yt_thumb}")
-          if not thumbs:
-            if duration > 120:
-              times = [duration * p for p in [0.05, 0.2, 0.4, 0.6, 0.8, 0.95]]
-            else:
-              times = [min(5, duration * 0.5)]
-            for i, t in enumerate(times):
-              out = f"{thumb_dir}/thumb_{i}.jpg"
-              r = subprocess.run([
+            if is_valid_image(out):
+              # Normalizar para JPG via ffmpeg (garante que PNG/WEBP/AVIF ficam como JPG)
+              norm = f"{thumb_dir}/thumb_0_norm.jpg"
+              subprocess.run([
                 'ffmpeg', '-hide_banner', '-loglevel', 'error',
-                '-ss', f'{t:.2f}', '-i', video,
-                '-vframes', '1', '-vf', 'scale=1280:-2',
-                '-q:v', '3', '-y', out,
+                '-i', out, '-vframes', '1', '-q:v', '2',
+                '-vf', 'scale=\'min(1280,iw)\':-2',
+                '-y', norm,
               ], capture_output=True)
-              if r.returncode == 0:
-                thumbs.append({'path': out, 'time': t, 'index': i})
-                print(f"  thumb_{i}.jpg @ {t:.1f}s")
+              if is_valid_image(norm):
+                os.replace(norm, out)
+              thumbs.append({'path': out, 'time': 0, 'index': 0})
+              size_kb = os.path.getsize(out) // 1024
+              print(f"✓ Thumbnail descarregada e válida ({size_kb} KB): {thumb_url}")
+            else:
+              # Download falhou — fallback para extração de frame
+              if os.path.exists(out):
+                os.remove(out)
+              print(f"⚠ Thumbnail inválida ou inacessível ({thumb_url}) — extraindo frame do vídeo")
+              if extract_frame(video, out):
+                thumbs.append({'path': out, 'time': 0, 'index': 0})
+                print(f"✓ Frame extraído como fallback: {os.path.getsize(out)//1024} KB")
               else:
-                print(f"  ⚠ thumb_{i} falhou")
-          json.dump(thumbs, open(os.environ['WORK_DIR'] + '/thumbs_manifest.json','w'))
-          print(f"✓ {len(thumbs)} thumbnail(s)")
+                print('✗ Falha ao extrair frame de fallback')
+
+          else:
+            # Sem URL fornecida — extrair 1 frame a ~7% da duração
+            out = f"{thumb_dir}/thumb_0.jpg"
+            print(f"  Nenhuma thumbnail_url fornecida — extraindo 1 frame a 7% ({duration*0.07:.1f}s)")
+            if extract_frame(video, out, time_pct=0.07):
+              thumbs.append({'path': out, 'time': duration * 0.07, 'index': 0})
+              print(f"✓ Frame extraído: {os.path.getsize(out)//1024} KB")
+            else:
+              # Última tentativa a 5%
+              print(f"  ⚠ Frame a 7% falhou — tentando a 5%")
+              if extract_frame(video, out, time_pct=0.05):
+                thumbs.append({'path': out, 'time': duration * 0.05, 'index': 0})
+                print(f"✓ Frame extraído a 5%: {os.path.getsize(out)//1024} KB")
+              else:
+                print('✗ Não foi possível extrair nenhum frame')
+
+          json.dump(thumbs, open(os.environ['WORK_DIR'] + '/thumbs_manifest.json', 'w'))
+          print(f"✓ {len(thumbs)} thumbnail(s) final(is)")
           PYEOF
 
       # ── 7. Encriptar init.mp4 + segmentos .m4s → .bin (chunk format v2) ───
@@ -423,8 +566,6 @@ jobs:
           PYEOF
 
       # ── 9. Gerar master.m3u8 ───────────────────────────────────────────────
-      # NOTA: CODECS omitido intencionalmente.
-      # O hls.js lê os codecs directamente do init.mp4 (moov/trak/stsd box).
       - name: Gerar master.m3u8
         run: |
           python3 << 'PYEOF'
@@ -435,11 +576,11 @@ jobs:
           eff_w    = os.environ['EFF_WIDTH']
           eff_h    = os.environ['EFF_HEIGHT']
           hls_dir   = work_dir + '/hls'
-          seg_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.m4s'))
-          if seg_files:
-            total_bytes  = sum(os.path.getsize(os.path.join(hls_dir, f)) for f in seg_files)
+          bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin')
+          if bin_files:
+            total_bytes  = sum(os.path.getsize(os.path.join(hls_dir, f)) for f in bin_files)
             seg_dur      = int(os.environ['SEG_DURATION'])
-            duration_s   = len(seg_files) * seg_dur
+            duration_s   = len(bin_files) * seg_dur
             real_bitrate = int((total_bytes * 8) / duration_s) if duration_s > 0 else 2000000
           else:
             real_bitrate = int(os.environ.get('PROBE_BITRATE') or 2000000)
@@ -454,7 +595,6 @@ jobs:
             f.write(master)
           print(f"✓ master.m3u8: {eff_w}x{eff_h} | {real_bitrate}bps real (EXT-X-VERSION:6 fMP4)")
           print(f"  → CDN: {cdn_base}/{job_id}/master.m3u8")
-          print(f"  → sem CODECS hardcoded — hls.js lê do init segment")
           PYEOF
 
       # ── 10. Criar Release e upload assets ──────────────────────────────────
@@ -555,7 +695,7 @@ jobs:
             f.write("UPLOAD_SKIP=false\n")
           PYEOF
 
-      # ── 11. Verificar tunnel e reiniciar se necessário ────────────────────
+      # ── 11. Verificar tunnel e reiniciar se necessário ─────────────────────
       - name: Verificar e restaurar tunnel
         run: |
           echo "=== Estado do processo cloudflared ==="
@@ -712,7 +852,7 @@ jobs:
             'qualities':    [quality],
             'width':        eff_w,
             'height':       eff_h,
-            'codec':        probe['codec'],
+            'codec':        'h264',
             'fps':          probe['fps'],
             'bitrate':      probe['bitrate'],
             'segmentCount': seg_count,
