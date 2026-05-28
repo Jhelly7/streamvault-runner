@@ -136,16 +136,13 @@ jobs:
 
           url      = os.environ['video_url_env']
           dest_dir = os.environ['WORK_DIR'] + '/incoming'
-          MAX_WAIT = 3600   # 1 hora máximo
-          SEED_RATIO_STOP = 0.0   # não seeder — parar logo após completar
+          MAX_WAIT = 3600
 
           ses = lt.session({
             'listen_interfaces': '0.0.0.0:6881',
             'alert_mask': lt.alert.category_t.status_notification |
                           lt.alert.category_t.error_notification,
           })
-
-          # Configurações de performance para CI
           ses.apply_settings({
             'connections_limit':         200,
             'active_downloads':          1,
@@ -163,7 +160,6 @@ jobs:
             params.save_path = dest_dir
             print(f"  Adicionando magnet: {url[:80]}...")
           else:
-            # Ficheiro .torrent — descarregar primeiro
             import urllib.request
             torrent_path = '/tmp/input.torrent'
             print(f"  Descarregando .torrent de: {url}")
@@ -184,15 +180,12 @@ jobs:
           while True:
             s = handle.status()
             pct = int(s.progress * 100)
-
             if pct != last_pct:
               dl_kb   = s.download_rate // 1024
               peers   = s.num_peers
               elapsed = int(time.time() - start_t)
               print(f"  [{elapsed:4d}s] {pct:3d}% | {dl_kb:6d} KB/s | peers: {peers}")
               last_pct = pct
-
-            # Detectar stall (sem progresso por 5 min com peers disponíveis)
             current_bytes = int(s.progress * (s.total_wanted or 1))
             if current_bytes > stall_bytes:
               stall_bytes = current_bytes
@@ -200,27 +193,18 @@ jobs:
             elif s.num_peers > 0 and (time.time() - stall_t) > 300:
               print('⚠ Sem progresso por 5 min — continuando...')
               stall_t = time.time()
-
             if s.is_seeding or s.progress >= 1.0:
               print(f"✓ Download completo ({int(time.time()-start_t)}s)")
               break
-
             if (time.time() - start_t) > MAX_WAIT:
               print(f'⚠ Timeout após {MAX_WAIT}s — progresso: {pct}%')
-              if pct == 0:
-                sys.exit(1)
-              # Continuar com o que tiver se >50%
-              if pct < 50:
-                sys.exit(1)
+              if pct == 0: sys.exit(1)
+              if pct < 50: sys.exit(1)
               print('  Download parcial (>50%) — continuando...')
               break
-
             ses.wait_for_alert(1000)
 
-          # Remover torrent sem apagar ficheiros
           ses.remove_torrent(handle, 0)
-
-          # Listar o que foi descarregado
           files = list(pathlib.Path(dest_dir).rglob('*'))
           video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
           videos = [f for f in files if f.suffix.lower() in video_exts]
@@ -282,7 +266,6 @@ jobs:
           fmt = d['format']
           num, den = map(int, vs.get('r_frame_rate','24/1').split('/'))
           fps = num / den if den else num
-          # codec_tag para master.m3u8 — sempre avc1 porque vamos forçar h264
           codec_tag = 'avc1.640028'
           src_codec = vs.get('codec_name', 'unknown')
           probe = {
@@ -327,14 +310,9 @@ jobs:
           PYEOF
 
       # ── 5. HLS encode — fMP4 ──────────────────────────────────────────────
-      # NOTA: Forçamos sempre -c:v libx264 independentemente do codec de entrada.
-      # Isto garante compatibilidade máxima em browsers/players (hls.js, Safari,
-      # Android, iOS). Codecs como HEVC, AV1, VP9, MPEG-2, etc. são re-encodados.
-      # O custo extra de CPU é aceitável; o ganho em compatibilidade é total.
       - name: HLS encode (fMP4 + libx264 superfast CRF26 + AAC 128k)
         run: |
           HLS_DIR="$WORK_DIR/hls"
-          # Escala se necessário
           if [ "$WILL_SCALE" = "true" ]; then
             SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}"
           else
@@ -343,7 +321,6 @@ jobs:
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
           echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s)"
           echo "  Re-encode para h264 (codec entrada: ${PROBE_CODEC}) — compatibilidade universal"
-          # Keepalive: mantém tunnel activo durante encode longo
           (while true; do
             curl -sf http://localhost:8080/ -o /dev/null 2>/dev/null || true
             sleep 30
@@ -370,11 +347,8 @@ jobs:
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
       # ── 6. Thumbnails ──────────────────────────────────────────────────────
-      # Lógica:
-      #   - thumbnail_url fornecida → descarregar e validar (JPG/PNG real ≥ 5 KB)
-      #   - sem thumbnail_url       → 1 frame a 7% da duração via ffmpeg
-      # Não gerar 6 frames automáticos em vídeos grandes porque em ficheiros
-      # problemáticos o ffmpeg pode produzir texto em vez de imagem.
+      # FIX: adicionada linha de debug para confirmar que INPUT_THUMBNAIL_URL chegou.
+      # Requer também que o dispatcher.js passe thumbnail_url nos inputs (já corrigido).
       - name: Obter thumbnails
         env:
           INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
@@ -388,8 +362,13 @@ jobs:
           thumb_url = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
           thumbs    = []
 
+          # DEBUG: confirmar que o valor chegou
+          if thumb_url:
+            print(f"  INPUT_THUMBNAIL_URL = '{thumb_url}'")
+          else:
+            print("  INPUT_THUMBNAIL_URL = (vazio — extraindo frame)")
+
           def is_valid_image(path, min_bytes=5000):
-            """Verifica que o ficheiro é realmente uma imagem JPG/PNG e não texto."""
             if not os.path.exists(path):
               return False
             size = os.path.getsize(path)
@@ -397,11 +376,9 @@ jobs:
               return False
             with open(path, 'rb') as f:
               header = f.read(12)
-            # JPG: FF D8 FF | PNG: 89 50 4E 47
             return header[:3] == b'\xff\xd8\xff' or header[:4] == b'\x89PNG'
 
           def extract_frame(video, out_path, time_pct=0.07):
-            """Extrai 1 frame a time_pct% da duração, resize para 1280px de largura."""
             t = max(1.0, duration * time_pct)
             r = subprocess.run([
               'ffmpeg', '-hide_banner', '-loglevel', 'error',
@@ -416,7 +393,6 @@ jobs:
           if thumb_url:
             out = f"{thumb_dir}/thumb_0.jpg"
             print(f"  Descarregando thumbnail: {thumb_url}")
-            # Tentativa 1: curl com User-Agent de browser
             r = subprocess.run([
               'curl', '-L', '--retry', '5', '--retry-delay', '3',
               '--max-time', '60',
@@ -428,7 +404,6 @@ jobs:
               '-H', 'Sec-Fetch-Site: cross-site',
               '-o', out, thumb_url,
             ], capture_output=True)
-            # Tentativa 2: wget como fallback
             if not is_valid_image(out):
               if os.path.exists(out):
                 os.remove(out)
@@ -438,12 +413,11 @@ jobs:
                 '-O', out, thumb_url,
               ], capture_output=True)
             if is_valid_image(out):
-              # Normalizar para JPG via ffmpeg (garante que PNG/WEBP/AVIF ficam como JPG)
               norm = f"{thumb_dir}/thumb_0_norm.jpg"
               subprocess.run([
                 'ffmpeg', '-hide_banner', '-loglevel', 'error',
                 '-i', out, '-vframes', '1', '-q:v', '2',
-                '-vf', 'scale=\'min(1280,iw)\':-2',
+                '-vf', "scale='min(1280,iw)':-2",
                 '-y', norm,
               ], capture_output=True)
               if is_valid_image(norm):
@@ -452,7 +426,6 @@ jobs:
               size_kb = os.path.getsize(out) // 1024
               print(f"✓ Thumbnail descarregada e válida ({size_kb} KB): {thumb_url}")
             else:
-              # Download falhou — fallback para extração de frame
               if os.path.exists(out):
                 os.remove(out)
               print(f"⚠ Thumbnail inválida ou inacessível ({thumb_url}) — extraindo frame do vídeo")
@@ -461,16 +434,13 @@ jobs:
                 print(f"✓ Frame extraído como fallback: {os.path.getsize(out)//1024} KB")
               else:
                 print('✗ Falha ao extrair frame de fallback')
-
           else:
-            # Sem URL fornecida — extrair 1 frame a ~7% da duração
             out = f"{thumb_dir}/thumb_0.jpg"
             print(f"  Nenhuma thumbnail_url fornecida — extraindo 1 frame a 7% ({duration*0.07:.1f}s)")
             if extract_frame(video, out, time_pct=0.07):
               thumbs.append({'path': out, 'time': duration * 0.07, 'index': 0})
               print(f"✓ Frame extraído: {os.path.getsize(out)//1024} KB")
             else:
-              # Última tentativa a 5%
               print(f"  ⚠ Frame a 7% falhou — tentando a 5%")
               if extract_frame(video, out, time_pct=0.05):
                 thumbs.append({'path': out, 'time': duration * 0.05, 'index': 0})
@@ -813,15 +783,20 @@ jobs:
           echo "✓ Tunnel e servidor HTTP desligados"
 
       # ── 14. Registar no EdgeOne ────────────────────────────────────────────
+      # FIX: retry com backoff exponencial para lidar com cold start Render.
+      # "Not connected" = servidor acordou mas ligação Turso/libsql ainda não está pronta.
+      # Tentamos até 5 vezes com espera crescente: 5s → 10s → 20s → 40s.
       - name: Registar no EdgeOne (Turso + KV)
         env:
           METADATA: ${{ inputs.metadata }}
         run: |
           python3 << 'PYEOF'
-          import json, os, urllib.request, urllib.error, datetime
+          import json, os, urllib.request, urllib.error, datetime, time
+
           pipeline_api = os.environ.get('PIPELINE_API','').rstrip('/')
           if not pipeline_api:
             print('⚠ PIPELINE_API não configurado — ignorado'); exit(0)
+
           work_dir  = os.environ['WORK_DIR']
           cdn_base  = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id    = os.environ['JOB_ID']
@@ -829,15 +804,19 @@ jobs:
           seg_dur   = int(os.environ['SEG_DURATION'])
           eff_w     = int(os.environ['EFF_WIDTH'])
           eff_h     = int(os.environ['EFF_HEIGHT'])
+
           try:    metadata = json.loads(os.environ.get('METADATA','{}'))
           except: metadata = {}
+
           probe    = json.load(open(work_dir + '/probe_parsed.json'))
           nonces   = json.load(open(work_dir + '/nonces.json'))
           thumbs   = json.load(open(work_dir + '/thumbs_manifest.json'))
           cdn_urls = json.load(open(work_dir + '/cdn_urls.json'))
+
           content_id = metadata.get('contentId', job_id)
           seg_count  = len([k for k in nonces['nonces'] if k != 'init.bin'])
           thumb_urls = [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
+
           body = {
             'contentId':    content_id,
             'title':        metadata.get('title','Untitled'),
@@ -865,22 +844,43 @@ jobs:
             'masterUrl':    f"{cdn_base}/{job_id}/master.m3u8",
             'noncesUrl':    f"{cdn_base}/{job_id}/nonces.json",
           }
-          req = urllib.request.Request(
-            f"{pipeline_api}/api/pipeline/register",
-            data=json.dumps(body).encode(),
-            headers={
-              'Content-Type': 'application/json',
-              'X-API-Key':    os.environ.get('ADMIN_API_KEY',''),
-            },
-            method='POST'
-          )
-          try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-              print(f"✓ Conteúdo registado ({r.status})")
-          except urllib.error.HTTPError as e:
-            print(f"⚠ Registo falhou ({e.code}): {e.read().decode()[:200]}")
-          except Exception as e:
-            print(f"⚠ Registo falhou: {e}")
+
+          payload = json.dumps(body).encode()
+
+          # Retry com backoff exponencial — trata cold start Render + "Not connected" Turso
+          MAX_ATTEMPTS = 5
+          BACKOFF      = [5, 10, 20, 40]   # segundos entre tentativas
+
+          for attempt in range(1, MAX_ATTEMPTS + 1):
+            req = urllib.request.Request(
+              f"{pipeline_api}/api/pipeline/register",
+              data=payload,
+              headers={
+                'Content-Type': 'application/json',
+                'X-API-Key':    os.environ.get('ADMIN_API_KEY',''),
+              },
+              method='POST'
+            )
+            try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                print(f"✓ Conteúdo registado ({r.status}) na tentativa {attempt}")
+                break
+            except urllib.error.HTTPError as e:
+              body_err = e.read().decode()[:300]
+              print(f"⚠ Tentativa {attempt}/{MAX_ATTEMPTS} — HTTP {e.code}: {body_err}")
+              # Erros de cliente (4xx, excepto 429) não melhoram com retry
+              if e.code < 500 and e.code != 429:
+                print(f"  Erro de cliente ({e.code}) — sem retry")
+                break
+            except Exception as e:
+              print(f"⚠ Tentativa {attempt}/{MAX_ATTEMPTS} — {e}")
+
+            if attempt < MAX_ATTEMPTS:
+              wait = BACKOFF[attempt - 1]
+              print(f"  Aguardando {wait}s antes da próxima tentativa...")
+              time.sleep(wait)
+            else:
+              print(f"✗ Registo falhou após {MAX_ATTEMPTS} tentativas — verificar pipeline API")
           PYEOF
 
       # ── 15. Cleanup ────────────────────────────────────────────────────────
