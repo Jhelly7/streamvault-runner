@@ -143,14 +143,17 @@ jobs:
             'alert_mask': lt.alert.category_t.status_notification |
                           lt.alert.category_t.error_notification,
           })
-          ses.apply_settings({
-            'connections_limit':         200,
-            'active_downloads':          1,
-            'active_seeds':              0,
-            'seed_time_limit':           0,
-            'share_ratio_limit':         0,
-            'seeding_time_ratio_limit':  0,
-          })
+
+          # FIX: removidas chaves inválidas no libtorrent 2.x
+          # (seeding_time_ratio_limit, share_ratio_limit, seed_time_limit)
+          try:
+            ses.apply_settings({
+              'connections_limit': 200,
+              'active_downloads':  1,
+              'active_seeds':      0,
+            })
+          except Exception as e:
+            print(f"⚠ apply_settings parcial: {e}")
 
           params = lt.add_torrent_params()
           params.save_path = dest_dir
@@ -347,8 +350,6 @@ jobs:
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
       # ── 6. Thumbnails ──────────────────────────────────────────────────────
-      # FIX: adicionada linha de debug para confirmar que INPUT_THUMBNAIL_URL chegou.
-      # Requer também que o dispatcher.js passe thumbnail_url nos inputs (já corrigido).
       - name: Obter thumbnails
         env:
           INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
@@ -362,7 +363,6 @@ jobs:
           thumb_url = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
           thumbs    = []
 
-          # DEBUG: confirmar que o valor chegou
           if thumb_url:
             print(f"  INPUT_THUMBNAIL_URL = '{thumb_url}'")
           else:
@@ -783,9 +783,6 @@ jobs:
           echo "✓ Tunnel e servidor HTTP desligados"
 
       # ── 14. Registar no EdgeOne ────────────────────────────────────────────
-      # FIX: retry com backoff exponencial para lidar com cold start Render.
-      # "Not connected" = servidor acordou mas ligação Turso/libsql ainda não está pronta.
-      # Tentamos até 5 vezes com espera crescente: 5s → 10s → 20s → 40s.
       - name: Registar no EdgeOne (Turso + KV)
         env:
           METADATA: ${{ inputs.metadata }}
@@ -847,9 +844,8 @@ jobs:
 
           payload = json.dumps(body).encode()
 
-          # Retry com backoff exponencial — trata cold start Render + "Not connected" Turso
           MAX_ATTEMPTS = 5
-          BACKOFF      = [5, 10, 20, 40]   # segundos entre tentativas
+          BACKOFF      = [5, 10, 20, 40]
 
           for attempt in range(1, MAX_ATTEMPTS + 1):
             req = urllib.request.Request(
@@ -868,7 +864,6 @@ jobs:
             except urllib.error.HTTPError as e:
               body_err = e.read().decode()[:300]
               print(f"⚠ Tentativa {attempt}/{MAX_ATTEMPTS} — HTTP {e.code}: {body_err}")
-              # Erros de cliente (4xx, excepto 429) não melhoram com retry
               if e.code < 500 and e.code != 429:
                 print(f"  Erro de cliente ({e.code}) — sem retry")
                 break
