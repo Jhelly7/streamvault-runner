@@ -242,19 +242,71 @@ jobs:
           name: video-${{ inputs.job_id }}
           path: ${{ env.WORK_DIR }}/incoming/
 
-      - name: Detectar ficheiro de vídeo
+      - name: Detectar ficheiro de vídeo (+ extrair .rar/.zip se necessário)
         run: |
           VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
-          VIDEO_PATH=""
-          for ext in $VIDEO_EXTS; do
-            FOUND=$(find "$WORK_DIR/incoming/" -iname "*.${ext}" | head -1)
-            if [ -n "$FOUND" ]; then VIDEO_PATH="$FOUND"; break; fi
-          done
+
+          find_video() {
+            for ext in $VIDEO_EXTS; do
+              FOUND=$(find "$WORK_DIR/incoming/" -iname "*.${ext}" | head -1)
+              if [ -n "$FOUND" ]; then echo "$FOUND"; return; fi
+            done
+          }
+
+          VIDEO_PATH=$(find_video)
+
+          # ── Se não encontrou vídeo, tentar extrair arquivos comprimidos ──
           if [ -z "$VIDEO_PATH" ]; then
-            echo "ERRO: nenhum vídeo encontrado"; ls -la "$WORK_DIR/incoming/"; exit 1
+            echo "Nenhum vídeo directo — procurando arquivos comprimidos..."
+
+            # Instalar unrar se necessário
+            RAR_FILES=$(find "$WORK_DIR/incoming/" -iname "*.rar" | head -1)
+            ZIP_FILES=$(find "$WORK_DIR/incoming/" -iname "*.zip" | head -1)
+            TAR_FILES=$(find "$WORK_DIR/incoming/" -iname "*.tar*" | head -1)
+            MKV_IN_RAR=""
+
+            if [ -n "$RAR_FILES" ]; then
+              echo "→ Encontrado .rar: $RAR_FILES"
+              sudo apt-get install -y --no-install-recommends unrar-free 2>/dev/null || \
+              sudo apt-get install -y --no-install-recommends unrar 2>/dev/null || true
+              # unrar-free usa 'unrar' ou 'unrar-free'; tentar ambos
+              EXTRACT_DIR="$WORK_DIR/incoming/extracted"
+              mkdir -p "$EXTRACT_DIR"
+              if command -v unrar &>/dev/null; then
+                unrar x -o+ "$RAR_FILES" "$EXTRACT_DIR/" && echo "✓ unrar concluído"
+              elif command -v unrar-free &>/dev/null; then
+                unrar-free -x "$RAR_FILES" "$EXTRACT_DIR/" && echo "✓ unrar-free concluído"
+              else
+                # fallback: bsdtar (já instalado no ubuntu-latest)
+                echo "  unrar não disponível — tentando bsdtar"
+                bsdtar -x -f "$RAR_FILES" -C "$EXTRACT_DIR/" && echo "✓ bsdtar concluído"
+              fi
+              VIDEO_PATH=$(find_video)
+
+            elif [ -n "$ZIP_FILES" ]; then
+              echo "→ Encontrado .zip: $ZIP_FILES"
+              EXTRACT_DIR="$WORK_DIR/incoming/extracted"
+              mkdir -p "$EXTRACT_DIR"
+              unzip -o "$ZIP_FILES" -d "$EXTRACT_DIR/"
+              VIDEO_PATH=$(find_video)
+
+            elif [ -n "$TAR_FILES" ]; then
+              echo "→ Encontrado .tar: $TAR_FILES"
+              EXTRACT_DIR="$WORK_DIR/incoming/extracted"
+              mkdir -p "$EXTRACT_DIR"
+              tar -xf "$TAR_FILES" -C "$EXTRACT_DIR/"
+              VIDEO_PATH=$(find_video)
+            fi
           fi
+
+          if [ -z "$VIDEO_PATH" ]; then
+            echo "ERRO: nenhum vídeo encontrado após extracção"
+            find "$WORK_DIR/incoming/" -type f | head -20
+            exit 1
+          fi
+
           echo "VIDEO_PATH=$VIDEO_PATH" >> $GITHUB_ENV
-          echo "Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
+          echo "✓ Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
 
       # ── 4. Probe ───────────────────────────────────────────────────────────
       - name: Probe do vídeo
