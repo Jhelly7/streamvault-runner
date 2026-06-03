@@ -9,6 +9,9 @@ name: StreamVault Process
 # STORAGE_GITHUB_OWNER  — username da conta storage
 # STORAGE_GITHUB_REPO   — repo da conta storage
 # CLOUDFLARE_TUNNEL_TOKEN — token do tunnel cloudflared
+# CF_ZONE_ID            — Zone ID do domínio CDN (Cloudflare Dashboard → Overview → Zone ID)
+# CF_API_TOKEN          — API Token com permissões: Zone / Cache Purge (Edit) + Zone / Zone Settings (Edit)
+#                         Criar em: dash.cloudflare.com/profile/api-tokens → Create Token → Edit zone DNS (template)
 
 on:
   workflow_dispatch:
@@ -660,6 +663,24 @@ jobs:
           if total_bytes > RELEASE_LIMIT:
             print(f"  ⚠ {total_mb:.0f} MB > {limit_mb:.0f} MB — upload ignorado")
             print(f"  → conteúdo servido exclusivamente pelo cache Cloudflare")
+            # Gerar cdn_urls.json mesmo quando upload é ignorado
+            # para que o warm (step 12) e o registo (step 14) funcionem normalmente
+            cdn_base_skip = os.environ['CDN_DOMAIN'].rstrip('/')
+            job_id_skip   = os.environ['JOB_ID']
+            nonces_skip   = json.load(open(work_dir + '/nonces.json'))
+            thumbs_skip   = json.load(open(work_dir + '/thumbs_manifest.json'))
+            cdn_urls_skip = (
+              [
+                f"{cdn_base_skip}/{job_id_skip}/master.m3u8",
+                f"{cdn_base_skip}/{job_id_skip}/nonces.json",
+                f"{cdn_base_skip}/{job_id_skip}/hls/index.m3u8",
+                f"{cdn_base_skip}/{job_id_skip}/hls/init.bin",
+              ] +
+              [f"{cdn_base_skip}/{job_id_skip}/hls/{bn}" for bn in nonces_skip['nonces'] if bn != 'init.bin'] +
+              [f"{cdn_base_skip}/{job_id_skip}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs_skip))]
+            )
+            json.dump(cdn_urls_skip, open(work_dir + '/cdn_urls.json', 'w'))
+            print(f"  ✓ cdn_urls.json gerado ({len(cdn_urls_skip)} URLs) — warm e registo continuam normalmente")
             with open(github_env, 'a') as f:
               f.write("UPLOAD_SKIP=true\n")
             sys.exit(0)
@@ -759,7 +780,57 @@ jobs:
             | grep -E "^HTTP|cf-cache-status|cf-ray|cache-control|server|content-type" \
             || echo "curl falhou"
 
-      # ── 12. Warm ───────────────────────────────────────────────────────────
+      # ── 11b. Activar Smart Tiered Cache ───────────────────────────────────
+      # Garante que todos os PoPs do mundo servem a partir do upper-tier
+      # em vez de ir à origem (tunnel já fechará no step 13).
+      # Só precisa de correr uma vez — idempotente, não faz mal repetir.
+      - name: Activar Smart Tiered Cache
+        env:
+          CF_ZONE_ID:    ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN:  ${{ secrets.CF_API_TOKEN }}
+        run: |
+          if [ -z "$CF_ZONE_ID" ] || [ -z "$CF_API_TOKEN" ]; then
+            echo "⚠ CF_ZONE_ID ou CF_API_TOKEN não configurados — Tiered Cache ignorado"
+            echo "  → Adiciona os secrets CF_ZONE_ID e CF_API_TOKEN para activar"
+            exit 0
+          fi
+
+          echo "→ Activando Smart Tiered Cache para zone $CF_ZONE_ID..."
+          RESPONSE=$(curl -s -X PATCH \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/cache/tiered_cache_smart_topology_enable" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"value":"on"}')
+
+          SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('success','false'))" 2>/dev/null || echo "false")
+
+          if [ "$SUCCESS" = "True" ] || [ "$SUCCESS" = "true" ]; then
+            echo "✅ Smart Tiered Cache activado"
+            echo "   Todos os PoPs mundiais vão agora buscar ao upper-tier em vez da origem"
+          else
+            # Verificar se já estava activo (erro esperado)
+            ERRORS=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('errors',''))" 2>/dev/null || echo "")
+            echo "⚠ Resposta inesperada: $RESPONSE"
+            echo "  → Verificar permissões do CF_API_TOKEN (Zone / Zone Settings / Edit)"
+          fi
+
+          # Verificar estado actual
+          echo ""
+          echo "→ Estado actual do Tiered Cache:"
+          curl -s \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/cache/tiered_cache_smart_topology_enable" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          if d.get('success'):
+            val = d.get('result', {}).get('value', 'unknown')
+            print(f'  Smart Tiered Cache: {val}')
+          else:
+            print(f'  Erro ao verificar: {d}')
+          " 2>/dev/null || echo "  Falha ao verificar estado"
+
+
       - name: Aquecer Cloudflare Cache
         run: |
           python3 << 'PYEOF'
