@@ -423,15 +423,27 @@ jobs:
           else:
             print("  INPUT_THUMBNAIL_URL = (vazio — extraindo frame)")
 
+          # ── Detecta imagem válida por magic bytes (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF/HEIF) ──
           def is_valid_image(path, min_bytes=5000):
             if not os.path.exists(path):
               return False
-            size = os.path.getsize(path)
-            if size < min_bytes:
+            if os.path.getsize(path) < min_bytes:
               return False
             with open(path, 'rb') as f:
-              header = f.read(12)
-            return header[:3] == b'\xff\xd8\xff' or header[:4] == b'\x89PNG'
+              header = f.read(16)
+            return (
+              header[:3]  == b'\xff\xd8\xff'           or  # JPEG
+              header[:4]  == b'\x89PNG'                or  # PNG
+              (header[:4] == b'RIFF' and
+               header[8:12] == b'WEBP')                or  # WebP
+              header[:6]  in (b'GIF87a', b'GIF89a')   or  # GIF
+              header[:2]  in (b'BM',)                  or  # BMP
+              header[:4]  in (b'II\x2a\x00',
+                              b'MM\x00\x2a')           or  # TIFF (LE / BE)
+              header[4:8] in (b'ftyp', b'mif1',
+                              b'msf1', b'heic',
+                              b'heix', b'avif')            # AVIF / HEIF
+            )
 
           def extract_frame(video, out_path, time_pct=0.07):
             t = max(1.0, duration * time_pct)
