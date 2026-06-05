@@ -43,6 +43,22 @@ on:
         description: 'URL da thumbnail (JPG/PNG) — vazio = gera 1 frame a ~7% do vídeo'
         required: false
         default: ''
+      season_number:
+        description: 'Número da temporada (0 = filme/documentário)'
+        required: false
+        default: '0'
+      episode_number:
+        description: 'Número do episódio (0 = coordinator ou filme)'
+        required: false
+        default: '0'
+      episode_title:
+        description: 'Título do episódio (opcional)'
+        required: false
+        default: ''
+      file_indices:
+        description: 'Índices dos ficheiros no torrent a processar ex: 2,3,4 (vazio = coordinator ou ficheiro único)'
+        required: false
+        default: ''
 
 jobs:
   process:
@@ -126,7 +142,231 @@ jobs:
           # Verificar instalação
           python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
-      # ── 3. Obter vídeo ─────────────────────────────────────────────────────
+      # ── 2b. Coordinator — extrai metadados torrent e dispara jobs filhos ──────
+      # Corre APENAS quando: URL torrent/magnet + type série/anime/dorama + file_indices vazio
+      # Termina com sys.exit(0) — steps seguintes não correm neste job coordinator
+      - name: '[Coordinator] Detectar episódios e disparar jobs filhos'
+        if: |
+          ${{
+            inputs.video_url != '' &&
+            inputs.file_indices == '' &&
+            (
+              contains(fromJson(inputs.metadata).type, 'series') ||
+              contains(fromJson(inputs.metadata).type, 'anime')  ||
+              contains(fromJson(inputs.metadata).type, 'dorama')
+            ) &&
+            (
+              startsWith(inputs.video_url, 'magnet:') ||
+              endsWith(inputs.video_url, '.torrent')  ||
+              contains(inputs.video_url, 'infohash:')
+            )
+          }}
+        env:
+          GH_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO:         ${{ github.repository }}
+          GH_REF:          ${{ github.ref_name }}
+          INPUT_METADATA:  ${{ inputs.metadata }}
+          INPUT_VIDEO_URL: ${{ inputs.video_url }}
+          INPUT_THUMBNAIL: ${{ inputs.thumbnail_url }}
+          INPUT_SEG:       ${{ inputs.seg_duration }}
+          INPUT_HEIGHT:    ${{ inputs.max_encode_height }}
+          INPUT_WARM:      ${{ inputs.warm_concurrency }}
+          INPUT_SEASON:    ${{ inputs.season_number }}
+        run: |
+          python3 << 'PYEOF'
+          import libtorrent as lt
+          import os, sys, re, json, time, urllib.request, urllib.error
+
+          url          = os.environ['INPUT_VIDEO_URL']
+          metadata_raw = os.environ['INPUT_METADATA']
+          gh_token     = os.environ['GH_TOKEN']
+          gh_repo      = os.environ['GH_REPO']
+          gh_ref       = os.environ['GH_REF']
+          season_num   = int(os.environ.get('INPUT_SEASON', '0') or '0')
+          WORKFLOW_FILE = 'StreamVault.yml'
+          VIDEO_EXTS    = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
+          BATCH_LIMIT   = 1_400 * 1024 * 1024  # 1.4GB estimado após encode
+
+          try:
+            metadata = json.loads(metadata_raw)
+          except Exception:
+            metadata = {}
+
+          content_id = metadata.get('contentId') or ''
+          print(f"Coordinator: {metadata.get('title','?')} S{season_num:02d} | {url[:70]}...")
+
+          # ── Sessão libtorrent só para metadados (sem download) ─────────────
+          ses = lt.session({'listen_interfaces': '0.0.0.0:6882'})
+          try:
+            ses.apply_settings({'connections_limit': 50, 'active_downloads': 1, 'active_seeds': 0})
+          except Exception as e:
+            print(f"  apply_settings parcial: {e}")
+
+          os.makedirs('/tmp/coord_meta', exist_ok=True)
+
+          if url.startswith('magnet:') or 'infohash:' in url:
+            params = lt.parse_magnet_uri(url)
+            params.save_path = '/tmp/coord_meta'
+          else:
+            torrent_path = '/tmp/coord.torrent'
+            urllib.request.urlretrieve(url, torrent_path)
+            ti = lt.torrent_info(torrent_path)
+            params = lt.add_torrent_params()
+            params.ti = ti
+            params.save_path = '/tmp/coord_meta'
+
+          # Pausar imediatamente — só queremos metadados
+          params.flags = lt.torrent_flags.upload_mode | lt.torrent_flags.paused
+          handle = ses.add_torrent(params)
+          handle.resume()
+
+          print("  Aguardando metadados...")
+          t0 = time.time()
+          while not handle.status().has_metadata:
+            if time.time() - t0 > 120:
+              print("ERRO: timeout metadados (120s)")
+              ses.remove_torrent(handle)
+              sys.exit(1)
+            ses.wait_for_alert(1000)
+            elapsed = int(time.time() - t0)
+            if elapsed % 15 == 0 and elapsed > 0:
+              st = handle.status()
+              print(f"  ... {elapsed}s | peers: {st.num_peers}")
+
+          info = handle.get_torrent_info()
+          fs   = info.files()
+          print(f"  Metadados OK: {info.name()} | {fs.num_files()} ficheiros | {info.total_size()//(1024*1024)} MB")
+          ses.remove_torrent(handle)
+
+          # ── Listar ficheiros de vídeo ──────────────────────────────────────
+          video_files = []
+          for i in range(fs.num_files()):
+            path = fs.file_path(i)
+            size = fs.file_size(i)
+            ext  = os.path.splitext(path)[1].lower()
+            if ext in VIDEO_EXTS:
+              video_files.append({'index': i, 'path': path, 'size': size, 'name': os.path.basename(path)})
+
+          if not video_files:
+            print("ERRO: nenhum ficheiro de vídeo nos metadados")
+            sys.exit(1)
+
+          print(f"  Vídeos encontrados: {len(video_files)}")
+
+          # ── Detectar número do episódio ────────────────────────────────────
+          def extract_ep(name):
+            base = os.path.splitext(name)[0]
+            patterns = [
+              r'[Ss]\d+[Ee](\d+)',
+              r'[Ee][Pp]?[\s._-]?(\d{1,3})',
+              r'[\s._-](\d{2,3})[\s._-]',
+              r'^(\d{1,3})[\s._-]',
+              r'[\s._-](\d{1,3})\.',
+            ]
+            for pat in patterns:
+              m = re.search(pat, base, re.IGNORECASE)
+              if m:
+                return int(m.group(1))
+            return None
+
+          for vf in video_files:
+            vf['ep_num'] = extract_ep(vf['name'])
+
+          # Ordenar por ep detectado, depois por nome
+          video_files.sort(key=lambda x: (x['ep_num'] is None, x['ep_num'] or 0, x['name']))
+
+          # Numerar episódios sem número detectado
+          used_nums = {v['ep_num'] for v in video_files if v['ep_num'] is not None}
+          counter   = 1
+          for vf in video_files:
+            if vf['ep_num'] is None:
+              while counter in used_nums:
+                counter += 1
+              vf['ep_num'] = counter
+              used_nums.add(counter)
+              counter += 1
+
+          for vf in video_files:
+            print(f"  [{vf['index']:2d}] ep{vf['ep_num']:02d} | {vf['name']} | {vf['size']//(1024*1024)}MB")
+
+          # ── Dividir em batches por tamanho estimado ────────────────────────
+          # CRF26 superfast ≈ 55% do original + 17% overhead ChaCha20
+          def est(size):
+            return int(size * 0.55 * 1.17)
+
+          batches, cur, cur_size = [], [], 0
+          for vf in video_files:
+            e = est(vf['size'])
+            if cur and cur_size + e > BATCH_LIMIT:
+              batches.append(cur)
+              cur, cur_size = [vf], e
+            else:
+              cur.append(vf)
+              cur_size += e
+          if cur:
+            batches.append(cur)
+
+          print(f"  Batches: {len(batches)}")
+          for i, b in enumerate(batches):
+            print(f"    Batch {i+1}: eps {[v['ep_num'] for v in b]} | ~{sum(v['size'] for v in b)//(1024*1024)}MB raw")
+
+          # ── Disparar jobs filhos via GitHub API ────────────────────────────
+          safe_cid = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
+          dispatched = 0
+
+          for bi, batch in enumerate(batches):
+            indices_str = ','.join(str(v['index']) for v in batch)
+            ep_numbers  = ','.join(str(v['ep_num']) for v in batch)
+            first_ep    = batch[0]['ep_num']
+            child_id    = f"{safe_cid}-s{season_num:02d}-ep{first_ep:02d}-b{bi+1}"
+            child_meta  = {**metadata, 'contentId': content_id or safe_cid}
+
+            payload = json.dumps({
+              'ref': gh_ref,
+              'inputs': {
+                'job_id':            child_id,
+                'video_url':         url,
+                'thumbnail_url':     os.environ.get('INPUT_THUMBNAIL',''),
+                'seg_duration':      os.environ.get('INPUT_SEG','4'),
+                'max_encode_height': os.environ.get('INPUT_HEIGHT','720'),
+                'warm_concurrency':  os.environ.get('INPUT_WARM','8'),
+                'metadata':          json.dumps(child_meta),
+                'season_number':     str(season_num),
+                'episode_number':    ep_numbers,
+                'episode_title':     '',
+                'file_indices':      indices_str,
+              }
+            }).encode()
+
+            req = urllib.request.Request(
+              f"https://api.github.com/repos/{gh_repo}/actions/workflows/{WORKFLOW_FILE}/dispatches",
+              data=payload,
+              headers={
+                'Authorization':        f'Bearer {gh_token}',
+                'Accept':               'application/vnd.github+json',
+                'X-GitHub-Api-Version': '2022-11-28',
+                'Content-Type':         'application/json',
+                'User-Agent':           'StreamVault-Coordinator/1.0',
+              },
+              method='POST'
+            )
+            try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                print(f"  ✓ Batch {bi+1} → {child_id} (HTTP {r.status})")
+                dispatched += 1
+            except urllib.error.HTTPError as e:
+              print(f"  ✗ Batch {bi+1} HTTP {e.code}: {e.read().decode()[:200]}")
+            except Exception as e:
+              print(f"  ✗ Batch {bi+1} erro: {e}")
+
+            if bi < len(batches) - 1:
+              time.sleep(2)
+
+          print(f"\n✅ Coordinator: {dispatched}/{len(batches)} jobs despachados")
+          sys.exit(0)
+          PYEOF
+
+      # ── 3. Obter vídeo ─────────────────────────────────────────────────────────────────────────────
       - name: '[Modo A] Descarregar vídeo'
         if: ${{ inputs.video_url != '' }}
         run: |
@@ -176,6 +416,28 @@ jobs:
 
           handle = ses.add_torrent(params)
           handle.set_sequential_download(True)
+
+          # ── Modo worker: aplicar prioridades por ficheiro ──────────────────
+          file_indices_raw = os.environ.get('FILE_INDICES_ENV', '').strip()
+          if file_indices_raw:
+            # Aguardar metadados para poder definir prioridades
+            print(f"  Modo worker — aguardando metadados para definir prioridades...")
+            t0_meta = time.time()
+            while not handle.status().has_metadata:
+              if time.time() - t0_meta > 60:
+                print("  ⚠ Timeout metadados — continuando sem prioridades")
+                break
+              ses.wait_for_alert(500)
+            if handle.status().has_metadata:
+              info_w    = handle.get_torrent_info()
+              num_files = info_w.files().num_files()
+              wanted    = set(int(x) for x in file_indices_raw.split(',') if x.strip().isdigit())
+              for fi in range(num_files):
+                prio = 7 if fi in wanted else 0
+                handle.file_priority(fi, prio)
+              print(f"  Prioridades definidas: {sorted(wanted)} activos | {num_files - len(wanted)} ignorados")
+            else:
+              print("  ⚠ Sem metadados — descarregando tudo (fallback)")
 
           print(f"  Destino: {dest_dir}")
           last_pct = -1
@@ -236,7 +498,8 @@ jobs:
             fi
           fi
         env:
-          video_url_env: ${{ inputs.video_url }}
+          video_url_env:    ${{ inputs.video_url }}
+          FILE_INDICES_ENV: ${{ inputs.file_indices }}
 
       - name: '[Modo B] Obter vídeo via Artifact'
         if: ${{ inputs.video_url == '' }}
@@ -248,6 +511,17 @@ jobs:
       - name: Detectar ficheiro de vídeo (+ extrair .rar/.zip se necessário)
         run: |
           VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
+
+          # Modo worker de série: se FILE_INDICES definido, processar episódios em sequência
+          # Os vídeos são detectados por ordem dos índices — cada um será processado separadamente
+          # Por agora detectamos o PRIMEIRO vídeo disponível (processamento sequencial por job)
+          FILE_INDICES="${{ inputs.file_indices }}"
+          if [ -n "$FILE_INDICES" ]; then
+            echo "→ Modo worker | file_indices: $FILE_INDICES"
+            echo "FILE_INDICES_ACTIVE=true" >> $GITHUB_ENV
+          else
+            echo "FILE_INDICES_ACTIVE=false" >> $GITHUB_ENV
+          fi
 
           find_video() {
             for ext in $VIDEO_EXTS; do
@@ -423,27 +697,15 @@ jobs:
           else:
             print("  INPUT_THUMBNAIL_URL = (vazio — extraindo frame)")
 
-          # ── Detecta imagem válida por magic bytes (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF/HEIF) ──
           def is_valid_image(path, min_bytes=5000):
             if not os.path.exists(path):
               return False
-            if os.path.getsize(path) < min_bytes:
+            size = os.path.getsize(path)
+            if size < min_bytes:
               return False
             with open(path, 'rb') as f:
-              header = f.read(16)
-            return (
-              header[:3]  == b'\xff\xd8\xff'           or  # JPEG
-              header[:4]  == b'\x89PNG'                or  # PNG
-              (header[:4] == b'RIFF' and
-               header[8:12] == b'WEBP')                or  # WebP
-              header[:6]  in (b'GIF87a', b'GIF89a')   or  # GIF
-              header[:2]  in (b'BM',)                  or  # BMP
-              header[:4]  in (b'II\x2a\x00',
-                              b'MM\x00\x2a')           or  # TIFF (LE / BE)
-              header[4:8] in (b'ftyp', b'mif1',
-                              b'msf1', b'heic',
-                              b'heix', b'avif')            # AVIF / HEIF
-            )
+              header = f.read(12)
+            return header[:3] == b'\xff\xd8\xff' or header[:4] == b'\x89PNG'
 
           def extract_frame(video, out_path, time_pct=0.07):
             t = max(1.0, duration * time_pct)
@@ -920,7 +1182,11 @@ jobs:
       # ── 14. Registar no EdgeOne ────────────────────────────────────────────
       - name: Registar no EdgeOne (Turso + KV)
         env:
-          METADATA: ${{ inputs.metadata }}
+          METADATA:        ${{ inputs.metadata }}
+          SEASON_NUMBER:   ${{ inputs.season_number }}
+          EPISODE_NUMBER:  ${{ inputs.episode_number }}
+          EPISODE_TITLE:   ${{ inputs.episode_title }}
+          FILE_INDICES:    ${{ inputs.file_indices }}
         run: |
           python3 << 'PYEOF'
           import json, os, urllib.request, urllib.error, datetime, time
@@ -1011,6 +1277,66 @@ jobs:
               time.sleep(wait)
             else:
               print(f"✗ Registo falhou após {MAX_ATTEMPTS} tentativas — verificar pipeline API")
+
+          # ── Registo de season e episode (só para séries/anime/dorama) ──────
+          content_type  = metadata.get('type', 'movie')
+          season_num    = int(os.environ.get('SEASON_NUMBER', '0') or '0')
+          episode_nums  = os.environ.get('EPISODE_NUMBER', '').strip()
+          episode_title = os.environ.get('EPISODE_TITLE', '').strip()
+          file_indices  = os.environ.get('FILE_INDICES', '').strip()
+
+          IS_SERIES = content_type in ('series', 'anime', 'dorama') and season_num > 0 and file_indices != ''
+
+          if IS_SERIES:
+            episode_list = [int(x) for x in episode_nums.split(',') if x.strip().isdigit()]
+            print(f"\n→ Registando série: contentId={content_id} | S{season_num:02d} | eps={episode_list}")
+
+            def api_call(endpoint, body_dict, label):
+              payload_s = json.dumps(body_dict).encode()
+              for attempt in range(1, 4):
+                req_s = urllib.request.Request(
+                  f"{pipeline_api}{endpoint}",
+                  data=payload_s,
+                  headers={'Content-Type': 'application/json', 'X-API-Key': os.environ.get('ADMIN_API_KEY','')},
+                  method='POST'
+                )
+                try:
+                  with urllib.request.urlopen(req_s, timeout=30) as r:
+                    resp = json.loads(r.read().decode())
+                    print(f"  ✓ {label} ({r.status})")
+                    return resp
+                except urllib.error.HTTPError as e:
+                  body_e = e.read().decode()[:200]
+                  # 409 = já existe — tudo bem, continuar
+                  if e.code == 409:
+                    print(f"  ℹ {label} já existe (409) — ok")
+                    return {'ok': True, 'exists': True}
+                  print(f"  ⚠ {label} tentativa {attempt} HTTP {e.code}: {body_e}")
+                  if e.code < 500:
+                    break
+                except Exception as e:
+                  print(f"  ⚠ {label} tentativa {attempt}: {e}")
+                time.sleep(3)
+              return None
+
+            # 1. Criar season (409 = já existe, ignorar)
+            season_resp = api_call('/api/admin/season', {
+              'content_id':    content_id,
+              'season_number': season_num,
+              'title':         f"Temporada {season_num}",
+            }, f"Season {season_num}")
+
+            # 2. Criar cada episódio do batch
+            for ep_num in episode_list:
+              ep_resp = api_call('/api/admin/episode', {
+                'content_id':     content_id,
+                'season_number':  season_num,
+                'episode_number': ep_num,
+                'title':          episode_title or f"Episódio {ep_num}",
+                'duration':       round(probe['duration']),
+              }, f"Ep {ep_num}")
+
+            print(f"  ✅ Season + {len(episode_list)} episódio(s) registados")
           PYEOF
 
       # ── 15. Cleanup ────────────────────────────────────────────────────────
