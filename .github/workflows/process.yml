@@ -125,12 +125,14 @@ jobs:
 
           # ── Criar tunnel isolado via API — escreve TUNNEL_ID e TUNNEL_TOKEN ─
           # IMPORTANTE: valores escritos aqui só ficam disponíveis no PRÓXIMO step
+          # JOB_ID_RAW passado via export — GITHUB_ENV ainda não está disponível neste step
+          export JOB_ID_RAW="${{ inputs.job_id }}"
           python3 << 'PYEOF'
           import os, json, secrets, base64, urllib.request, urllib.error, sys
 
           account_id = os.environ['CF_ACCOUNT_ID']
           api_token  = os.environ['CF_API_TOKEN']
-          job_id     = os.environ['JOB_ID']
+          job_id = os.environ['JOB_ID_RAW']
 
           tunnel_name   = f"sv-{job_id[:40]}"
           tunnel_secret = base64.b64encode(secrets.token_bytes(32)).decode()
