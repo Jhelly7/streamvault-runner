@@ -8,10 +8,16 @@ name: StreamVault Process
 # STORAGE_GITHUB_TOKEN  — PAT da conta storage (scope: repo)
 # STORAGE_GITHUB_OWNER  — username da conta storage
 # STORAGE_GITHUB_REPO   — repo da conta storage
-# CLOUDFLARE_TUNNEL_TOKEN — token do tunnel cloudflared
+# CF_ACCOUNT_ID         — Cloudflare Account ID (Dashboard → lado direito)
 # CF_ZONE_ID            — Zone ID do domínio CDN (Cloudflare Dashboard → Overview → Zone ID)
-# CF_API_TOKEN          — API Token com permissões: Zone / Cache Purge (Edit) + Zone / Zone Settings (Edit)
-#                         Criar em: dash.cloudflare.com/profile/api-tokens → Create Token → Edit zone DNS (template)
+# CF_API_TOKEN          — API Token com permissões:
+#                           Cloudflare Tunnel: Edit
+#                           Zone / Cache Purge: Edit
+#                           Zone / Zone Settings: Edit
+#                           Zone / DNS: Edit
+#                         Criar em: dash.cloudflare.com/profile/api-tokens
+#
+# REMOVIDO: CLOUDFLARE_TUNNEL_TOKEN — cada job cria e destrói o seu próprio tunnel via API
 
 on:
   workflow_dispatch:
@@ -71,10 +77,16 @@ jobs:
       CDN_DOMAIN:    ${{ secrets.CDN_DOMAIN }}
       PIPELINE_API:  ${{ secrets.PIPELINE_API }}
       ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_ZONE_ID:    ${{ secrets.CF_ZONE_ID }}
+      CF_API_TOKEN:  ${{ secrets.CF_API_TOKEN }}
 
     steps:
 
-      # ── 0. Preparar dirs + servidor HTTP + tunnel ──────────────────────────
+      # ── 0a. Preparar dirs + servidor HTTP + criar tunnel via API ────────────
+      # Corre sempre — inclusive no coordinator.
+      # Cria o tunnel e escreve TUNNEL_ID + TUNNEL_TOKEN em GITHUB_ENV.
+      # O cloudflared só arranca no step 0b (próximo step) onde as vars já estão disponíveis.
       - name: Preparar ambiente
         run: |
           mkdir -p $WORK_DIR/incoming $WORK_DIR/hls $WORK_DIR/thumbs
@@ -82,18 +94,26 @@ jobs:
           echo "SEG_DURATION=${{ inputs.seg_duration }}" >> $GITHUB_ENV
           echo "MAX_H=${{ inputs.max_encode_height }}"   >> $GITHUB_ENV
           echo "WARM_C=${{ inputs.warm_concurrency }}"   >> $GITHUB_ENV
+
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
-          # Servidor HTTP
+
+          # ── Servidor HTTP — só cacheia respostas 200, nunca 404 ────────────
           printf '%s\n' \
             'import http.server, os' \
             '' \
             'class CacheHandler(http.server.SimpleHTTPRequestHandler):' \
             '  def __init__(self, *a, **kw):' \
             '    super().__init__(*a, directory="/tmp/sv_work", **kw)' \
+            '  def send_response(self, code, message=None):' \
+            '    super().send_response(code, message)' \
+            '    self._response_code = code' \
             '  def end_headers(self):' \
-            '    self.send_header("Cache-Control", "public, max-age=31536000, immutable")' \
+            '    if getattr(self, "_response_code", 200) == 200:' \
+            '      self.send_header("Cache-Control", "public, max-age=31536000, immutable")' \
+            '    else:' \
+            '      self.send_header("Cache-Control", "no-store")' \
             '    self.send_header("Access-Control-Allow-Origin", "*")' \
             '    super().end_headers()' \
             '  def log_message(self, *a): pass' \
@@ -102,20 +122,103 @@ jobs:
             > /tmp/http_server.py
           python3 /tmp/http_server.py &
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
-          mkdir -p ~/.cloudflared
+
+          # ── Criar tunnel isolado via API — escreve TUNNEL_ID e TUNNEL_TOKEN ─
+          # IMPORTANTE: valores escritos aqui só ficam disponíveis no PRÓXIMO step
+          python3 << 'PYEOF'
+          import os, json, secrets, base64, urllib.request, urllib.error, sys
+
+          account_id = os.environ['CF_ACCOUNT_ID']
+          api_token  = os.environ['CF_API_TOKEN']
+          job_id     = os.environ['JOB_ID']
+
+          tunnel_name   = f"sv-{job_id[:40]}"
+          tunnel_secret = base64.b64encode(secrets.token_bytes(32)).decode()
+          headers = {
+            'Authorization': f'Bearer {api_token}',
+            'Content-Type':  'application/json',
+          }
+
+          def cf_request(method, path, body=None):
+            url  = f"https://api.cloudflare.com/client/v4{path}"
+            data = json.dumps(body).encode() if body else None
+            req  = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode()), r.status
+            except urllib.error.HTTPError as e:
+              return json.loads(e.read().decode()), e.code
+
+          print(f"→ Criando tunnel: {tunnel_name}")
+          resp, _ = cf_request('POST', f'/accounts/{account_id}/cfd_tunnel', {
+            'name':          tunnel_name,
+            'tunnel_secret': tunnel_secret,
+            'config_src':    'local',
+          })
+          if not resp.get('success'):
+            print(f"✗ Falha ao criar tunnel: {resp}")
+            sys.exit(1)
+
+          tunnel_id = resp['result']['id']
+          print(f"✓ Tunnel criado: {tunnel_id}")
+
+          resp_token, _ = cf_request('GET', f'/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token')
+          if not resp_token.get('success'):
+            print(f"✗ Falha ao obter token: {resp_token}")
+            sys.exit(1)
+
+          tunnel_token = resp_token['result']
+          print(f"✓ Token obtido")
+
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"TUNNEL_ID={tunnel_id}\n")
+            f.write(f"TUNNEL_TOKEN={tunnel_token}\n")
+
+          with open('/tmp/sv_tunnel_id', 'w') as f:
+            f.write(tunnel_id)
+
+          print(f"✓ TUNNEL_ID e TUNNEL_TOKEN em GITHUB_ENV — disponíveis no step 0b")
+          PYEOF
+
+      # ── 0b. Arrancar cloudflared ───────────────────────────────────────────
+      # Step separado: TUNNEL_TOKEN do GITHUB_ENV do step 0a já está disponível.
+      # Não corre no coordinator — não precisa de tunnel para extrair metadados.
+      - name: Arrancar tunnel Cloudflare
+        if: |
+          ${{
+            !(
+              inputs.video_url != '' &&
+              inputs.file_indices == '' &&
+              (
+                contains(fromJson(inputs.metadata).type, 'series') ||
+                contains(fromJson(inputs.metadata).type, 'anime')  ||
+                contains(fromJson(inputs.metadata).type, 'dorama')
+              ) &&
+              (
+                startsWith(inputs.video_url, 'magnet:') ||
+                endsWith(inputs.video_url, '.torrent')  ||
+                contains(inputs.video_url, 'infohash:')
+              )
+            )
+          }}
+        run: |
           CDN_HOST=$(echo "${{ secrets.CDN_DOMAIN }}" | sed 's|https\?://||')
+          mkdir -p ~/.cloudflared
           cat > ~/.cloudflared/config.yml << EOF
           ingress:
             - hostname: ${CDN_HOST}
               service: http://localhost:8080
             - service: http_status:404
           EOF
+
+          # TUNNEL_TOKEN disponível aqui via GITHUB_ENV do step 0a
           cloudflared tunnel --no-autoupdate \
             --config ~/.cloudflared/config.yml \
-            run --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" &
+            run --token "$TUNNEL_TOKEN" &
           echo "TUNNEL_PID=$!" >> $GITHUB_ENV
-          echo "Aguardando tunnel..."
-          for i in $(seq 1 20); do
+
+          echo "Aguardando tunnel estabilizar..."
+          for i in $(seq 1 30); do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
               "${{ secrets.CDN_DOMAIN }}/" 2>/dev/null || echo "000")
             echo "  Tentativa $i: HTTP $STATUS"
@@ -125,7 +228,6 @@ jobs:
             fi
             sleep 3
           done
-
       # ── 1. Instalar FFmpeg ─────────────────────────────────────────────────
       - name: Instalar FFmpeg
         run: |
@@ -184,7 +286,7 @@ jobs:
           gh_ref       = os.environ['GH_REF']
           season_num   = int(os.environ.get('INPUT_SEASON', '0') or '0')
           WORKFLOW_FILE = 'StreamVault.yml'
-          VIDEO_EXTS    = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
+          VIDEO_EXTS    = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg','.vob','.3gp','.rm','.rmvb','.divx','.ogv'}
           BATCH_LIMIT   = 1_400 * 1024 * 1024  # 1.4GB estimado após encode
 
           try:
@@ -474,7 +576,7 @@ jobs:
 
           ses.remove_torrent(handle, 0)
           files = list(pathlib.Path(dest_dir).rglob('*'))
-          video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
+          video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg','.vob','.3gp','.rm','.rmvb','.divx','.ogv'}
           videos = [f for f in files if f.suffix.lower() in video_exts]
           print(f"  Ficheiros descarregados: {len(files)}")
           for v in videos:
@@ -510,7 +612,7 @@ jobs:
 
       - name: Detectar ficheiro de vídeo (+ extrair .rar/.zip se necessário)
         run: |
-          VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
+          VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg vob 3gp rm rmvb divx ogv video"
 
           # Modo worker de série: se FILE_INDICES definido, processar episódios em sequência
           # Os vídeos são detectados por ordem dos índices — cada um será processado separadamente
@@ -705,7 +807,15 @@ jobs:
               return False
             with open(path, 'rb') as f:
               header = f.read(12)
-            return header[:3] == b'\xff\xd8\xff' or header[:4] == b'\x89PNG'
+            # JPEG, PNG, WebP, AVIF, GIF
+            return (
+              header[:3]  == b'\xff\xd8\xff'                    or  # JPEG
+              header[:4]  == b'\x89PNG'                          or  # PNG
+              header[:4]  == b'RIFF'                             or  # WebP
+              header[4:8] == b'WEBP'                             or  # WebP
+              b'ftyp' in header[4:12]                           or  # AVIF/HEIF/MP4
+              header[:6]  in (b'GIF87a', b'GIF89a')                 # GIF
+            )
 
           def extract_frame(video, out_path, time_pct=0.07):
             t = max(1.0, duration * time_pct)
@@ -895,7 +1005,8 @@ jobs:
           print(f"  → CDN: {cdn_base}/{job_id}/master.m3u8")
           PYEOF
 
-      # ── 10. Criar Release e upload assets ──────────────────────────────────
+      # ── 10. Criar Release e upload assets ─────────────────────────────────
+      # cdn_urls.json é sempre gerado aqui — lido pelos steps 12 e 14.
       - name: Criar Release e upload assets
         id: upload_assets
         continue-on-error: true
@@ -914,55 +1025,66 @@ jobs:
           job_id        = os.environ['JOB_ID']
           quality       = os.environ['QUALITY_LABEL']
           github_env    = os.environ['GITHUB_ENV']
+          cdn_base      = os.environ['CDN_DOMAIN'].rstrip('/')
           RELEASE_LIMIT = 1_500 * 1024 * 1024
+
+          # ── Função auxiliar — constrói lista de URLs CDN ───────────────────
+          def build_cdn_urls():
+            nonces = json.load(open(work_dir + '/nonces.json'))
+            thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
+            return (
+              [
+                f"{cdn_base}/{job_id}/master.m3u8",
+                f"{cdn_base}/{job_id}/nonces.json",
+                f"{cdn_base}/{job_id}/hls/index.m3u8",
+                f"{cdn_base}/{job_id}/hls/init.bin",
+              ] +
+              [f"{cdn_base}/{job_id}/hls/{bn}" for bn in nonces['nonces'] if bn != 'init.bin'] +
+              [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
+            )
+
+          # ── Lista de assets a enviar ───────────────────────────────────────
           assets = []
           for fpath, mime in [
-            (os.path.join(work_dir, 'master.m3u8'), 'application/vnd.apple.mpegurl'),
+            (os.path.join(work_dir, 'master.m3u8'),       'application/vnd.apple.mpegurl'),
             (os.path.join(work_dir, 'hls', 'index.m3u8'), 'application/vnd.apple.mpegurl'),
-            (os.path.join(work_dir, 'nonces.json'), 'application/json'),
+            (os.path.join(work_dir, 'nonces.json'),        'application/json'),
           ]:
             if os.path.exists(fpath):
               assets.append((fpath, os.path.basename(fpath), mime))
+
           hls_dir = os.path.join(work_dir, 'hls')
           for f in sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin')):
             assets.append((os.path.join(hls_dir, f), f, 'application/octet-stream'))
+
           thumb_dir = os.path.join(work_dir, 'thumbs')
           if os.path.isdir(thumb_dir):
             for f in sorted(f for f in os.listdir(thumb_dir) if f.endswith('.jpg')):
               assets.append((os.path.join(thumb_dir, f), f, 'image/jpeg'))
+
           total_bytes = sum(os.path.getsize(p) for p, _, _ in assets)
           total_mb    = total_bytes / (1024 * 1024)
           limit_mb    = RELEASE_LIMIT / (1024 * 1024)
           print(f"  Total assets: {len(assets)} ficheiros | {total_mb:.1f} MB (limite: {limit_mb:.0f} MB)")
+
+          # ── Acima do limite — skip upload, só warm + registo ───────────────
           if total_bytes > RELEASE_LIMIT:
             print(f"  ⚠ {total_mb:.0f} MB > {limit_mb:.0f} MB — upload ignorado")
             print(f"  → conteúdo servido exclusivamente pelo cache Cloudflare")
-            # Gerar cdn_urls.json mesmo quando upload é ignorado
-            # para que o warm (step 12) e o registo (step 14) funcionem normalmente
-            cdn_base_skip = os.environ['CDN_DOMAIN'].rstrip('/')
-            job_id_skip   = os.environ['JOB_ID']
-            nonces_skip   = json.load(open(work_dir + '/nonces.json'))
-            thumbs_skip   = json.load(open(work_dir + '/thumbs_manifest.json'))
-            cdn_urls_skip = (
-              [
-                f"{cdn_base_skip}/{job_id_skip}/master.m3u8",
-                f"{cdn_base_skip}/{job_id_skip}/nonces.json",
-                f"{cdn_base_skip}/{job_id_skip}/hls/index.m3u8",
-                f"{cdn_base_skip}/{job_id_skip}/hls/init.bin",
-              ] +
-              [f"{cdn_base_skip}/{job_id_skip}/hls/{bn}" for bn in nonces_skip['nonces'] if bn != 'init.bin'] +
-              [f"{cdn_base_skip}/{job_id_skip}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs_skip))]
-            )
-            json.dump(cdn_urls_skip, open(work_dir + '/cdn_urls.json', 'w'))
-            print(f"  ✓ cdn_urls.json gerado ({len(cdn_urls_skip)} URLs) — warm e registo continuam normalmente")
+            cdn_urls = build_cdn_urls()
+            json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
+            print(f"  ✓ cdn_urls.json gerado ({len(cdn_urls)} URLs)")
             with open(github_env, 'a') as f:
               f.write("UPLOAD_SKIP=true\n")
             sys.exit(0)
+
+          # ── Criar Release ──────────────────────────────────────────────────
           try:
             meta = json.loads(os.environ.get('METADATA', '{}'))
           except Exception:
             meta = {}
           title = meta.get('title', 'Untitled')
+
           r = subprocess.run([
             'curl', '-sf', '-X', 'POST',
             '-H', f'Authorization: Bearer {storage_token}',
@@ -977,19 +1099,24 @@ jobs:
               'prerelease': False,
             }),
           ], capture_output=True, text=True)
+
           if r.returncode != 0:
             print(f"  ✗ Falha ao criar Release: {r.stderr.strip()}")
+            cdn_urls = build_cdn_urls()
+            json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
             with open(github_env, 'a') as f:
               f.write("UPLOAD_SKIP=true\n")
             sys.exit(0)
+
           upload_url = json.loads(r.stdout)['upload_url'].split('{')[0]
           print(f"  ✓ Release criada: tag={job_id}")
+
+          # ── Upload assets ──────────────────────────────────────────────────
           ok = 0
           for file_path, asset_name, mime in assets:
             size_kb = os.path.getsize(file_path) // 1024
             r = subprocess.run([
-              'curl', '-sf',
-              '-o', '/dev/null', '-w', '%{http_code}',
+              'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
               '-X', 'POST',
               '-H', f'Authorization: Bearer {storage_token}',
               '-H', f'Content-Type: {mime}',
@@ -1003,14 +1130,18 @@ jobs:
               ok += 1
             else:
               print(f"  ✗ {asset_name} HTTP {code} — abortando upload")
+              cdn_urls = build_cdn_urls()
+              json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
               with open(github_env, 'a') as f:
                 f.write("UPLOAD_SKIP=true\n")
               sys.exit(0)
+
           print(f"  ✅ {ok}/{len(assets)} assets enviados")
+          cdn_urls = build_cdn_urls()
+          json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
           with open(github_env, 'a') as f:
             f.write("UPLOAD_SKIP=false\n")
           PYEOF
-
       # ── 11. Verificar tunnel e reiniciar se necessário ─────────────────────
       - name: Verificar e restaurar tunnel
         run: |
@@ -1021,7 +1152,7 @@ jobs:
             echo "⚠ Tunnel morto — a reiniciar..."
             cloudflared tunnel --no-autoupdate \
               --config ~/.cloudflared/config.yml \
-              run --token "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" &
+              run --token "$TUNNEL_TOKEN" &
             NEW_PID=$!
             echo "TUNNEL_PID=$NEW_PID" >> $GITHUB_ENV
             echo "  Novo PID: $NEW_PID"
@@ -1171,13 +1302,67 @@ jobs:
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json','w'))
           PYEOF
 
-      # ── 13. Desligar tunnel ────────────────────────────────────────────────
-      - name: Desligar Cloudflare Tunnel
+      # ── 13. Desligar tunnel e destruir via API ─────────────────────────────
+      # Destrói APENAS o tunnel deste job — outros jobs paralelos não são afectados.
+      - name: Desligar e destruir tunnel do job
         if: always()
         run: |
           [ -n "$TUNNEL_PID" ]      && kill "$TUNNEL_PID"      2>/dev/null || true
           [ -n "$HTTP_SERVER_PID" ] && kill "$HTTP_SERVER_PID" 2>/dev/null || true
-          echo "✓ Tunnel e servidor HTTP desligados"
+          echo "✓ Processo cloudflared e servidor HTTP terminados"
+
+          python3 << 'PYEOF'
+          import os, json, urllib.request, urllib.error, time
+
+          account_id = os.environ.get('CF_ACCOUNT_ID', '')
+          api_token  = os.environ.get('CF_API_TOKEN', '')
+          tunnel_id  = os.environ.get('TUNNEL_ID', '')
+
+          if not tunnel_id and os.path.exists('/tmp/sv_tunnel_id'):
+            with open('/tmp/sv_tunnel_id') as f:
+              tunnel_id = f.read().strip()
+
+          if not tunnel_id:
+            print("⚠ TUNNEL_ID não encontrado — tunnel pode ter ficado activo no Cloudflare")
+            exit(0)
+
+          if not account_id or not api_token:
+            print("⚠ CF_ACCOUNT_ID ou CF_API_TOKEN em falta — não foi possível destruir tunnel")
+            exit(0)
+
+          headers = {
+            'Authorization': f'Bearer {api_token}',
+            'Content-Type':  'application/json',
+          }
+
+          time.sleep(5)
+
+          # Limpar conexões pendentes
+          cleanup_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}/connections"
+          req = urllib.request.Request(cleanup_url, headers=headers, method='DELETE')
+          try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+              print(f"✓ Conexões limpas (HTTP {r.status})")
+          except Exception as e:
+            print(f"  Aviso cleanup conexões: {e}")
+
+          time.sleep(2)
+
+          # Destruir tunnel
+          delete_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}"
+          req = urllib.request.Request(delete_url, headers=headers, method='DELETE')
+          try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+              resp = json.loads(r.read().decode())
+              if resp.get('success'):
+                print(f"✅ Tunnel {tunnel_id} destruído com sucesso")
+              else:
+                print(f"⚠ Resposta inesperada: {resp}")
+          except urllib.error.HTTPError as e:
+            print(f"⚠ Falha HTTP {e.code}: {e.read().decode()[:200]}")
+          except Exception as e:
+            print(f"⚠ Erro: {e}")
+          PYEOF
 
       # ── 14. Registar no EdgeOne ────────────────────────────────────────────
       - name: Registar no EdgeOne (Turso + KV)
@@ -1342,4 +1527,7 @@ jobs:
       # ── 15. Cleanup ────────────────────────────────────────────────────────
       - name: Cleanup
         if: always()
-        run: rm -rf "$WORK_DIR" && echo "✓ Workspace limpo"
+        run: |
+          rm -rf "$WORK_DIR"
+          rm -f /tmp/sv_tunnel_id
+          echo "✓ Workspace limpo"
