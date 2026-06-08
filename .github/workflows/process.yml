@@ -171,15 +171,41 @@ jobs:
           tunnel_token = resp_token['result']
           print(f"✓ Token obtido")
 
+          # ── Actualizar DNS record cdn.pixgo.qzz.io → tunnel efémero ──────
+          zone_id  = os.environ['CF_ZONE_ID']
+          cdn_host = os.environ['CDN_DOMAIN'].replace('https://', '').replace('http://', '').rstrip('/')
+          resp_dns, _ = cf_request('GET', f'/zones/{zone_id}/dns_records?type=CNAME&name={cdn_host}')
+          if not resp_dns.get('success') or not resp_dns.get('result'):
+            print(f"✗ Falha ao obter DNS record: {resp_dns}")
+            sys.exit(1)
+
+          dns_record    = resp_dns['result'][0]
+          dns_record_id = dns_record['id']
+          old_content   = dns_record['content']
+          print(f"✓ DNS record actual: {old_content}")
+
+          new_content = f"{tunnel_id}.cfargotunnel.com"
+          resp_patch, _ = cf_request('PATCH', f'/zones/{zone_id}/dns_records/{dns_record_id}', {
+            'content': new_content,
+          })
+          if not resp_patch.get('success'):
+            print(f"✗ Falha ao actualizar DNS: {resp_patch}")
+            sys.exit(1)
+          print(f"✓ DNS actualizado: {cdn_host} -> {new_content}")
+
           with open(os.environ['GITHUB_ENV'], 'a') as f:
             f.write(f"TUNNEL_ID={tunnel_id}\n")
             f.write(f"TUNNEL_TOKEN={tunnel_token}\n")
+            f.write(f"DNS_RECORD_ID={dns_record_id}\n")
+            f.write(f"DNS_OLD_CONTENT={old_content}\n")
 
           # Ficheiro de fallback para o cleanup (if: always())
           with open('/tmp/sv_tunnel_id', 'w') as f:
             f.write(tunnel_id)
+          with open('/tmp/sv_dns_restore', 'w') as f:
+            f.write(f"{dns_record_id}\n{old_content}\n")
 
-          print(f"✓ TUNNEL_ID e TUNNEL_TOKEN em GITHUB_ENV — disponíveis no step 0b")
+          print(f"✓ TUNNEL_ID, TUNNEL_TOKEN, DNS_RECORD_ID em GITHUB_ENV — disponíveis no step 0b")
           PYEOF
 
       # ── 0b. Arrancar cloudflared ───────────────────────────────────────────
@@ -265,9 +291,6 @@ jobs:
             )
           }}
         env:
-          GH_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO:         ${{ github.repository }}
-          GH_REF:          ${{ github.ref_name }}
           INPUT_METADATA:  ${{ inputs.metadata }}
           INPUT_VIDEO_URL: ${{ inputs.video_url }}
           INPUT_THUMBNAIL: ${{ inputs.thumbnail_url }}
@@ -282,11 +305,7 @@ jobs:
 
           url          = os.environ['INPUT_VIDEO_URL']
           metadata_raw = os.environ['INPUT_METADATA']
-          gh_token     = os.environ['GH_TOKEN']
-          gh_repo      = os.environ['GH_REPO']
-          gh_ref       = os.environ['GH_REF']
           season_num   = int(os.environ.get('INPUT_SEASON', '0') or '0')
-          WORKFLOW_FILE = 'StreamVault.yml'
           VIDEO_EXTS    = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
           BATCH_LIMIT   = 1_400 * 1024 * 1024
 
@@ -408,6 +427,15 @@ jobs:
           safe_cid  = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
           dispatched = 0
 
+          # ── Dispatcher FIFO — envia para a fila em vez de disparar directamente ──
+          # O dispatcher gere MAX_CONCURRENT e chama processNext() automaticamente.
+          # Cada batch entra na fila; o tunnel do job anterior fecha antes do próximo arrancar.
+          dispatcher_base = os.environ.get('PIPELINE_API','').rstrip('/')
+          # PIPELINE_API pode ser https://host/api/pipeline — extrair base
+          import re as _re
+          dispatcher_base = _re.sub(r'/api/.*$', '', dispatcher_base).rstrip('/')
+          admin_key = os.environ.get('ADMIN_API_KEY','')
+
           for bi, batch in enumerate(batches):
             indices_str = ','.join(str(v['index']) for v in batch)
             ep_numbers  = ','.join(str(v['ep_num']) for v in batch)
@@ -416,47 +444,46 @@ jobs:
             child_meta  = {**metadata, 'contentId': content_id or safe_cid}
 
             payload = json.dumps({
-              'ref': gh_ref,
-              'inputs': {
-                'job_id':            child_id,
-                'video_url':         url,
-                'thumbnail_url':     os.environ.get('INPUT_THUMBNAIL',''),
-                'seg_duration':      os.environ.get('INPUT_SEG','4'),
-                'max_encode_height': os.environ.get('INPUT_HEIGHT','720'),
-                'warm_concurrency':  os.environ.get('INPUT_WARM','8'),
-                'metadata':          json.dumps(child_meta),
-                'season_number':     str(season_num),
-                'episode_number':    ep_numbers,
-                'episode_title':     '',
-                'file_indices':      indices_str,
-              }
+              'job_id':            child_id,
+              'video_url':         url,
+              'thumbnail_url':     os.environ.get('INPUT_THUMBNAIL',''),
+              'seg_duration':      os.environ.get('INPUT_SEG','4'),
+              'max_encode_height': os.environ.get('INPUT_HEIGHT','720'),
+              'warm_concurrency':  os.environ.get('INPUT_WARM','8'),
+              'metadata':          child_meta,
+              'season_number':     str(season_num),
+              'episode_number':    ep_numbers,
+              'episode_title':     '',
+              'file_indices':      indices_str,
             }).encode()
 
             req = urllib.request.Request(
-              f"https://api.github.com/repos/{gh_repo}/actions/workflows/{WORKFLOW_FILE}/dispatches",
+              f"{dispatcher_base}/dispatch",
               data=payload,
               headers={
-                'Authorization':        f'Bearer {gh_token}',
-                'Accept':               'application/vnd.github+json',
-                'X-GitHub-Api-Version': '2022-11-28',
-                'Content-Type':         'application/json',
-                'User-Agent':           'StreamVault-Coordinator/1.0',
+                'Content-Type': 'application/json',
+                'x-api-key':    admin_key,
+                'User-Agent':   'StreamVault-Coordinator/3.0',
               },
               method='POST'
             )
             try:
               with urllib.request.urlopen(req, timeout=30) as r:
-                print(f"  ✓ Batch {bi+1} → {child_id} (HTTP {r.status})")
+                resp = json.loads(r.read().decode())
+                pos  = resp.get('queue_position', 0)
+                st   = resp.get('status', '?')
+                print(f"  ✓ Batch {bi+1} → {child_id} ({st} pos={pos+1})")
                 dispatched += 1
             except urllib.error.HTTPError as e:
               print(f"  ✗ Batch {bi+1} HTTP {e.code}: {e.read().decode()[:200]}")
             except Exception as e:
               print(f"  ✗ Batch {bi+1} erro: {e}")
 
+            # Pequena pausa para não sobrecarregar o dispatcher
             if bi < len(batches) - 1:
-              time.sleep(2)
+              time.sleep(1)
 
-          print(f"\n✅ Coordinator: {dispatched}/{len(batches)} jobs despachados")
+          print(f"\n✅ Coordinator: {dispatched}/{len(batches)} jobs em fila FIFO")
           sys.exit(0)
           PYEOF
 
@@ -1231,6 +1258,39 @@ jobs:
               print(f"✗ Cache não aqueceu — 0 HITs na 2ª passagem")
           PYEOF
 
+      # ── 12b. Notificar dispatcher (webhook FIFO) ────────────────────────────
+      # Corre SEMPRE (success ou failure) — liberta slot na fila FIFO
+      # ANTES de destruir o tunnel no step 13.
+      # SEM este step, o slot ficaria preso até reinício do servidor.
+      - name: Notificar dispatcher (webhook FIFO)
+        if: always()
+        env:
+          DISPATCHER_URL: ${{ secrets.PIPELINE_API }}
+          ADMIN_API_KEY:  ${{ secrets.ADMIN_API_KEY }}
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            WEBHOOK_STATUS="done"
+          else
+            WEBHOOK_STATUS="failed"
+          fi
+          # PIPELINE_API pode ser https://host/api/pipeline — extrair base
+          DISPATCHER_BASE=$(echo "$DISPATCHER_URL" | sed 's|/api/.*||; s|/$||')
+          WEBHOOK_URL="${DISPATCHER_BASE}/webhook"
+          echo "→ POST ${WEBHOOK_URL} job_id=${JOB_ID} status=${WEBHOOK_STATUS}"
+          HTTP_CODE=$(curl -s -o /tmp/webhook_resp.txt -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ADMIN_API_KEY}" \
+            --max-time 15 \
+            "${WEBHOOK_URL}" \
+            -d "{\"job_id\":\"${JOB_ID}\",\"status\":\"${WEBHOOK_STATUS}\"}")
+          echo "  HTTP ${HTTP_CODE}: $(cat /tmp/webhook_resp.txt)"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✓ Dispatcher notificado — slot libertado"
+          else
+            echo "⚠ Webhook falhou (HTTP ${HTTP_CODE}) — slot pode ficar preso até restart"
+          fi
+
       # ── 13. Desligar e destruir tunnel do job ─────────────────────────────
       # Destrói APENAS o tunnel UUID deste job.
       # Outros jobs paralelos têm UUIDs diferentes — não são afectados.
@@ -1266,34 +1326,57 @@ jobs:
             'Content-Type':  'application/json',
           }
 
+          def cf_req(method, path, body=None):
+            url  = f"https://api.cloudflare.com/client/v4{path}"
+            data = json.dumps(body).encode() if body else None
+            req  = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+              with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read().decode()), r.status
+            except urllib.error.HTTPError as e:
+              return json.loads(e.read().decode()), e.code
+
           # Aguardar processo local fechar conexões
           time.sleep(5)
 
-          # Limpar conexões pendentes
-          cleanup_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}/connections"
-          req = urllib.request.Request(cleanup_url, headers=headers, method='DELETE')
-          try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-              print(f"✓ Conexões limpas (HTTP {r.status})")
-          except Exception as e:
-            print(f"  Aviso cleanup conexões: {e}")
+          # ── Restaurar DNS record para o tunnel permanente ──────────────────
+          zone_id        = os.environ.get('CF_ZONE_ID', '')
+          dns_record_id  = os.environ.get('DNS_RECORD_ID', '')
+          old_content    = os.environ.get('DNS_OLD_CONTENT', '')
+
+          # Fallback: ler de ficheiro
+          if (not dns_record_id or not old_content) and os.path.exists('/tmp/sv_dns_restore'):
+            with open('/tmp/sv_dns_restore') as f:
+              lines = f.read().strip().splitlines()
+              if len(lines) >= 2:
+                dns_record_id = dns_record_id or lines[0]
+                old_content   = old_content   or lines[1]
+
+          if zone_id and dns_record_id and old_content:
+            resp_patch, _ = cf_req('PATCH', f'/zones/{zone_id}/dns_records/{dns_record_id}', {
+              'content': old_content,
+            })
+            if resp_patch.get('success'):
+              print(f"✓ DNS restaurado: {old_content}")
+            else:
+              print(f"⚠ Falha ao restaurar DNS: {resp_patch}")
+          else:
+            print("⚠ DNS_RECORD_ID ou DNS_OLD_CONTENT em falta — DNS não restaurado")
 
           time.sleep(2)
 
-          # Destruir tunnel
-          delete_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}"
-          req = urllib.request.Request(delete_url, headers=headers, method='DELETE')
-          try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-              resp = json.loads(r.read().decode())
-              if resp.get('success'):
-                print(f"✅ Tunnel {tunnel_id} destruído")
-              else:
-                print(f"⚠ Resposta inesperada: {resp}")
-          except urllib.error.HTTPError as e:
-            print(f"⚠ Falha HTTP {e.code}: {e.read().decode()[:200]}")
-          except Exception as e:
-            print(f"⚠ Erro: {e}")
+          # ── Limpar conexões pendentes ──────────────────────────────────────
+          cf_req('DELETE', f'/accounts/{account_id}/cfd_tunnel/{tunnel_id}/connections')
+          print(f"✓ Conexões limpas")
+
+          time.sleep(2)
+
+          # ── Destruir tunnel efémero ────────────────────────────────────────
+          resp_del, _ = cf_req('DELETE', f'/accounts/{account_id}/cfd_tunnel/{tunnel_id}')
+          if resp_del.get('success'):
+            print(f"✅ Tunnel {tunnel_id} destruído")
+          else:
+            print(f"⚠ Resposta inesperada: {resp_del}")
           PYEOF
 
       # ── 14. Registar no EdgeOne ────────────────────────────────────────────
