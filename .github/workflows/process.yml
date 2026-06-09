@@ -3,21 +3,17 @@ name: StreamVault Process
 # ── Secrets obrigatórios (Settings → Secrets → Actions) ───────────────────
 # CHACHA_KEY            — 32 bytes hex (mesmo do server.js)
 # CDN_DOMAIN            — ex: https://cdn.pixgo.qzz.io
-# PIPELINE_API          — URL da API EdgeOne
+# PIPELINE_API          — URL base do servidor unificado (ex: https://alwaysdata.onrender.com)
 # ADMIN_API_KEY         — chave X-API-Key para PIPELINE_API
 # STORAGE_GITHUB_TOKEN  — PAT da conta storage (scope: repo)
 # STORAGE_GITHUB_OWNER  — username da conta storage
 # STORAGE_GITHUB_REPO   — repo da conta storage
-# CF_ACCOUNT_ID         — Cloudflare Account ID (Dashboard → lado direito)
-# CF_ZONE_ID            — Zone ID do domínio CDN (Cloudflare Dashboard → Overview → Zone ID)
-# CF_API_TOKEN          — API Token com permissões:
-#                           Cloudflare Tunnel: Edit
-#                           Zone / Cache Purge: Edit
-#                           Zone / Zone Settings: Edit
-#                           Zone / DNS: Edit
-#                         Criar em: dash.cloudflare.com/profile/api-tokens
+# CF_ACCOUNT_ID         — Cloudflare Account ID
+# CF_ZONE_ID            — Zone ID do domínio CDN
+# CF_API_TOKEN          — API Token: Cloudflare Tunnel:Edit, Zone/Cache Purge:Edit, Zone Settings:Edit
 #
-# REMOVIDO: CLOUDFLARE_TUNNEL_TOKEN — cada job cria e destrói o seu próprio tunnel via API
+# REMOVIDO: lógica DNS — o tunnel efémero não precisa de alterar CNAME.
+# O cloudflared autentica via token; o Cloudflare resolve o ingress internamente.
 
 on:
   workflow_dispatch:
@@ -86,6 +82,7 @@ jobs:
       # ── 0a. Preparar dirs + servidor HTTP + criar tunnel via API ───────────
       # Cria tunnel com UUID único por job via API Cloudflare.
       # TUNNEL_ID e TUNNEL_TOKEN escritos em GITHUB_ENV — disponíveis no step 0b.
+      # Sem lógica DNS — o tunnel efémero não precisa de alterar o CNAME do domínio.
       - name: Preparar ambiente
         run: |
           mkdir -p $WORK_DIR/incoming $WORK_DIR/hls $WORK_DIR/thumbs
@@ -99,7 +96,6 @@ jobs:
           chmod +x /usr/local/bin/cloudflared
 
           # ── Servidor HTTP — Cache-Control: no-store em respostas não-200 ───
-          # Impede que 404s sejam cacheados permanentemente no Cloudflare.
           printf '%s\n' \
             'import http.server, os' \
             '' \
@@ -124,7 +120,6 @@ jobs:
           echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
 
           # ── Criar tunnel isolado via API Cloudflare ────────────────────────
-          # JOB_ID_RAW passado via export — GITHUB_ENV não está disponível neste step
           export JOB_ID_RAW="${{ inputs.job_id }}"
           python3 << 'PYEOF'
           import os, json, secrets, base64, urllib.request, urllib.error, sys
@@ -171,46 +166,17 @@ jobs:
           tunnel_token = resp_token['result']
           print(f"✓ Token obtido")
 
-          # ── Actualizar DNS record cdn.pixgo.qzz.io → tunnel efémero ──────
-          zone_id  = os.environ['CF_ZONE_ID']
-          cdn_host = os.environ['CDN_DOMAIN'].replace('https://', '').replace('http://', '').rstrip('/')
-          resp_dns, _ = cf_request('GET', f'/zones/{zone_id}/dns_records?type=CNAME&name={cdn_host}')
-          if not resp_dns.get('success') or not resp_dns.get('result'):
-            print(f"✗ Falha ao obter DNS record: {resp_dns}")
-            sys.exit(1)
-
-          dns_record    = resp_dns['result'][0]
-          dns_record_id = dns_record['id']
-          old_content   = dns_record['content']
-          print(f"✓ DNS record actual: {old_content}")
-
-          new_content = f"{tunnel_id}.cfargotunnel.com"
-          resp_patch, _ = cf_request('PATCH', f'/zones/{zone_id}/dns_records/{dns_record_id}', {
-            'content': new_content,
-          })
-          if not resp_patch.get('success'):
-            print(f"✗ Falha ao actualizar DNS: {resp_patch}")
-            sys.exit(1)
-          print(f"✓ DNS actualizado: {cdn_host} -> {new_content}")
-
           with open(os.environ['GITHUB_ENV'], 'a') as f:
             f.write(f"TUNNEL_ID={tunnel_id}\n")
             f.write(f"TUNNEL_TOKEN={tunnel_token}\n")
-            f.write(f"DNS_RECORD_ID={dns_record_id}\n")
-            f.write(f"DNS_OLD_CONTENT={old_content}\n")
 
-          # Ficheiro de fallback para o cleanup (if: always())
           with open('/tmp/sv_tunnel_id', 'w') as f:
             f.write(tunnel_id)
-          with open('/tmp/sv_dns_restore', 'w') as f:
-            f.write(f"{dns_record_id}\n{old_content}\n")
 
-          print(f"✓ TUNNEL_ID, TUNNEL_TOKEN, DNS_RECORD_ID em GITHUB_ENV — disponíveis no step 0b")
+          print(f"✓ TUNNEL_ID e TUNNEL_TOKEN em GITHUB_ENV — disponíveis no step 0b")
           PYEOF
 
       # ── 0b. Arrancar cloudflared ───────────────────────────────────────────
-      # Step separado: TUNNEL_TOKEN do GITHUB_ENV do step 0a já está disponível.
-      # Não corre no coordinator — coordinator não precisa de tunnel.
       - name: Arrancar tunnel Cloudflare
         if: |
           ${{
@@ -271,9 +237,6 @@ jobs:
           python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
       # ── 2b. Coordinator ────────────────────────────────────────────────────
-      # Corre APENAS quando: URL torrent/magnet + type série/anime/dorama + file_indices vazio.
-      # Extrai metadados do torrent, divide em batches e dispara jobs filhos.
-      # Termina com sys.exit(0) — steps seguintes não correm.
       - name: '[Coordinator] Detectar episódios e disparar jobs filhos'
         if: |
           ${{
@@ -306,8 +269,8 @@ jobs:
           url          = os.environ['INPUT_VIDEO_URL']
           metadata_raw = os.environ['INPUT_METADATA']
           season_num   = int(os.environ.get('INPUT_SEASON', '0') or '0')
-          VIDEO_EXTS    = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
-          BATCH_LIMIT   = 1_400 * 1024 * 1024
+          VIDEO_EXTS   = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
+          BATCH_LIMIT  = 1_400 * 1024 * 1024
 
           try:
             metadata = json.loads(metadata_raw)
@@ -424,17 +387,12 @@ jobs:
           for i, b in enumerate(batches):
             print(f"    Batch {i+1}: eps {[v['ep_num'] for v in b]} | ~{sum(v['size'] for v in b)//(1024*1024)}MB raw")
 
-          safe_cid  = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
+          safe_cid   = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
           dispatched = 0
 
-          # ── Dispatcher FIFO — envia para a fila em vez de disparar directamente ──
-          # O dispatcher gere MAX_CONCURRENT e chama processNext() automaticamente.
-          # Cada batch entra na fila; o tunnel do job anterior fecha antes do próximo arrancar.
-          dispatcher_base = os.environ.get('PIPELINE_API','').rstrip('/')
-          # PIPELINE_API pode ser https://host/api/pipeline — extrair base
-          import re as _re
-          dispatcher_base = _re.sub(r'/api/.*$', '', dispatcher_base).rstrip('/')
-          admin_key = os.environ.get('ADMIN_API_KEY','')
+          # Enviar para o dispatcher FIFO via /dispatch
+          dispatcher_base = re.sub(r'/api/.*$', '', os.environ.get('PIPELINE_API','').rstrip('/'))
+          admin_key       = os.environ.get('ADMIN_API_KEY', '')
 
           for bi, batch in enumerate(batches):
             indices_str = ','.join(str(v['index']) for v in batch)
@@ -472,14 +430,13 @@ jobs:
                 resp = json.loads(r.read().decode())
                 pos  = resp.get('queue_position', 0)
                 st   = resp.get('status', '?')
-                print(f"  ✓ Batch {bi+1} → {child_id} ({st} pos={pos+1})")
+                print(f"  ✓ Batch {bi+1} → {child_id} ({st} fila #{pos+1})")
                 dispatched += 1
             except urllib.error.HTTPError as e:
               print(f"  ✗ Batch {bi+1} HTTP {e.code}: {e.read().decode()[:200]}")
             except Exception as e:
               print(f"  ✗ Batch {bi+1} erro: {e}")
 
-            # Pequena pausa para não sobrecarregar o dispatcher
             if bi < len(batches) - 1:
               time.sleep(1)
 
@@ -977,7 +934,6 @@ jobs:
           PYEOF
 
       # ── 10. Criar Release e upload assets ─────────────────────────────────
-      # cdn_urls.json é sempre gerado aqui — lido pelos steps 12 e 14.
       - name: Criar Release e upload assets
         id: upload_assets
         continue-on-error: true
@@ -999,7 +955,6 @@ jobs:
           cdn_base      = os.environ['CDN_DOMAIN'].rstrip('/')
           RELEASE_LIMIT = 1_500 * 1024 * 1024
 
-          # ── Função auxiliar — constrói lista de URLs CDN ───────────────────
           def build_cdn_urls():
             nonces = json.load(open(work_dir + '/nonces.json'))
             thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
@@ -1014,7 +969,6 @@ jobs:
               [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
             )
 
-          # ── Lista de assets a enviar ───────────────────────────────────────
           assets = []
           for fpath, mime in [
             (os.path.join(work_dir, 'master.m3u8'),       'application/vnd.apple.mpegurl'),
@@ -1038,18 +992,14 @@ jobs:
           limit_mb    = RELEASE_LIMIT / (1024 * 1024)
           print(f"  Total assets: {len(assets)} ficheiros | {total_mb:.1f} MB (limite: {limit_mb:.0f} MB)")
 
-          # ── Acima do limite — skip upload, só warm + registo ───────────────
           if total_bytes > RELEASE_LIMIT:
             print(f"  ⚠ {total_mb:.0f} MB > {limit_mb:.0f} MB — upload ignorado")
-            print(f"  → conteúdo servido exclusivamente pelo cache Cloudflare")
             cdn_urls = build_cdn_urls()
             json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
-            print(f"  ✓ cdn_urls.json gerado ({len(cdn_urls)} URLs)")
             with open(github_env, 'a') as f:
               f.write("UPLOAD_SKIP=true\n")
             sys.exit(0)
 
-          # ── Criar Release ──────────────────────────────────────────────────
           try:
             meta = json.loads(os.environ.get('METADATA', '{}'))
           except Exception:
@@ -1082,7 +1032,6 @@ jobs:
           upload_url = json.loads(r.stdout)['upload_url'].split('{')[0]
           print(f"  ✓ Release criada: tag={job_id}")
 
-          # ── Upload assets ──────────────────────────────────────────────────
           ok = 0
           for file_path, asset_name, mime in assets:
             size_kb = os.path.getsize(file_path) // 1024
@@ -1206,8 +1155,6 @@ jobs:
 
           work_dir = os.environ['WORK_DIR']
           warm_c   = int(os.environ['WARM_C'])
-
-          # cdn_urls.json gerado no step 10 em todos os casos
           cdn_urls = json.load(open(work_dir + '/cdn_urls.json'))
 
           def fetch_url(url):
@@ -1258,42 +1205,7 @@ jobs:
               print(f"✗ Cache não aqueceu — 0 HITs na 2ª passagem")
           PYEOF
 
-      # ── 12b. Notificar dispatcher (webhook FIFO) ────────────────────────────
-      # Corre SEMPRE (success ou failure) — liberta slot na fila FIFO
-      # ANTES de destruir o tunnel no step 13.
-      # SEM este step, o slot ficaria preso até reinício do servidor.
-      - name: Notificar dispatcher (webhook FIFO)
-        if: always()
-        env:
-          DISPATCHER_URL: ${{ secrets.PIPELINE_API }}
-          ADMIN_API_KEY:  ${{ secrets.ADMIN_API_KEY }}
-        run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            WEBHOOK_STATUS="done"
-          else
-            WEBHOOK_STATUS="failed"
-          fi
-          # PIPELINE_API pode ser https://host/api/pipeline — extrair base
-          DISPATCHER_BASE=$(echo "$DISPATCHER_URL" | sed 's|/api/.*||; s|/$||')
-          WEBHOOK_URL="${DISPATCHER_BASE}/webhook"
-          echo "→ POST ${WEBHOOK_URL} job_id=${JOB_ID} status=${WEBHOOK_STATUS}"
-          HTTP_CODE=$(curl -s -o /tmp/webhook_resp.txt -w "%{http_code}" \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: ${ADMIN_API_KEY}" \
-            --max-time 15 \
-            "${WEBHOOK_URL}" \
-            -d "{\"job_id\":\"${JOB_ID}\",\"status\":\"${WEBHOOK_STATUS}\"}")
-          echo "  HTTP ${HTTP_CODE}: $(cat /tmp/webhook_resp.txt)"
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "✓ Dispatcher notificado — slot libertado"
-          else
-            echo "⚠ Webhook falhou (HTTP ${HTTP_CODE}) — slot pode ficar preso até restart"
-          fi
-
       # ── 13. Desligar e destruir tunnel do job ─────────────────────────────
-      # Destrói APENAS o tunnel UUID deste job.
-      # Outros jobs paralelos têm UUIDs diferentes — não são afectados.
       - name: Desligar e destruir tunnel do job
         if: always()
         run: |
@@ -1308,7 +1220,6 @@ jobs:
           api_token  = os.environ.get('CF_API_TOKEN', '')
           tunnel_id  = os.environ.get('TUNNEL_ID', '')
 
-          # Fallback: ler de ficheiro caso a var não tenha propagado no if:always()
           if not tunnel_id and os.path.exists('/tmp/sv_tunnel_id'):
             with open('/tmp/sv_tunnel_id') as f:
               tunnel_id = f.read().strip()
@@ -1326,57 +1237,31 @@ jobs:
             'Content-Type':  'application/json',
           }
 
-          def cf_req(method, path, body=None):
-            url  = f"https://api.cloudflare.com/client/v4{path}"
-            data = json.dumps(body).encode() if body else None
-            req  = urllib.request.Request(url, data=data, headers=headers, method=method)
-            try:
-              with urllib.request.urlopen(req, timeout=15) as r:
-                return json.loads(r.read().decode()), r.status
-            except urllib.error.HTTPError as e:
-              return json.loads(e.read().decode()), e.code
-
-          # Aguardar processo local fechar conexões
           time.sleep(5)
 
-          # ── Restaurar DNS record para o tunnel permanente ──────────────────
-          zone_id        = os.environ.get('CF_ZONE_ID', '')
-          dns_record_id  = os.environ.get('DNS_RECORD_ID', '')
-          old_content    = os.environ.get('DNS_OLD_CONTENT', '')
-
-          # Fallback: ler de ficheiro
-          if (not dns_record_id or not old_content) and os.path.exists('/tmp/sv_dns_restore'):
-            with open('/tmp/sv_dns_restore') as f:
-              lines = f.read().strip().splitlines()
-              if len(lines) >= 2:
-                dns_record_id = dns_record_id or lines[0]
-                old_content   = old_content   or lines[1]
-
-          if zone_id and dns_record_id and old_content:
-            resp_patch, _ = cf_req('PATCH', f'/zones/{zone_id}/dns_records/{dns_record_id}', {
-              'content': old_content,
-            })
-            if resp_patch.get('success'):
-              print(f"✓ DNS restaurado: {old_content}")
-            else:
-              print(f"⚠ Falha ao restaurar DNS: {resp_patch}")
-          else:
-            print("⚠ DNS_RECORD_ID ou DNS_OLD_CONTENT em falta — DNS não restaurado")
+          cleanup_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}/connections"
+          req = urllib.request.Request(cleanup_url, headers=headers, method='DELETE')
+          try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+              print(f"✓ Conexões limpas (HTTP {r.status})")
+          except Exception as e:
+            print(f"  Aviso cleanup conexões: {e}")
 
           time.sleep(2)
 
-          # ── Limpar conexões pendentes ──────────────────────────────────────
-          cf_req('DELETE', f'/accounts/{account_id}/cfd_tunnel/{tunnel_id}/connections')
-          print(f"✓ Conexões limpas")
-
-          time.sleep(2)
-
-          # ── Destruir tunnel efémero ────────────────────────────────────────
-          resp_del, _ = cf_req('DELETE', f'/accounts/{account_id}/cfd_tunnel/{tunnel_id}')
-          if resp_del.get('success'):
-            print(f"✅ Tunnel {tunnel_id} destruído")
-          else:
-            print(f"⚠ Resposta inesperada: {resp_del}")
+          delete_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}"
+          req = urllib.request.Request(delete_url, headers=headers, method='DELETE')
+          try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+              resp = json.loads(r.read().decode())
+              if resp.get('success'):
+                print(f"✅ Tunnel {tunnel_id} destruído")
+              else:
+                print(f"⚠ Resposta inesperada: {resp}")
+          except urllib.error.HTTPError as e:
+            print(f"⚠ Falha HTTP {e.code}: {e.read().decode()[:200]}")
+          except Exception as e:
+            print(f"⚠ Erro: {e}")
           PYEOF
 
       # ── 14. Registar no EdgeOne ────────────────────────────────────────────
@@ -1477,7 +1362,6 @@ jobs:
             else:
               print(f"✗ Registo falhou após {MAX_ATTEMPTS} tentativas")
 
-          # ── Registo season/episode (só séries) ────────────────────────────
           content_type  = metadata.get('type', 'movie')
           season_num    = int(os.environ.get('SEASON_NUMBER', '0') or '0')
           episode_nums  = os.environ.get('EPISODE_NUMBER', '').strip()
@@ -1533,10 +1417,53 @@ jobs:
             print(f"  ✅ Season + {len(episode_list)} episódio(s) registados")
           PYEOF
 
+      # ── 14b. Notificar dispatcher (webhook FIFO) ───────────────────────────
+      # if: always() — corre sempre, mesmo que steps anteriores tenham falhado.
+      # Liberta o slot na fila FIFO para o próximo job ser despachado.
+      # Posição: depois do registo (step 14) — slot só libertado quando tudo terminou.
+      - name: Notificar dispatcher (webhook FIFO)
+        if: always()
+        run: |
+          if [ -z "$PIPELINE_API" ]; then
+            echo "⚠ PIPELINE_API não configurado — webhook ignorado"
+            exit 0
+          fi
+
+          if [ "${{ job.status }}" = "success" ]; then
+            WEBHOOK_STATUS="done"
+          else
+            WEBHOOK_STATUS="failed"
+          fi
+
+          # PIPELINE_API pode ser https://host/api/pipeline — extrair base
+          WEBHOOK_URL="$(echo "$PIPELINE_API" | sed 's|/api/.*||; s|/$||')/webhook"
+
+          echo "→ POST ${WEBHOOK_URL} job_id=${JOB_ID} status=${WEBHOOK_STATUS}"
+
+          HTTP_CODE=$(curl -s -o /tmp/wh_resp.txt -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ADMIN_API_KEY}" \
+            --max-time 20 \
+            --retry 3 \
+            --retry-delay 5 \
+            "${WEBHOOK_URL}" \
+            -d "{\"job_id\":\"${JOB_ID}\",\"status\":\"${WEBHOOK_STATUS}\"}")
+
+          echo "  HTTP ${HTTP_CODE}: $(cat /tmp/wh_resp.txt)"
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✓ Slot libertado — próximo job na fila será despachado"
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "ℹ Job não encontrado no dispatcher (cancelado ou expirado) — ok"
+          else
+            echo "⚠ Webhook falhou (HTTP ${HTTP_CODE}) — slot pode ficar preso até restart do Render"
+          fi
+
       # ── 15. Cleanup ────────────────────────────────────────────────────────
       - name: Cleanup
         if: always()
         run: |
           rm -rf "$WORK_DIR"
-          rm -f /tmp/sv_tunnel_id
+          rm -f /tmp/sv_tunnel_id /tmp/wh_resp.txt
           echo "✓ Workspace limpo"
