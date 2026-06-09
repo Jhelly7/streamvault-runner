@@ -80,9 +80,6 @@ jobs:
     steps:
 
       # ── 0a. Preparar dirs + servidor HTTP + criar tunnel via API ───────────
-      # Cria tunnel com UUID único por job via API Cloudflare.
-      # TUNNEL_ID e TUNNEL_TOKEN escritos em GITHUB_ENV — disponíveis no step 0b.
-      # Sem lógica DNS — o tunnel efémero não precisa de alterar o CNAME do domínio.
       - name: Preparar ambiente
         run: |
           mkdir -p $WORK_DIR/incoming $WORK_DIR/hls $WORK_DIR/thumbs
@@ -1063,7 +1060,7 @@ jobs:
             f.write("UPLOAD_SKIP=false\n")
           PYEOF
 
-      # ── 11. Verificar tunnel e reiniciar se necessário ─────────────────────
+      # ── 11. Verificar tunnel + purge cache + aguardar resposta ─────────────
       - name: Verificar e restaurar tunnel
         run: |
           echo "=== Estado do processo cloudflared ==="
@@ -1087,6 +1084,28 @@ jobs:
             echo "⚠ Servidor HTTP morto — a reiniciar..."
             python3 /tmp/http_server.py &
             echo "HTTP_SERVER_PID=$!" >> $GITHUB_ENV
+          fi
+
+          echo ""
+          echo "=== Purge de 404s cacheados deste job no Cloudflare ==="
+          # 404s de runs anteriores com o mesmo job_id ficam cacheados com
+          # max-age=31536000. Forçar purge antes do warm para garantir MISS limpo.
+          if [ -n "$CF_ZONE_ID" ] && [ -n "$CF_API_TOKEN" ]; then
+            PURGE_RESP=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"prefixes\":[\"${CDN_DOMAIN#https://}/${JOB_ID}/\"]}")
+            PURGE_OK=$(echo "$PURGE_RESP" | python3 -c \
+              "import sys,json; print(json.load(sys.stdin).get('success','false'))" 2>/dev/null || echo "false")
+            if [ "$PURGE_OK" = "True" ] || [ "$PURGE_OK" = "true" ]; then
+              echo "✓ Purge por prefixo enviado: ${CDN_DOMAIN#https://}/${JOB_ID}/"
+            else
+              echo "⚠ Purge falhou (pode não ter plano Enterprise — fallback ignorado)"
+              echo "  Resposta: $PURGE_RESP"
+            fi
+          else
+            echo "⚠ CF_ZONE_ID/CF_API_TOKEN não configurados — purge ignorado"
           fi
 
           echo ""
@@ -1420,7 +1439,6 @@ jobs:
       # ── 14b. Notificar dispatcher (webhook FIFO) ───────────────────────────
       # if: always() — corre sempre, mesmo que steps anteriores tenham falhado.
       # Liberta o slot na fila FIFO para o próximo job ser despachado.
-      # Posição: depois do registo (step 14) — slot só libertado quando tudo terminou.
       - name: Notificar dispatcher (webhook FIFO)
         if: always()
         run: |
@@ -1435,7 +1453,6 @@ jobs:
             WEBHOOK_STATUS="failed"
           fi
 
-          # PIPELINE_API pode ser https://host/api/pipeline — extrair base
           WEBHOOK_URL="$(echo "$PIPELINE_API" | sed 's|/api/.*||; s|/$||')/webhook"
 
           echo "→ POST ${WEBHOOK_URL} job_id=${JOB_ID} status=${WEBHOOK_STATUS}"
@@ -1455,9 +1472,9 @@ jobs:
           if [ "$HTTP_CODE" = "200" ]; then
             echo "✓ Slot libertado — próximo job na fila será despachado"
           elif [ "$HTTP_CODE" = "404" ]; then
-            echo "ℹ Job não encontrado no dispatcher (cancelado ou expirado) — ok"
+            echo "ℹ Job não encontrado no dispatcher (job manual ou expirado) — ok"
           else
-            echo "⚠ Webhook falhou (HTTP ${HTTP_CODE}) — slot pode ficar preso até restart do Render"
+            echo "⚠ Webhook falhou (HTTP ${HTTP_CODE}) — slot libertado pelo watchdog em ~360min"
           fi
 
       # ── 15. Cleanup ────────────────────────────────────────────────────────
