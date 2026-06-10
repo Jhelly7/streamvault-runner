@@ -115,6 +115,7 @@ jobs:
 
           # ── Criar tunnel isolado via API Cloudflare ────────────────────────
           export JOB_ID_RAW="${{ inputs.job_id }}"
+          export CF_CDN_HOST=$(echo "${{ secrets.CDN_DOMAIN }}" | sed 's|https\?://||')
           python3 << 'PYEOF'
           import os, json, secrets, base64, urllib.request, urllib.error, sys
 
@@ -143,7 +144,7 @@ jobs:
           resp, _ = cf_request('POST', f'/accounts/{account_id}/cfd_tunnel', {
             'name':          tunnel_name,
             'tunnel_secret': tunnel_secret,
-            'config_src':    'local',
+            'config_src':    'cloudflare',
           })
           if not resp.get('success'):
             print(f"✗ Falha ao criar tunnel: {resp}")
@@ -151,6 +152,28 @@ jobs:
 
           tunnel_id = resp['result']['id']
           print(f"✓ Tunnel criado: {tunnel_id}")
+
+          # ── Configurar ingress via API (obrigatório com config_src=cloudflare) ──
+          cdn_host = os.environ['CF_CDN_HOST']
+          resp_cfg, _ = cf_request('PUT',
+            f'/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations',
+            {
+              'config': {
+                'ingress': [
+                  {
+                    'hostname': cdn_host,
+                    'service':  'http://localhost:8080',
+                    'originRequest': {},
+                  },
+                  {'service': 'http_status:404'},
+                ],
+              },
+            }
+          )
+          if not resp_cfg.get('success'):
+            print(f"✗ Falha ao configurar ingress: {resp_cfg}")
+            sys.exit(1)
+          print(f"✓ Ingress configurado: {cdn_host} → http://localhost:8080")
 
           resp_token, _ = cf_request('GET', f'/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token')
           if not resp_token.get('success'):
@@ -190,17 +213,9 @@ jobs:
             )
           }}
         run: |
-          CDN_HOST=$(echo "${{ secrets.CDN_DOMAIN }}" | sed 's|https\?://||')
-          mkdir -p ~/.cloudflared
-          cat > ~/.cloudflared/config.yml << EOF
-          ingress:
-            - hostname: ${CDN_HOST}
-              service: http://localhost:8080
-            - service: http_status:404
-          EOF
-
+          # Tunnel remotamente gerido — ingress já configurado via API no step 0a.
+          # Não usar --config: o cloudflared vai buscar o ingress ao Cloudflare pelo token.
           cloudflared tunnel --no-autoupdate \
-            --config ~/.cloudflared/config.yml \
             run --token "$TUNNEL_TOKEN" &
           echo "TUNNEL_PID=$!" >> $GITHUB_ENV
 
@@ -1079,7 +1094,6 @@ jobs:
           else
             echo "⚠ Tunnel morto — a reiniciar com token do job..."
             cloudflared tunnel --no-autoupdate \
-              --config ~/.cloudflared/config.yml \
               run --token "$TUNNEL_TOKEN" &
             NEW_PID=$!
             echo "TUNNEL_PID=$NEW_PID" >> $GITHUB_ENV
