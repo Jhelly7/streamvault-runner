@@ -11,9 +11,6 @@ name: StreamVault Process
 # CF_ACCOUNT_ID         — Cloudflare Account ID
 # CF_ZONE_ID            — Zone ID do domínio CDN
 # CF_API_TOKEN          — API Token: Cloudflare Tunnel:Edit, Zone/Cache Purge:Edit, Zone Settings:Edit
-#
-# REMOVIDO: lógica DNS — o tunnel efémero não precisa de alterar CNAME.
-# O cloudflared autentica via token; o Cloudflare resolve o ingress internamente.
 
 on:
   workflow_dispatch:
@@ -387,7 +384,6 @@ jobs:
           safe_cid   = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
           dispatched = 0
 
-          # Enviar para o dispatcher FIFO via /dispatch
           dispatcher_base = re.sub(r'/api/.*$', '', os.environ.get('PIPELINE_API','').rstrip('/'))
           admin_key       = os.environ.get('ADMIN_API_KEY', '')
 
@@ -750,7 +746,17 @@ jobs:
             if os.path.getsize(path) < min_bytes: return False
             with open(path, 'rb') as f:
               h = f.read(12)
-            return h[:3] == b'\xff\xd8\xff' or h[:4] == b'\x89PNG'
+            return (
+              h[:3] == b'\xff\xd8\xff' or    # JPEG
+              h[:4] == b'\x89PNG' or          # PNG
+              h[:4] == b'RIFF' or             # WebP (RIFF....WEBP)
+              h[:6] in (b'GIF87a', b'GIF89a') or  # GIF
+              h[:2] == b'BM' or              # BMP
+              h[:4] in (b'II*\x00', b'MM\x00*') or  # TIFF
+              h[:4] in (b'\x00\x00\x00\x18', b'\x00\x00\x00\x1c',  # AVIF/HEIF ftyp
+                        b'\x00\x00\x00\x20') or
+              (len(h) >= 8 and h[4:8] == b'ftyp')  # generic ISOBMFF (AVIF/HEIF)
+            )
 
           def extract_frame(video, out_path, time_pct=0.07):
             t = max(1.0, duration * time_pct)
@@ -1060,8 +1066,12 @@ jobs:
             f.write("UPLOAD_SKIP=false\n")
           PYEOF
 
-      # ── 11. Verificar tunnel + purge cache + aguardar resposta ─────────────
-      - name: Verificar e restaurar tunnel
+      # ── 11. Verificar tunnel + purge cache por lista de URLs ───────────────
+      # NOTA: purge por prefixes requer plano Enterprise.
+      # purge por lista de files (máx 30 por request) funciona em todos os planos.
+      # Fazemos purge de TODAS as URLs do job antes do warm para garantir MISS
+      # limpo mesmo que existam 404s ou respostas antigas cacheadas.
+      - name: Verificar tunnel e purgar cache
         run: |
           echo "=== Estado do processo cloudflared ==="
           if ps -p "$TUNNEL_PID" > /dev/null 2>&1; then
@@ -1087,26 +1097,65 @@ jobs:
           fi
 
           echo ""
-          echo "=== Purge de 404s cacheados deste job no Cloudflare ==="
-          # 404s de runs anteriores com o mesmo job_id ficam cacheados com
-          # max-age=31536000. Forçar purge antes do warm para garantir MISS limpo.
-          if [ -n "$CF_ZONE_ID" ] && [ -n "$CF_API_TOKEN" ]; then
-            PURGE_RESP=$(curl -s -X POST \
-              "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
-              -H "Authorization: Bearer ${CF_API_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "{\"prefixes\":[\"${CDN_DOMAIN#https://}/${JOB_ID}/\"]}")
-            PURGE_OK=$(echo "$PURGE_RESP" | python3 -c \
-              "import sys,json; print(json.load(sys.stdin).get('success','false'))" 2>/dev/null || echo "false")
-            if [ "$PURGE_OK" = "True" ] || [ "$PURGE_OK" = "true" ]; then
-              echo "✓ Purge por prefixo enviado: ${CDN_DOMAIN#https://}/${JOB_ID}/"
-            else
-              echo "⚠ Purge falhou (pode não ter plano Enterprise — fallback ignorado)"
-              echo "  Resposta: $PURGE_RESP"
-            fi
-          else
-            echo "⚠ CF_ZONE_ID/CF_API_TOKEN não configurados — purge ignorado"
-          fi
+          echo "=== Purge cache por lista de URLs (funciona em todos os planos) ==="
+          python3 << 'PYEOF'
+          import os, json, urllib.request, urllib.error
+
+          zone_id   = os.environ.get('CF_ZONE_ID', '')
+          api_token = os.environ.get('CF_API_TOKEN', '')
+          work_dir  = os.environ['WORK_DIR']
+
+          if not zone_id or not api_token:
+            print("⚠ CF_ZONE_ID/CF_API_TOKEN não configurados — purge ignorado")
+            exit(0)
+
+          cdn_urls_path = work_dir + '/cdn_urls.json'
+          if not os.path.exists(cdn_urls_path):
+            print("⚠ cdn_urls.json não encontrado — purge ignorado")
+            exit(0)
+
+          cdn_urls = json.load(open(cdn_urls_path))
+          print(f"→ Purgando {len(cdn_urls)} URLs em batches de 30...")
+
+          # Cloudflare limita a 30 URLs por request de purge
+          BATCH_SIZE = 30
+          purged = 0
+          errors = 0
+
+          for i in range(0, len(cdn_urls), BATCH_SIZE):
+            batch   = cdn_urls[i:i + BATCH_SIZE]
+            payload = json.dumps({'files': batch}).encode()
+            req = urllib.request.Request(
+              f'https://api.cloudflare.com/client/v4/zones/{zone_id}/purge_cache',
+              data=payload,
+              headers={
+                'Authorization': f'Bearer {api_token}',
+                'Content-Type':  'application/json',
+              },
+              method='POST'
+            )
+            try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                resp = json.loads(r.read().decode())
+                if resp.get('success'):
+                  purged += len(batch)
+                else:
+                  print(f"  ⚠ Batch {i//BATCH_SIZE+1} falhou: {resp.get('errors', resp)}")
+                  errors += len(batch)
+            except urllib.error.HTTPError as e:
+              body = e.read().decode()[:200]
+              print(f"  ✗ Batch {i//BATCH_SIZE+1} HTTP {e.code}: {body}")
+              errors += len(batch)
+            except Exception as e:
+              print(f"  ✗ Batch {i//BATCH_SIZE+1} erro: {e}")
+              errors += len(batch)
+
+          total = purged + errors
+          if errors == 0:
+            print(f"✓ Purge completo: {purged}/{total} URLs purgadas")
+          else:
+            print(f"⚠ Purge parcial: {purged} OK | {errors} erros")
+          PYEOF
 
           echo ""
           echo "=== Aguardar tunnel pronto para servir ==="
@@ -1178,7 +1227,9 @@ jobs:
 
           def fetch_url(url):
             try:
-              with ur.urlopen(ur.Request(url), timeout=120) as r:
+              req = ur.Request(url)
+              req.add_header('User-Agent', 'StreamVault-Warmer/1.0')
+              with ur.urlopen(req, timeout=120) as r:
                 body      = r.read()
                 cf_status = r.headers.get('cf-cache-status', 'UNKNOWN')
                 cc        = r.headers.get('cache-control', 'none')
@@ -1437,8 +1488,6 @@ jobs:
           PYEOF
 
       # ── 14b. Notificar dispatcher (webhook FIFO) ───────────────────────────
-      # if: always() — corre sempre, mesmo que steps anteriores tenham falhado.
-      # Liberta o slot na fila FIFO para o próximo job ser despachado.
       - name: Notificar dispatcher (webhook FIFO)
         if: always()
         run: |
