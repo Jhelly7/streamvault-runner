@@ -3,7 +3,7 @@ name: StreamVault Process
 # ── Secrets obrigatórios (Settings → Secrets → Actions) ───────────────────
 # CHACHA_KEY            — 32 bytes hex (mesmo do server.js)
 # CDN_DOMAIN            — ex: https://cdn.pixgo.qzz.io
-# PIPELINE_API          — URL base do servidor unificado (ex: https://alwaysdata.onrender.com)
+# PIPELINE_API          — URL base do servidor unificado
 # ADMIN_API_KEY         — chave X-API-Key para PIPELINE_API
 # STORAGE_GITHUB_TOKEN  — PAT da conta storage (scope: repo)
 # STORAGE_GITHUB_OWNER  — username da conta storage
@@ -735,7 +735,7 @@ jobs:
           print(f"✓ {len(seg_files)} segmentos + init encriptados (chunk-v2, fMP4)")
           PYEOF
 
-      # ── 7b. Dividir .bin maiores que 1.9 GB em partes (limite Release = 2 GB) ─
+      # ── 7b. Dividir .bin maiores que 1.9 GB em partes ──────────────────────
       - name: Dividir ficheiros .bin > 1.9GB em partes
         run: |
           python3 << 'PYEOF'
@@ -780,6 +780,152 @@ jobs:
             print("✓ Nenhum ficheiro excede o limite — split não necessário")
           PYEOF
 
+      # ── 7c. Verificar necessidade de uploaders ─────────────────────────────
+      - name: Verificar se precisa de uploaders paralelos
+        id: check_uploaders
+        run: |
+          python3 << 'PYEOF'
+          import os
+
+          hls_dir   = os.environ['WORK_DIR'] + '/hls'
+          thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
+
+          # Contar segmentos .bin (excluindo init.bin e .part*)
+          seg_count = len([f for f in os.listdir(hls_dir)
+                          if f.endswith('.bin') and f != 'init.bin' and '.part' not in f])
+
+          # Contar metadados fixos
+          meta_count = 4  # master.m3u8, index.m3u8, nonces.json, split_manifest.json
+          if os.path.exists(os.path.join(hls_dir, 'init.bin')):
+              meta_count += 1
+          if os.path.isdir(thumb_dir):
+              meta_count += len([f for f in os.listdir(thumb_dir) if f.endswith('.jpg')])
+
+          total_assets = meta_count + seg_count
+          NEED_UPLOADERS = total_assets > 900
+
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f"NEED_UPLOADERS={'true' if NEED_UPLOADERS else 'false'}\n")
+              f.write(f"SEG_COUNT={seg_count}\n")
+              f.write(f"META_COUNT={meta_count}\n")
+              f.write(f"TOTAL_ASSETS={total_assets}\n")
+
+          print(f"  Segmentos: {seg_count} | Metadados: {meta_count} | Total: {total_assets}")
+          print(f"  {'⚠ Precisa uploaders paralelos' if NEED_UPLOADERS else '✓ Upload normal (1 Release)'}")
+          PYEOF
+
+      # ── 7d. Empacotar segmentos para uploaders ─────────────────────────────
+      - name: Empacotar segmentos para uploaders
+        if: ${{ env.NEED_UPLOADERS == 'true' }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, tarfile
+
+          hls_dir   = os.environ['WORK_DIR'] + '/hls'
+          seg_files = sorted([f for f in os.listdir(hls_dir)
+                             if (f.endswith('.bin') or '.bin.part' in f) and f != 'init.bin'])
+
+          UPLOADER_BATCH = 500
+          batches = [seg_files[i:i+UPLOADER_BATCH]
+                    for i in range(0, len(seg_files), UPLOADER_BATCH)]
+
+          os.makedirs('/tmp/uploader_batches', exist_ok=True)
+
+          for bi, batch in enumerate(batches):
+              tar_path = f'/tmp/uploader_batches/batch_{bi:03d}.tar'
+              with tarfile.open(tar_path, 'w') as tar:
+                  for fname in batch:
+                      tar.add(os.path.join(hls_dir, fname), arcname=fname)
+              batch_size = os.path.getsize(tar_path) // (1024*1024)
+              print(f"  Batch {bi}: {len(batch)} segs → {tar_path} ({batch_size}MB)")
+
+          # Salvar mapeamento
+          manifest = {
+              'batches': len(batches),
+              'batch_size': UPLOADER_BATCH,
+              'total_segs': len(seg_files),
+          }
+          json.dump(manifest, open('/tmp/uploader_batches/manifest.json', 'w'))
+
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f"UPLOADER_BATCHES={len(batches)}\n")
+
+          print(f"✓ {len(seg_files)} segmentos em {len(batches)} batches")
+          PYEOF
+
+      - name: Upload artifact com segmentos
+        if: ${{ env.NEED_UPLOADERS == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: segs-${{ inputs.job_id }}
+          path: /tmp/uploader_batches/
+          retention-days: 1
+
+      # ── 7e. Disparar jobs uploaders ────────────────────────────────────────
+      - name: Disparar jobs uploaders
+        if: ${{ env.NEED_UPLOADERS == 'true' }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, urllib.request, urllib.error, time
+
+          job_id          = os.environ['JOB_ID']
+          batches         = int(os.environ['UPLOADER_BATCHES'])
+          pipeline_api    = os.environ.get('PIPELINE_API','').rstrip('/')
+          admin_key       = os.environ.get('ADMIN_API_KEY','')
+          dispatcher_base = pipeline_api.replace('/api', '').rstrip('/')
+
+          try:
+              metadata = json.loads(os.environ.get('METADATA_JSON', '{}'))
+          except:
+              metadata = {}
+
+          dispatched = 0
+          for bi in range(batches):
+              uploader_id = f"{job_id}-up{bi:03d}"
+
+              payload = json.dumps({
+                  'job_id':            uploader_id,
+                  'video_url':         '',
+                  'thumbnail_url':     '',
+                  'seg_duration':      os.environ.get('SEG_DURATION', '4'),
+                  'max_encode_height': os.environ.get('MAX_H', '720'),
+                  'warm_concurrency':  '1',
+                  'metadata':          {**metadata, 'parent_job': job_id, 'batch_index': bi, 'is_uploader': True},
+                  'season_number':     '0',
+                  'episode_number':    '0',
+                  'episode_title':     '',
+                  'file_indices':      f'uploader:{bi}',
+              }).encode()
+
+              req = urllib.request.Request(
+                  f"{dispatcher_base}/dispatch",
+                  data=payload,
+                  headers={
+                      'Content-Type': 'application/json',
+                      'x-api-key':    admin_key,
+                      'User-Agent':   'StreamVault-UploaderDispatcher/1.0',
+                  },
+                  method='POST'
+              )
+
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      resp = json.loads(r.read().decode())
+                      print(f"  ✓ Uploader {bi+1}/{batches} → {uploader_id} ({resp.get('status','?')})")
+                      dispatched += 1
+              except urllib.error.HTTPError as e:
+                  print(f"  ✗ Uploader {bi+1} HTTP {e.code}: {e.read().decode()[:200]}")
+              except Exception as e:
+                  print(f"  ✗ Uploader {bi+1} erro: {e}")
+
+              if bi < batches - 1:
+                  time.sleep(0.5)
+
+          print(f"✅ {dispatched}/{batches} uploaders disparados")
+          PYEOF
+        env:
+          METADATA_JSON: ${{ inputs.metadata }}
+
       # ── 8. Reescrever index.m3u8 com URLs CDN ─────────────────────────────
       - name: Reescrever index.m3u8 com URLs CDN
         run: |
@@ -809,7 +955,7 @@ jobs:
       - name: Gerar master.m3u8
         run: |
           python3 << 'PYEOF'
-          import os, json
+          import os
           cdn_base  = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id    = os.environ['JOB_ID']
           work_dir  = os.environ['WORK_DIR']
@@ -864,15 +1010,124 @@ jobs:
           print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs")
           PYEOF
 
-      # ── 11. Criar Release(s) e upload assets ──────────────────────────────
-      # GitHub limita 1000 assets por Release.
-      # Estratégia: Release principal ({job_id}) recebe sempre os ficheiros de
-      # metadados (master.m3u8, index.m3u8, nonces.json, split_manifest.json,
-      # init.bin, thumb_*.jpg). Os segmentos .bin são distribuídos em chunks de
-      # 990 por Release adicional ({job_id}-p2, {job_id}-p3, …) se necessário.
-      # O CDN Worker serve todos os paths de {job_id}/* independentemente de
-      # qual Release física contém cada asset — não há alteração nos cdn_urls.
-      - name: Criar Release(s) e upload assets
+      # ── 11. Upload metadados (modo uploaders) ──────────────────────────────
+      - name: Upload metadados (Release principal - modo uploaders)
+        if: ${{ env.NEED_UPLOADERS == 'true' }}
+        env:
+          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
+          STORAGE_REPO:  ${{ secrets.STORAGE_GITHUB_REPO }}
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess, json, time
+
+          work_dir      = os.environ['WORK_DIR']
+          storage_token = os.environ['STORAGE_TOKEN']
+          storage_owner = os.environ['STORAGE_OWNER']
+          storage_repo  = os.environ['STORAGE_REPO']
+          job_id        = os.environ['JOB_ID']
+          quality       = os.environ['QUALITY_LABEL']
+
+          # Listar metadados essenciais
+          meta_files = []
+
+          # Master playlist e metadados raiz
+          for fname in ['master.m3u8', 'nonces.json']:
+              fpath = os.path.join(work_dir, fname)
+              if os.path.exists(fpath):
+                  meta_files.append((fpath, fname, 'application/json' if fname.endswith('.json') else 'application/vnd.apple.mpegurl'))
+
+          # split_manifest.json (pode não existir)
+          split_manifest = os.path.join(work_dir, 'split_manifest.json')
+          if os.path.exists(split_manifest):
+              meta_files.append((split_manifest, 'split_manifest.json', 'application/json'))
+
+          # HLS dir: index.m3u8 + init.bin
+          hls_dir = work_dir + '/hls'
+          for fname, mime in [('index.m3u8', 'application/vnd.apple.mpegurl'), ('init.bin', 'application/octet-stream')]:
+              fpath = os.path.join(hls_dir, fname)
+              if os.path.exists(fpath):
+                  meta_files.append((fpath, fname, mime))
+
+          # Thumbnails
+          thumb_dir = os.path.join(work_dir, 'thumbs')
+          if os.path.isdir(thumb_dir):
+              for f in sorted(os.listdir(thumb_dir)):
+                  if f.endswith('.jpg'):
+                      meta_files.append((os.path.join(thumb_dir, f), f, 'image/jpeg'))
+
+          print(f"  Upload {len(meta_files)} metadados para Release principal: {job_id}")
+
+          # Criar release
+          r = subprocess.run([
+              'curl', '-sf',
+              '-H', f'Authorization: Bearer {storage_token}',
+              '-H', 'Accept: application/vnd.github+json',
+              '-H', 'X-GitHub-Api-Version: 2022-11-28',
+              '-X', 'POST',
+              f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases',
+              '-d', json.dumps({
+                  'tag_name':   job_id,
+                  'name':       job_id,
+                  'body':       f'jobId={job_id} | quality={quality} | mode=uploaders',
+                  'draft':      False,
+                  'prerelease': False,
+              }),
+          ], capture_output=True, text=True)
+
+          if r.returncode != 0:
+              # Tag já existe — obter release existente
+              print(f"  ↺ Tag já existe — obtendo release existente...")
+              r = subprocess.run([
+                  'curl', '-sf',
+                  '-H', f'Authorization: Bearer {storage_token}',
+                  '-H', 'Accept: application/vnd.github+json',
+                  '-H', 'X-GitHub-Api-Version: 2022-11-28',
+                  f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{job_id}',
+              ], capture_output=True, text=True)
+
+          release = json.loads(r.stdout)
+          upload_url = release['upload_url'].split('{')[0]
+          existing_assets = {a['name']: a['id'] for a in release.get('assets', [])}
+
+          ok = 0
+          for fpath, fname, mime in meta_files:
+              # Remover asset existente se houver
+              if fname in existing_assets:
+                  print(f"  ↺ {fname} já existe — removendo...")
+                  subprocess.run([
+                      'curl', '-sf', '-X', 'DELETE',
+                      '-H', f'Authorization: Bearer {storage_token}',
+                      '-H', 'Accept: application/vnd.github+json',
+                      '-H', 'X-GitHub-Api-Version: 2022-11-28',
+                      f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{existing_assets[fname]}',
+                  ], capture_output=True)
+                  time.sleep(1)
+
+              # Upload
+              size_kb = os.path.getsize(fpath) // 1024
+              r = subprocess.run([
+                  'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
+                  '-X', 'POST',
+                  '-H', f'Authorization: Bearer {storage_token}',
+                  '-H', f'Content-Type: {mime}',
+                  '--max-time', '120',
+                  f'{upload_url}?name={fname}',
+                  '--data-binary', f'@{fpath}',
+              ], capture_output=True, text=True)
+
+              if r.stdout.strip() == '201':
+                  print(f"  ✓ {fname} ({size_kb}KB)")
+                  ok += 1
+              else:
+                  print(f"  ✗ {fname} HTTP {r.stdout.strip()}")
+
+          print(f"✅ Release principal: {ok}/{len(meta_files)} metadados")
+          PYEOF
+
+      # ── 12. Criar Release(s) e upload assets (MODO NORMAL ≤ 900 assets) ───
+      - name: Criar Release(s) e upload assets (modo normal)
+        if: ${{ env.NEED_UPLOADERS != 'true' }}
         id: upload_assets
         continue-on-error: true
         env:
@@ -891,11 +1146,9 @@ jobs:
           quality       = os.environ['QUALITY_LABEL']
           github_env    = os.environ['GITHUB_ENV']
 
-          # ── Limite seguro por Release (GitHub impõe 1000 hard) ─────────────
           ASSETS_PER_RELEASE = 990
 
           def gh_json(args):
-            """Executa curl autenticado e devolve dict JSON ou {} em erro."""
             r = subprocess.run([
               'curl', '-sf',
               '-H', f'Authorization: Bearer {storage_token}',
@@ -910,7 +1163,6 @@ jobs:
               return {}
 
           def get_or_create_release(tag, title, body_text):
-            """Cria Release com tag dada; se já existir devolve a existente."""
             data = gh_json([
               '-X', 'POST',
               f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases',
@@ -924,7 +1176,6 @@ jobs:
             ])
             if 'upload_url' in data:
               return data
-            # 422 = tag já existe → buscar existente
             print(f"  ↺ Tag '{tag}' já existe — obtendo Release existente...")
             data2 = gh_json([
               f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{tag}'
@@ -941,14 +1192,13 @@ jobs:
                 '-H', 'X-GitHub-Api-Version: 2022-11-28',
                 f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{existing_assets[asset_name]}',
               ], capture_output=True)
-              # Aguardar confirmação da deleção (máx 10s)
               for _ in range(10):
                 time.sleep(1)
                 check = gh_json([
                   f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{existing_assets[asset_name]}'
                 ])
                 if not check or 'id' not in check:
-                  break  # asset já não existe
+                  break
 
           def upload_asset(upload_url, file_path, asset_name, mime):
             size_kb = os.path.getsize(file_path) // 1024
@@ -969,8 +1219,7 @@ jobs:
               print(f"  ✗ {asset_name} HTTP {code} — abortando")
               return False
 
-          # ── Construir lista de assets ───────────────────────────────────────
-          # Ordem: metadados fixos primeiro, depois segmentos .bin por ordem
+          # Construir lista de assets
           meta_assets = []
           for fpath, mime in [
             (os.path.join(work_dir, 'master.m3u8'),        'application/vnd.apple.mpegurl'),
@@ -981,7 +1230,6 @@ jobs:
             if os.path.exists(fpath):
               meta_assets.append((fpath, os.path.basename(fpath), mime))
 
-          # init.bin e thumbnails também vão para a Release principal
           hls_dir   = os.path.join(work_dir, 'hls')
           thumb_dir = os.path.join(work_dir, 'thumbs')
 
@@ -993,7 +1241,6 @@ jobs:
             for f in sorted(f for f in os.listdir(thumb_dir) if f.endswith('.jpg')):
               meta_assets.append((os.path.join(thumb_dir, f), f, 'image/jpeg'))
 
-          # Segmentos .bin (excluindo init.bin, já incluído acima)
           seg_assets = []
           for f in sorted(os.listdir(hls_dir)):
             if (f.endswith('.bin') or '.bin.part' in f) and f != 'init.bin':
@@ -1009,13 +1256,10 @@ jobs:
             meta = {}
           title = meta.get('title', 'Untitled')
 
-          # ── Calcular quantas Releases são necessárias ───────────────────────
-          # Release p1 (tag = job_id): meta_assets + tantos seg_assets que caibam
           slots_p1    = ASSETS_PER_RELEASE - len(meta_assets)
           segs_p1     = seg_assets[:slots_p1]
           segs_remain = seg_assets[slots_p1:]
 
-          # Releases adicionais p2, p3, … (tag = job_id-p2, job_id-p3, …)
           extra_chunks = []
           part_idx = 2
           while segs_remain:
@@ -1029,7 +1273,6 @@ jobs:
 
           all_ok = True
 
-          # ── Release principal ───────────────────────────────────────────────
           print(f"\n→ Release principal: tag={job_id}")
           rel = get_or_create_release(
             job_id, title,
@@ -1054,7 +1297,6 @@ jobs:
             ok_p1 += 1
           print(f"  ✅ Release principal: {ok_p1}/{len(p1_assets)} assets")
 
-          # ── Releases adicionais ─────────────────────────────────────────────
           for part_tag, chunk in extra_chunks:
             print(f"\n→ Release adicional: tag={part_tag} ({len(chunk)} segmentos)")
             rel_p = get_or_create_release(
@@ -1085,8 +1327,9 @@ jobs:
           with open(github_env, 'a') as f: f.write("UPLOAD_SKIP=false\n")
           PYEOF
 
-      # ── 12. Registar no EdgeOne ────────────────────────────────────────────
+      # ── 13. Registar no EdgeOne ────────────────────────────────────────────
       - name: Registar no EdgeOne (Turso + KV)
+        if: ${{ env.NEED_UPLOADERS != 'true' }}
         env:
           METADATA:       ${{ inputs.metadata }}
           SEASON_NUMBER:  ${{ inputs.season_number }}
@@ -1238,7 +1481,7 @@ jobs:
             print(f"  ✅ Season + {len(episode_list)} episódio(s) registados")
           PYEOF
 
-      # ── 12b. Notificar dispatcher (webhook FIFO) ───────────────────────────
+      # ── 13b. Notificar dispatcher (webhook FIFO) ───────────────────────────
       - name: Notificar dispatcher (webhook FIFO)
         if: always()
         run: |
@@ -1277,7 +1520,7 @@ jobs:
             echo "⚠ Webhook falhou (HTTP ${HTTP_CODE}) — slot libertado pelo watchdog em ~360min"
           fi
 
-      # ── 13. Cleanup ────────────────────────────────────────────────────────
+      # ── 14. Cleanup ────────────────────────────────────────────────────────
       - name: Cleanup
         if: always()
         run: |
