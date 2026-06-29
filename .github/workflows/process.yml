@@ -46,7 +46,6 @@ on:
         description: 'Índices dos ficheiros no torrent'
         required: false
         default: ''
-      # INTERNOS: parâmetros para auto-recorrência
       upload_mode:
         description: 'INTERNO: modo de upload'
         required: false
@@ -59,6 +58,10 @@ on:
         description: 'INTERNO: total de lotes'
         required: false
         default: '0'
+      parent_run_id:
+        description: 'INTERNO: run_id do job principal'
+        required: false
+        default: ''
 
 jobs:
   process:
@@ -82,6 +85,7 @@ jobs:
             echo "IS_BATCH_MODE=true" >> $GITHUB_ENV
             echo "BATCH_INDEX=${{ inputs.upload_batch }}" >> $GITHUB_ENV
             echo "TOTAL_BATCHES=${{ inputs.total_batches }}" >> $GITHUB_ENV
+            echo "PARENT_RUN_ID=${{ inputs.parent_run_id }}" >> $GITHUB_ENV
           else
             echo "→ Modo: COMPLETO (download + encode + upload)"
             echo "IS_BATCH_MODE=false" >> $GITHUB_ENV
@@ -90,21 +94,21 @@ jobs:
           echo "SEG_DURATION=${{ inputs.seg_duration }}" >> $GITHUB_ENV
           echo "MAX_H=${{ inputs.max_encode_height }}" >> $GITHUB_ENV
 
-      # ── 0a. Preparar dirs ────────────────────────────────────────────────
       - name: Preparar ambiente
         run: |
           mkdir -p $WORK_DIR/incoming $WORK_DIR/hls $WORK_DIR/thumbs
 
       # ═══════════════════════════════════════════════════════════════════
-      # MODO BATCH: só download + upload de um lote específico
+      # MODO BATCH
       # ═══════════════════════════════════════════════════════════════════
       
-      - name: '[BATCH] Download artifact com segmentos'
+      - name: '[BATCH] Download artifact da run pai'
         if: env.IS_BATCH_MODE == 'true'
         uses: actions/download-artifact@v4
         with:
           name: segs-${{ inputs.job_id }}
           path: /tmp/batches/
+          run-id: ${{ inputs.parent_run_id }}
 
       - name: '[BATCH] Extrair lote e fazer upload'
         if: env.IS_BATCH_MODE == 'true'
@@ -130,6 +134,7 @@ jobs:
           batch_file = f'/tmp/batches/batch_{batch_index:03d}.tar'
           if not os.path.exists(batch_file):
             print(f"  ✗ Arquivo {batch_file} não encontrado")
+            print(f"  Conteúdo de /tmp/batches/: {os.listdir('/tmp/batches/')}")
             exit(1)
 
           os.makedirs(f'{work_dir}/hls', exist_ok=True)
@@ -140,7 +145,6 @@ jobs:
                              if f.endswith('.bin') or '.bin.part' in f])
           print(f"  {len(seg_files)} segmentos extraídos")
 
-          # Obter release
           r = subprocess.run([
             'curl', '-sf',
             '-H', f'Authorization: Bearer {storage_token}',
@@ -217,7 +221,7 @@ jobs:
           PYEOF
 
       # ═══════════════════════════════════════════════════════════════════
-      # MODO COMPLETO: download + encode + metadados + disparar lotes
+      # MODO COMPLETO
       # ═══════════════════════════════════════════════════════════════════
 
       - name: Instalar FFmpeg
@@ -234,7 +238,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends python3-libtorrent
           python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
-      # ── Coordinator ────────────────────────────────────────────────────
       - name: '[Coordinator] Detectar episódios e disparar jobs filhos'
         if: |
           env.IS_BATCH_MODE != 'true' &&
@@ -276,10 +279,8 @@ jobs:
           print(f"Coordinator: {metadata.get('title','?')} S{season_num:02d} | {url[:70]}...")
 
           ses = lt.session({'listen_interfaces': '0.0.0.0:6882'})
-          try:
-            ses.apply_settings({'connections_limit':50,'active_downloads':1,'active_seeds':0})
-          except Exception as e:
-            print(f"  apply_settings parcial: {e}")
+          try: ses.apply_settings({'connections_limit':50,'active_downloads':1,'active_seeds':0})
+          except Exception as e: print(f"  apply_settings parcial: {e}")
 
           os.makedirs('/tmp/coord_meta', exist_ok=True)
 
@@ -341,8 +342,7 @@ jobs:
             ]
             for pat in patterns:
               m = re.search(pat, base, re.IGNORECASE)
-              if m:
-                return int(m.group(1))
+              if m: return int(m.group(1))
             return None
 
           for vf in video_files:
@@ -375,8 +375,7 @@ jobs:
             else:
               cur.append(vf)
               cur_size += e
-          if cur:
-            batches.append(cur)
+          if cur: batches.append(cur)
 
           print(f"  Batches: {len(batches)}")
           for i, b in enumerate(batches):
@@ -430,15 +429,12 @@ jobs:
               print(f"  ✗ Batch {bi+1} HTTP {e.code}: {e.read().decode()[:200]}")
             except Exception as e:
               print(f"  ✗ Batch {bi+1} erro: {e}")
-
-            if bi < len(batches) - 1:
-              time.sleep(1)
+            if bi < len(batches) - 1: time.sleep(1)
 
           print(f"\n✅ Coordinator: {dispatched}/{len(batches)} jobs em fila FIFO")
           sys.exit(0)
           PYEOF
 
-      # ── Download vídeo ─────────────────────────────────────────────────
       - name: '[Modo A] Descarregar vídeo'
         if: env.IS_BATCH_MODE != 'true' && inputs.video_url != ''
         run: |
@@ -453,19 +449,9 @@ jobs:
           dest_dir = os.environ['WORK_DIR'] + '/incoming'
           MAX_WAIT = 3600
 
-          ses = lt.session({
-            'listen_interfaces': '0.0.0.0:6881',
-            'alert_mask': lt.alert.category_t.status_notification |
-                          lt.alert.category_t.error_notification,
-          })
-          try:
-            ses.apply_settings({
-              'connections_limit': 200,
-              'active_downloads':  1,
-              'active_seeds':      0,
-            })
-          except Exception as e:
-            print(f"⚠ apply_settings parcial: {e}")
+          ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
+          try: ses.apply_settings({'connections_limit':200,'active_downloads':1,'active_seeds':0})
+          except Exception as e: print(f"⚠ apply_settings parcial: {e}")
 
           params = lt.add_torrent_params()
           params.save_path = dest_dir
@@ -544,12 +530,10 @@ jobs:
           video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
           videos     = [f for f in files if f.suffix.lower() in video_exts]
           print(f"  Ficheiros descarregados: {len(files)}")
-          for v in videos:
-            print(f"  → Vídeo: {v} ({v.stat().st_size // (1024*1024)} MB)")
+          for v in videos: print(f"  → Vídeo: {v} ({v.stat().st_size // (1024*1024)} MB)")
           if not videos:
             print('⚠ Nenhum vídeo encontrado no torrent')
-            for f in files:
-              print(f'  {f} ({f.stat().st_size} bytes)')
+            for f in files: print(f'  {f} ({f.stat().st_size} bytes)')
           PYEOF
           else
             echo "→ Modo URL directa (curl)"
@@ -579,7 +563,6 @@ jobs:
         if: env.IS_BATCH_MODE != 'true'
         run: |
           VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
-
           FILE_INDICES="${{ inputs.file_indices }}"
           if [ -n "$FILE_INDICES" ]; then
             echo "→ Modo worker | file_indices: $FILE_INDICES"
@@ -642,13 +625,10 @@ jobs:
           echo "VIDEO_PATH=$VIDEO_PATH" >> $GITHUB_ENV
           echo "✓ Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
 
-      # ── Probe ───────────────────────────────────────────────────────────
       - name: Probe do vídeo
         if: env.IS_BATCH_MODE != 'true'
         run: |
-          ffprobe -v quiet -print_format json \
-            -show_streams -show_format "$VIDEO_PATH" \
-            > "$WORK_DIR/probe.json"
+          ffprobe -v quiet -print_format json -show_streams -show_format "$VIDEO_PATH" > "$WORK_DIR/probe.json"
           python3 << 'PYEOF'
           import json, os
           d   = json.load(open(os.environ['WORK_DIR'] + '/probe.json'))
@@ -664,7 +644,6 @@ jobs:
             'codec':    src_codec,
             'fps':      fps,
             'bitrate':  int(fmt.get('bit_rate', 0)),
-            'size':     int(fmt.get('size', 0)),
           }
           json.dump(probe, open(os.environ['WORK_DIR'] + '/probe_parsed.json','w'))
           max_h      = int(os.environ['MAX_H'])
@@ -672,12 +651,7 @@ jobs:
           will_scale = probe['height'] > max_h
           eff_w      = round((probe['width'] / probe['height']) * eff_h / 2) * 2 if will_scale else probe['width']
           h          = eff_h
-          label = ('4k'    if h>=2160 else
-                   '1440p' if h>=1440 else
-                   '1080p' if h>=1080 else
-                   '720p'  if h>=720  else
-                   '480p'  if h>=480  else
-                   '360p'  if h>=360  else f'{h}p')
+          label = ('4k' if h>=2160 else '1440p' if h>=1440 else '1080p' if h>=1080 else '720p' if h>=720 else f'{h}p')
           with open(os.environ['GITHUB_ENV'], 'a') as f:
             f.write(f"PROBE_DURATION={probe['duration']}\n")
             f.write(f"PROBE_WIDTH={probe['width']}\n")
@@ -693,7 +667,6 @@ jobs:
           print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale}")
           PYEOF
 
-      # ── HLS encode ─────────────────────────────────────────────────────
       - name: HLS encode (fMP4 + libx264 superfast CRF26 + AAC 128k)
         if: env.IS_BATCH_MODE != 'true'
         run: |
@@ -705,7 +678,6 @@ jobs:
           fi
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
           echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s)"
-          echo "  Re-encode para h264 (codec entrada: ${PROBE_CODEC}) — compatibilidade universal"
           ffmpeg -hide_banner -loglevel warning -stats \
             -i "$VIDEO_PATH" \
             $SCALE_ARGS \
@@ -725,7 +697,6 @@ jobs:
           echo "✓ $(ls $HLS_DIR/*.m4s | wc -l) segmentos .m4s gerados (fMP4 h264)"
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
-      # ── Thumbnails ──────────────────────────────────────────────────────
       - name: Obter thumbnails
         if: env.IS_BATCH_MODE != 'true'
         env:
@@ -733,7 +704,6 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import subprocess, os, json
-
           thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
           duration  = float(os.environ['PROBE_DURATION'])
           video     = os.environ['VIDEO_PATH']
@@ -745,83 +715,49 @@ jobs:
             if os.path.getsize(path) < min_bytes: return False
             with open(path, 'rb') as f:
               h = f.read(12)
-            return (
-              h[:3] == b'\xff\xd8\xff' or
-              h[:4] == b'\x89PNG' or
-              h[:4] == b'RIFF' or
-              h[:6] in (b'GIF87a', b'GIF89a') or
-              h[:2] == b'BM' or
-              h[:4] in (b'II*\x00', b'MM\x00*') or
-              h[:4] in (b'\x00\x00\x00\x18', b'\x00\x00\x00\x1c',
-                        b'\x00\x00\x00\x20') or
-              (len(h) >= 8 and h[4:8] == b'ftyp')
-            )
+            return (h[:3] == b'\xff\xd8\xff' or h[:4] == b'\x89PNG' or h[:4] == b'RIFF' or
+                    h[:6] in (b'GIF87a', b'GIF89a') or h[:2] == b'BM' or
+                    h[:4] in (b'II*\x00', b'MM\x00*') or
+                    (len(h) >= 8 and h[4:8] == b'ftyp'))
 
           def extract_frame(video, out_path, time_pct=0.07):
             t = max(1.0, duration * time_pct)
-            r = subprocess.run([
-              'ffmpeg', '-hide_banner', '-loglevel', 'error',
-              '-ss', f'{t:.2f}', '-i', video,
-              '-vframes', '1', '-vf', 'scale=1280:-2', '-q:v', '2',
-              '-y', out_path,
-            ], capture_output=True)
+            r = subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-ss',f'{t:.2f}',
+              '-i',video,'-vframes','1','-vf','scale=1280:-2','-q:v','2','-y',out_path], capture_output=True)
             return r.returncode == 0 and is_valid_image(out_path)
 
           if thumb_url:
             out = f"{thumb_dir}/thumb_0.jpg"
             print(f"  Descarregando thumbnail: {thumb_url}")
-            subprocess.run([
-              'curl', '-L', '--retry', '5', '--retry-delay', '3', '--max-time', '60',
-              '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              '-H', 'Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-              '-H', 'Accept-Language: pt-BR,pt;q=0.9,en;q=0.8',
-              '-H', 'Sec-Fetch-Dest: image',
-              '-H', 'Sec-Fetch-Mode: no-cors',
-              '-H', 'Sec-Fetch-Site: cross-site',
-              '-o', out, thumb_url,
-            ], capture_output=True)
+            subprocess.run(['curl','-L','--retry','5','--retry-delay','3','--max-time','60',
+              '-H','User-Agent: Mozilla/5.0','-o',out,thumb_url], capture_output=True)
             if not is_valid_image(out):
               if os.path.exists(out): os.remove(out)
-              subprocess.run([
-                'wget', '--timeout=30', '--tries=5',
-                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                '-O', out, thumb_url,
-              ], capture_output=True)
+              subprocess.run(['wget','--timeout=30','--tries=5','-O',out,thumb_url], capture_output=True)
             if is_valid_image(out):
-              norm = f"{thumb_dir}/thumb_0_norm.jpg"
-              subprocess.run([
-                'ffmpeg', '-hide_banner', '-loglevel', 'error',
-                '-i', out, '-vframes', '1', '-q:v', '2',
-                '-vf', "scale='min(1280,iw)':-2", '-y', norm,
-              ], capture_output=True)
-              if is_valid_image(norm): os.replace(norm, out)
-              thumbs.append({'path': out, 'time': 0, 'index': 0})
+              thumbs.append({'path':out,'time':0,'index':0})
               print(f"✓ Thumbnail válida ({os.path.getsize(out)//1024} KB)")
             else:
               if os.path.exists(out): os.remove(out)
-              print(f"⚠ Thumbnail inválida — extraindo frame do vídeo")
               if extract_frame(video, out):
-                thumbs.append({'path': out, 'time': 0, 'index': 0})
-                print(f"✓ Frame extraído como fallback: {os.path.getsize(out)//1024} KB")
-              else:
-                print('✗ Falha ao extrair frame de fallback')
+                thumbs.append({'path':out,'time':0,'index':0})
+                print(f"✓ Frame extraído como fallback")
+              else: print('✗ Falha ao extrair frame')
           else:
             out = f"{thumb_dir}/thumb_0.jpg"
             print(f"  Extraindo frame a 7% ({duration*0.07:.1f}s)")
             if extract_frame(video, out, time_pct=0.07):
-              thumbs.append({'path': out, 'time': duration*0.07, 'index': 0})
+              thumbs.append({'path':out,'time':duration*0.07,'index':0})
               print(f"✓ Frame extraído: {os.path.getsize(out)//1024} KB")
             elif extract_frame(video, out, time_pct=0.05):
-              thumbs.append({'path': out, 'time': duration*0.05, 'index': 0})
+              thumbs.append({'path':out,'time':duration*0.05,'index':0})
               print(f"✓ Frame extraído a 5%: {os.path.getsize(out)//1024} KB")
-            else:
-              print('✗ Não foi possível extrair frame')
+            else: print('✗ Não foi possível extrair frame')
 
           json.dump(thumbs, open(os.environ['WORK_DIR'] + '/thumbs_manifest.json', 'w'))
           print(f"✓ {len(thumbs)} thumbnail(s)")
           PYEOF
 
-      # ── Encrypt ─────────────────────────────────────────────────────────
       - name: Encriptar segmentos → .bin
         if: env.IS_BATCH_MODE != 'true'
         run: |
@@ -829,8 +765,7 @@ jobs:
           import os, json, secrets, struct
           from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
           key_hex = os.environ['CHACHA_KEY']
-          if len(key_hex) != 64:
-            raise ValueError('CHACHA_KEY inválido')
+          if len(key_hex) != 64: raise ValueError('CHACHA_KEY inválido')
           key     = bytes.fromhex(key_hex)
           hls_dir = os.environ['WORK_DIR'] + '/hls'
           CHUNK_SIZE = 65536
@@ -849,83 +784,30 @@ jobs:
 
           nonce_map = {}
           init_src  = os.path.join(hls_dir, 'init.mp4')
-          init_dst  = os.path.join(hls_dir, 'init.bin')
           if os.path.exists(init_src):
             with open(init_src, 'rb') as f: data = f.read()
             encrypted = encrypt_segment(data, key)
-            with open(init_dst, 'wb') as f: f.write(encrypted)
+            with open(os.path.join(hls_dir, 'init.bin'), 'wb') as f: f.write(encrypted)
             os.remove(init_src)
-            n_chunks = struct.unpack('<I', encrypted[:4])[0]
-            nonce_map['init.bin'] = f'chunked:{n_chunks}'
-            print(f"  init.mp4 → init.bin ({len(data)//1024}KB → {n_chunks} chunks)")
+            nonce_map['init.bin'] = f"chunked:{struct.unpack('<I', encrypted[:4])[0]}"
+            print(f"  init.mp4 → init.bin ({len(data)//1024}KB)")
 
           seg_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.m4s'))
           if not seg_files: raise RuntimeError('Nenhum .m4s encontrado')
 
           for fname in seg_files:
-            src      = os.path.join(hls_dir, fname)
-            bin_name = fname.replace('.m4s', '.bin')
-            dst      = os.path.join(hls_dir, bin_name)
-            with open(src, 'rb') as f: data = f.read()
+            with open(os.path.join(hls_dir, fname), 'rb') as f: data = f.read()
             encrypted = encrypt_segment(data, key)
-            with open(dst, 'wb') as f: f.write(encrypted)
-            os.remove(src)
-            n_chunks = struct.unpack('<I', encrypted[:4])[0]
-            nonce_map[bin_name] = f'chunked:{n_chunks}'
-            print(f"  {fname} → {bin_name} ({len(data)//1024}KB → {n_chunks} chunks)")
+            bin_name = fname.replace('.m4s', '.bin')
+            with open(os.path.join(hls_dir, bin_name), 'wb') as f: f.write(encrypted)
+            os.remove(os.path.join(hls_dir, fname))
+            nonce_map[bin_name] = f"chunked:{struct.unpack('<I', encrypted[:4])[0]}"
 
           out = {'key_id': os.environ['CHACHA_KEY'][:8], 'format': 'chunk-v2', 'nonces': nonce_map}
           json.dump(out, open(os.environ['WORK_DIR'] + '/nonces.json','w'))
-          print(f"✓ {len(seg_files)} segmentos + init encriptados (chunk-v2, fMP4)")
+          print(f"✓ {len(seg_files)} segmentos encriptados")
           PYEOF
 
-      # ── Split >1.9GB ────────────────────────────────────────────────────
-      - name: Dividir ficheiros .bin > 1.9GB em partes
-        if: env.IS_BATCH_MODE != 'true'
-        run: |
-          python3 << 'PYEOF'
-          import os, json
-
-          hls_dir    = os.environ['WORK_DIR'] + '/hls'
-          SPLIT_SIZE = int(1.9 * 1024 * 1024 * 1024)
-          split_map  = {}
-
-          for fname in sorted(os.listdir(hls_dir)):
-            if not fname.endswith('.bin'):
-              continue
-            fpath = os.path.join(hls_dir, fname)
-            size  = os.path.getsize(fpath)
-            if size <= SPLIT_SIZE:
-              continue
-
-            print(f"  ⚠ {fname} ({size/(1024**3):.2f}GB) excede limite — dividindo...")
-            n_parts = 0
-            with open(fpath, 'rb') as src:
-              part_idx = 0
-              while True:
-                chunk = src.read(SPLIT_SIZE)
-                if not chunk:
-                  break
-                part_name = f"{fname}.part{part_idx:03d}"
-                with open(os.path.join(hls_dir, part_name), 'wb') as dst:
-                  dst.write(chunk)
-                part_idx += 1
-                n_parts += 1
-
-            os.remove(fpath)
-            split_map[fname] = n_parts
-            print(f"    → {n_parts} partes ({fname}.part000 .. {fname}.part{n_parts-1:03d})")
-
-          manifest_path = os.environ['WORK_DIR'] + '/split_manifest.json'
-          json.dump(split_map, open(manifest_path, 'w'))
-
-          if split_map:
-            print(f"✓ {len(split_map)} ficheiro(s) dividido(s): {split_map}")
-          else:
-            print("✓ Nenhum ficheiro excede o limite — split não necessário")
-          PYEOF
-
-      # ── Reescrever index.m3u8 ───────────────────────────────────────────
       - name: Reescrever index.m3u8 com URLs CDN
         if: env.IS_BATCH_MODE != 'true'
         run: |
@@ -934,24 +816,13 @@ jobs:
           hls_dir  = os.environ['WORK_DIR'] + '/hls'
           cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id   = os.environ['JOB_ID']
-          with open(hls_dir + '/index.m3u8') as f:
-            content = f.read()
-          content = re.sub(
-            r'#EXT-X-MAP:URI="init\.mp4"',
-            f'#EXT-X-MAP:URI="{cdn_base}/{job_id}/hls/init.bin"',
-            content
-          )
-          content = re.sub(
-            r'^(seg\d+)\.m4s$',
-            lambda m: f"{cdn_base}/{job_id}/hls/{m.group(1)}.bin",
-            content, flags=re.MULTILINE
-          )
-          with open(hls_dir + '/index.m3u8', 'w') as f:
-            f.write(content)
+          with open(hls_dir + '/index.m3u8') as f: content = f.read()
+          content = re.sub(r'#EXT-X-MAP:URI="init\.mp4"', f'#EXT-X-MAP:URI="{cdn_base}/{job_id}/hls/init.bin"', content)
+          content = re.sub(r'^(seg\d+)\.m4s$', lambda m: f"{cdn_base}/{job_id}/hls/{m.group(1)}.bin", content, flags=re.MULTILINE)
+          with open(hls_dir + '/index.m3u8', 'w') as f: f.write(content)
           print(f"✓ index.m3u8 reescrito → {cdn_base}/{job_id}/hls/")
           PYEOF
 
-      # ── Gerar master.m3u8 ───────────────────────────────────────────────
       - name: Gerar master.m3u8
         if: env.IS_BATCH_MODE != 'true'
         run: |
@@ -971,20 +842,13 @@ jobs:
             real_bitrate = int((total_bytes * 8) / duration_s) if duration_s > 0 else 2000000
           else:
             real_bitrate = int(os.environ.get('PROBE_BITRATE') or 2000000)
-          master = '\n'.join([
-            '#EXTM3U',
-            '#EXT-X-VERSION:6',
-            '',
+          master = '\n'.join(['#EXTM3U','#EXT-X-VERSION:6','',
             f'#EXT-X-STREAM-INF:BANDWIDTH={real_bitrate},RESOLUTION={eff_w}x{eff_h}',
-            f'{cdn_base}/{job_id}/hls/index.m3u8',
-          ])
-          with open(work_dir + '/master.m3u8', 'w') as f:
-            f.write(master)
-          print(f"✓ master.m3u8: {eff_w}x{eff_h} | {real_bitrate}bps (EXT-X-VERSION:6 fMP4)")
-          print(f"  → CDN: {cdn_base}/{job_id}/master.m3u8")
+            f'{cdn_base}/{job_id}/hls/index.m3u8'])
+          with open(work_dir + '/master.m3u8', 'w') as f: f.write(master)
+          print(f"✓ master.m3u8: {eff_w}x{eff_h} | {real_bitrate}bps")
           PYEOF
 
-      # ── Gerar cdn_urls.json ─────────────────────────────────────────────
       - name: Gerar cdn_urls.json
         if: env.IS_BATCH_MODE != 'true'
         run: |
@@ -993,26 +857,16 @@ jobs:
           work_dir = os.environ['WORK_DIR']
           cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id   = os.environ['JOB_ID']
-
           nonces = json.load(open(work_dir + '/nonces.json'))
           thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
-
-          cdn_urls = (
-            [
-              f"{cdn_base}/{job_id}/master.m3u8",
-              f"{cdn_base}/{job_id}/nonces.json",
-              f"{cdn_base}/{job_id}/hls/index.m3u8",
-              f"{cdn_base}/{job_id}/hls/init.bin",
-            ] +
+          cdn_urls = ([f"{cdn_base}/{job_id}/master.m3u8", f"{cdn_base}/{job_id}/nonces.json",
+            f"{cdn_base}/{job_id}/hls/index.m3u8", f"{cdn_base}/{job_id}/hls/init.bin"] +
             [f"{cdn_base}/{job_id}/hls/{bn}" for bn in nonces['nonces'] if bn != 'init.bin'] +
-            [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
-          )
-
+            [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))])
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
           print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs")
           PYEOF
 
-      # ── Verificar necessidade de lotes ──────────────────────────────────
       - name: Verificar necessidade de upload em lotes
         if: env.IS_BATCH_MODE != 'true'
         id: check_batches
@@ -1021,28 +875,23 @@ jobs:
           import os
           hls_dir = os.environ['WORK_DIR'] + '/hls'
           thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
-          
           seg_count = len([f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin' and '.part' not in f])
           meta_count = 4
           if os.path.exists(os.path.join(hls_dir, 'init.bin')): meta_count += 1
           if os.path.isdir(thumb_dir): meta_count += len([f for f in os.listdir(thumb_dir) if f.endswith('.jpg')])
-          
           total = meta_count + seg_count
           NEED_BATCHES = total > 900
           BATCH_SIZE = 500
           total_batches = (seg_count + BATCH_SIZE - 1) // BATCH_SIZE if NEED_BATCHES else 0
-          
           with open(os.environ['GITHUB_ENV'], 'a') as f:
             f.write(f"NEED_BATCHES={'true' if NEED_BATCHES else 'false'}\n")
             f.write(f"TOTAL_BATCHES={total_batches}\n")
             f.write(f"SEG_COUNT={seg_count}\n")
-          
           print(f"  Segmentos: {seg_count} | Metadados: {meta_count} | Total: {total}")
           print(f"  {'⚠ Precisa lotes' if NEED_BATCHES else '✓ Upload normal'}")
           if NEED_BATCHES: print(f"  Lotes: {total_batches} × {BATCH_SIZE} segmentos")
           PYEOF
 
-      # ── Upload metadados + init.bin + thumbs ────────────────────────────
       - name: Upload metadados + init.bin + thumbs
         if: env.IS_BATCH_MODE != 'true'
         env:
@@ -1052,7 +901,6 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os, subprocess, json, time
-          
           work_dir = os.environ['WORK_DIR']
           storage_token = os.environ['STORAGE_TOKEN']
           storage_owner = os.environ['STORAGE_OWNER']
@@ -1062,18 +910,12 @@ jobs:
           github_env = os.environ['GITHUB_ENV']
           
           meta_files = []
-          for fname, mime in [
-            ('master.m3u8', 'application/vnd.apple.mpegurl'),
-            ('nonces.json', 'application/json'),
-          ]:
+          for fname, mime in [('master.m3u8','application/vnd.apple.mpegurl'),('nonces.json','application/json')]:
             fpath = os.path.join(work_dir, fname)
             if os.path.exists(fpath): meta_files.append((fpath, fname, mime))
           
           hls_dir = work_dir + '/hls'
-          for fname, mime in [
-            ('index.m3u8', 'application/vnd.apple.mpegurl'),
-            ('init.bin', 'application/octet-stream'),
-          ]:
+          for fname, mime in [('index.m3u8','application/vnd.apple.mpegurl'),('init.bin','application/octet-stream')]:
             fpath = os.path.join(hls_dir, fname)
             if os.path.exists(fpath): meta_files.append((fpath, fname, mime))
           
@@ -1084,19 +926,17 @@ jobs:
           
           print(f"  Upload {len(meta_files)} metadados → Release {job_id}")
           
-          r = subprocess.run([
-            'curl', '-sf', '-H', f'Authorization: Bearer {storage_token}',
-            '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28',
-            '-X', 'POST', f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases',
-            '-d', json.dumps({'tag_name':job_id, 'name':job_id, 'body':f'jobId={job_id} | {quality}', 'draft':False, 'prerelease':False}),
-          ], capture_output=True, text=True)
+          r = subprocess.run(['curl','-sf','-H',f'Authorization: Bearer {storage_token}',
+            '-H','Accept: application/vnd.github+json','-H','X-GitHub-Api-Version: 2022-11-28',
+            '-X','POST',f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases',
+            '-d',json.dumps({'tag_name':job_id,'name':job_id,'body':f'jobId={job_id} | {quality}','draft':False,'prerelease':False})],
+            capture_output=True, text=True)
           
           if r.returncode != 0:
-            r = subprocess.run([
-              'curl', '-sf', '-H', f'Authorization: Bearer {storage_token}',
-              '-H', 'Accept: application/vnd.github+json',
-              f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{job_id}',
-            ], capture_output=True, text=True)
+            r = subprocess.run(['curl','-sf','-H',f'Authorization: Bearer {storage_token}',
+              '-H','Accept: application/vnd.github+json',
+              f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{job_id}'],
+              capture_output=True, text=True)
           
           release = json.loads(r.stdout)
           upload_url = release['upload_url'].split('{')[0]
@@ -1111,39 +951,31 @@ jobs:
             r = subprocess.run(['curl','-sf','-o','/dev/null','-w','%{http_code}','-X','POST',
               '-H',f'Authorization: Bearer {storage_token}','-H',f'Content-Type: {mime}',
               '--max-time','120',f'{upload_url}?name={fname}','--data-binary',f'@{fpath}'], capture_output=True, text=True)
-            if r.stdout.strip() == '201':
-              print(f"  ✓ {fname}"); ok += 1
+            if r.stdout.strip() == '201': print(f"  ✓ {fname}"); ok += 1
             else: print(f"  ✗ {fname} HTTP {r.stdout.strip()}")
           
           print(f"  ✅ {ok}/{len(meta_files)} metadados")
           with open(github_env, 'a') as f: f.write("METADATA_UPLOADED=true\n")
           PYEOF
 
-      # ── Empacotar segmentos para lotes ──────────────────────────────────
       - name: Empacotar segmentos em lotes
         if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES == 'true'
         run: |
           python3 << 'PYEOF'
           import os, json, tarfile
-          
           hls_dir = os.environ['WORK_DIR'] + '/hls'
-          seg_files = sorted([f for f in os.listdir(hls_dir) 
-                             if (f.endswith('.bin') or '.bin.part' in f) and f != 'init.bin'])
-          
+          seg_files = sorted([f for f in os.listdir(hls_dir) if (f.endswith('.bin') or '.bin.part' in f) and f != 'init.bin'])
           BATCH_SIZE = 500
           batches = [seg_files[i:i+BATCH_SIZE] for i in range(0, len(seg_files), BATCH_SIZE)]
-          
           os.makedirs('/tmp/uploader_batches', exist_ok=True)
           for bi, batch in enumerate(batches):
             tar_path = f'/tmp/uploader_batches/batch_{bi:03d}.tar'
             with tarfile.open(tar_path, 'w') as tar:
               for fname in batch: tar.add(os.path.join(hls_dir, fname), arcname=fname)
             print(f"  Batch {bi}: {len(batch)} segs ({os.path.getsize(tar_path)//(1024*1024)}MB)")
-          
           manifest = {'batches':len(batches), 'batch_size':BATCH_SIZE, 'total_segs':len(seg_files)}
           json.dump(manifest, open('/tmp/uploader_batches/manifest.json','w'))
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-            f.write(f"TOTAL_BATCHES={len(batches)}\n")
+          with open(os.environ['GITHUB_ENV'], 'a') as f: f.write(f"TOTAL_BATCHES={len(batches)}\n")
           print(f"  ✓ {len(batches)} lotes criados")
           PYEOF
 
@@ -1153,9 +985,8 @@ jobs:
         with:
           name: segs-${{ inputs.job_id }}
           path: /tmp/uploader_batches/
-          retention-days: 1
+          retention-days: 3
 
-      # ── Upload normal (≤900 assets) ─────────────────────────────────────
       - name: Upload segmentos (modo normal)
         if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true'
         env:
@@ -1165,23 +996,18 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os, subprocess, json, time
-          
           storage_token = os.environ['STORAGE_TOKEN']
           storage_owner = os.environ['STORAGE_OWNER']
           storage_repo  = os.environ['STORAGE_REPO']
           job_id = os.environ['JOB_ID']
           hls_dir = os.environ['WORK_DIR'] + '/hls'
-          
           seg_files = sorted([f for f in os.listdir(hls_dir) if (f.endswith('.bin') or '.bin.part' in f) and f != 'init.bin'])
           print(f"  Upload {len(seg_files)} segmentos")
-          
           r = subprocess.run(['curl','-sf','-H',f'Authorization: Bearer {storage_token}',
-            f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{job_id}'],
-            capture_output=True, text=True)
+            f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{job_id}'], capture_output=True, text=True)
           release = json.loads(r.stdout)
           upload_url = release['upload_url'].split('{')[0]
           existing = {a['name']: a['id'] for a in release.get('assets', [])}
-          
           ok = 0
           for fname in seg_files:
             fpath = os.path.join(hls_dir, fname)
@@ -1194,21 +1020,20 @@ jobs:
               '--max-time','120',f'{upload_url}?name={fname}','--data-binary',f'@{fpath}'], capture_output=True, text=True)
             if r.stdout.strip() == '201': ok += 1
             else: print(f"  ✗ {fname} HTTP {r.stdout.strip()}")
-          
           print(f"  ✅ {ok}/{len(seg_files)} segmentos")
           PYEOF
 
-      # ── Disparar lote 0 (usa STORAGE_GITHUB_TOKEN) ──────────────────────
+      # ── Disparar lote 0 com parent_run_id ───────────────────────────────
       - name: Disparar lote 0 (auto-recorrência)
         if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES == 'true'
         run: |
           python3 << 'PYEOF'
           import os, subprocess, json
-          
           job_id = os.environ['JOB_ID']
           total_batches = int(os.environ['TOTAL_BATCHES'])
           dispatch_token = os.environ['DISPATCH_TOKEN']
           github_repo = os.environ['GITHUB_REPOSITORY']
+          parent_run_id = os.environ['GITHUB_RUN_ID']
           
           payload = {
             'ref': 'main',
@@ -1217,51 +1042,45 @@ jobs:
               'upload_mode': 'batch_upload',
               'upload_batch': '0',
               'total_batches': str(total_batches),
+              'parent_run_id': parent_run_id,
               'video_url': '',
               'metadata': '{}',
               'file_indices': '',
             }
           }
           
-          r = subprocess.run([
-            'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
-            '-X', 'POST',
-            '-H', f'Authorization: Bearer {dispatch_token}',
-            '-H', 'Accept: application/vnd.github+json',
-            '-H', 'X-GitHub-Api-Version: 2022-11-28',
+          r = subprocess.run(['curl','-sf','-o','/dev/null','-w','%{http_code}','-X','POST',
+            '-H',f'Authorization: Bearer {dispatch_token}',
+            '-H','Accept: application/vnd.github+json',
+            '-H','X-GitHub-Api-Version: 2022-11-28',
             f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
-            '-d', json.dumps(payload),
-          ], capture_output=True, text=True)
+            '-d',json.dumps(payload)], capture_output=True, text=True)
           
           code = r.stdout.strip()
-          if code == '204':
-            print(f"  ✓ Lote 0/{total_batches} disparado com sucesso")
-          else:
-            print(f"  ✗ Erro ao disparar lote 0: HTTP {code}")
-            print(f"  stderr: {r.stderr[:200]}")
+          if code == '204': print(f"  ✓ Lote 0/{total_batches} disparado (run={parent_run_id})")
+          else: print(f"  ✗ Erro HTTP {code}: {r.stderr[:200]}")
           PYEOF
         env:
           DISPATCH_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
 
       # ── Disparar próximo lote (batch mode) ──────────────────────────────
       - name: '[BATCH] Disparar próximo lote'
         if: env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH != 'true'
         run: |
           NEXT_BATCH=$((${{ inputs.upload_batch }} + 1))
-          
           HTTP_CODE=$(curl -sf -o /dev/null -w '%{http_code}' \
             -X POST \
             -H "Authorization: Bearer ${{ secrets.STORAGE_GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/process.yml/dispatches" \
-            -d "{\"ref\":\"main\",\"inputs\":{\"job_id\":\"${{ inputs.job_id }}\",\"upload_mode\":\"batch_upload\",\"upload_batch\":\"$NEXT_BATCH\",\"total_batches\":\"${{ inputs.total_batches }}\",\"video_url\":\"\",\"metadata\":\"{}\",\"file_indices\":\"\"}}")
-          
+            -d "{\"ref\":\"main\",\"inputs\":{\"job_id\":\"${{ inputs.job_id }}\",\"upload_mode\":\"batch_upload\",\"upload_batch\":\"$NEXT_BATCH\",\"total_batches\":\"${{ inputs.total_batches }}\",\"parent_run_id\":\"${{ inputs.parent_run_id }}\",\"video_url\":\"\",\"metadata\":\"{}\",\"file_indices\":\"\"}}")
           if [ "$HTTP_CODE" = "204" ]; then
-            echo "  ✓ Lote $NEXT_BATCH/${{ inputs.total_batches }} disparado com sucesso"
+            echo "  ✓ Lote $NEXT_BATCH/${{ inputs.total_batches }} disparado"
           else
-            echo "  ✗ Erro ao disparar lote $NEXT_BATCH: HTTP $HTTP_CODE"
+            echo "  ✗ Erro HTTP $HTTP_CODE"
           fi
 
       # ── Registar no EdgeOne ─────────────────────────────────────────────
@@ -1278,12 +1097,8 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import json, os, urllib.request, urllib.error, datetime, time
-
           pipeline_api = os.environ.get('PIPELINE_API','').rstrip('/')
-          if not pipeline_api:
-            print('⚠ PIPELINE_API não configurado — ignorado')
-            exit(0)
-
+          if not pipeline_api: print('⚠ PIPELINE_API não configurado'); exit(0)
           work_dir = os.environ['WORK_DIR']
           cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id   = os.environ['JOB_ID']
@@ -1291,175 +1106,49 @@ jobs:
           seg_dur  = int(os.environ['SEG_DURATION'])
           eff_w    = int(os.environ['EFF_WIDTH'])
           eff_h    = int(os.environ['EFF_HEIGHT'])
-
           try:    metadata = json.loads(os.environ.get('METADATA','{}'))
           except: metadata = {}
-
           probe    = json.load(open(work_dir + '/probe_parsed.json'))
           nonces   = json.load(open(work_dir + '/nonces.json'))
           thumbs   = json.load(open(work_dir + '/thumbs_manifest.json'))
           cdn_urls = json.load(open(work_dir + '/cdn_urls.json'))
-
           content_id = metadata.get('contentId', job_id)
           seg_count  = len([k for k in nonces['nonces'] if k != 'init.bin'])
           thumb_urls = [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
-
           body = {
-            'contentId':    content_id,
-            'title':        metadata.get('title','Untitled'),
-            'description':  metadata.get('description',''),
-            'type':         metadata.get('type','movie'),
-            'year':         int(metadata.get('year') or datetime.datetime.now().year),
-            'lang':         metadata.get('lang','en'),
-            'duration':     round(probe['duration']),
-            'thumbnail':    thumb_urls[0] if thumb_urls else '',
-            'thumbnails':   thumb_urls,
-            'qualities':    [quality],
-            'width':        eff_w,
-            'height':       eff_h,
-            'codec':        'h264',
-            'fps':          probe['fps'],
-            'bitrate':      probe['bitrate'],
-            'segmentCount': seg_count,
-            'segDuration':  seg_dur,
-            'videoID':      content_id,
-            'cdnUrls':      cdn_urls,
-            'encrypted':    True,
-            'encryption':   'chacha20-chunk-v2',
-            'container':    'fmp4',
-            'segExt':       'bin',
-            'masterUrl':    f"{cdn_base}/{job_id}/master.m3u8",
-            'noncesUrl':    f"{cdn_base}/{job_id}/nonces.json",
+            'contentId':content_id,'title':metadata.get('title','Untitled'),'description':metadata.get('description',''),
+            'type':metadata.get('type','movie'),'year':int(metadata.get('year') or datetime.datetime.now().year),
+            'lang':metadata.get('lang','en'),'duration':round(probe['duration']),'thumbnail':thumb_urls[0] if thumb_urls else '',
+            'thumbnails':thumb_urls,'qualities':[quality],'width':eff_w,'height':eff_h,'codec':'h264','fps':probe['fps'],
+            'bitrate':probe['bitrate'],'segmentCount':seg_count,'segDuration':seg_dur,'videoID':content_id,'cdnUrls':cdn_urls,
+            'encrypted':True,'encryption':'chacha20-chunk-v2','container':'fmp4','segExt':'bin',
+            'masterUrl':f"{cdn_base}/{job_id}/master.m3u8",'noncesUrl':f"{cdn_base}/{job_id}/nonces.json",
           }
-
-          payload      = json.dumps(body).encode()
-          MAX_ATTEMPTS = 5
-          BACKOFF      = [5, 10, 20, 40]
-
-          for attempt in range(1, MAX_ATTEMPTS + 1):
-            req = urllib.request.Request(
-              f"{pipeline_api}/api/pipeline/register",
-              data=payload,
-              headers={
-                'Content-Type': 'application/json',
-                'X-API-Key':    os.environ.get('ADMIN_API_KEY',''),
-              },
-              method='POST'
-            )
+          payload = json.dumps(body).encode()
+          for attempt in range(1, 6):
+            req = urllib.request.Request(f"{pipeline_api}/api/pipeline/register", data=payload,
+              headers={'Content-Type':'application/json','X-API-Key':os.environ.get('ADMIN_API_KEY','')}, method='POST')
             try:
-              with urllib.request.urlopen(req, timeout=30) as r:
-                print(f"✓ Conteúdo registado ({r.status}) na tentativa {attempt}")
-                break
+              with urllib.request.urlopen(req, timeout=30) as r: print(f"✓ Conteúdo registado ({r.status})"); break
             except urllib.error.HTTPError as e:
-              body_err = e.read().decode()[:300]
-              print(f"⚠ Tentativa {attempt}/{MAX_ATTEMPTS} — HTTP {e.code}: {body_err}")
-              if e.code < 500 and e.code != 429:
-                print(f"  Erro de cliente ({e.code}) — sem retry")
-                break
-            except Exception as e:
-              print(f"⚠ Tentativa {attempt}/{MAX_ATTEMPTS} — {e}")
-            if attempt < MAX_ATTEMPTS:
-              wait = BACKOFF[attempt - 1]
-              print(f"  Aguardando {wait}s...")
-              time.sleep(wait)
-            else:
-              print(f"✗ Registo falhou após {MAX_ATTEMPTS} tentativas")
-
-          content_type  = metadata.get('type', 'movie')
-          season_num    = int(os.environ.get('SEASON_NUMBER', '0') or '0')
-          episode_nums  = os.environ.get('EPISODE_NUMBER', '').strip()
-          episode_title = os.environ.get('EPISODE_TITLE', '').strip()
-          file_indices  = os.environ.get('FILE_INDICES', '').strip()
-          IS_SERIES     = content_type in ('series', 'anime', 'dorama') and season_num > 0 and file_indices != ''
-
-          if IS_SERIES:
-            episode_list = [int(x) for x in episode_nums.split(',') if x.strip().isdigit()]
-            print(f"\n→ Registando série: contentId={content_id} | S{season_num:02d} | eps={episode_list}")
-
-            def api_call(endpoint, body_dict, label):
-              payload_s = json.dumps(body_dict).encode()
-              for attempt in range(1, 4):
-                req_s = urllib.request.Request(
-                  f"{pipeline_api}{endpoint}",
-                  data=payload_s,
-                  headers={'Content-Type': 'application/json', 'X-API-Key': os.environ.get('ADMIN_API_KEY','')},
-                  method='POST'
-                )
-                try:
-                  with urllib.request.urlopen(req_s, timeout=30) as r:
-                    resp = json.loads(r.read().decode())
-                    print(f"  ✓ {label} ({r.status})")
-                    return resp
-                except urllib.error.HTTPError as e:
-                  body_e = e.read().decode()[:200]
-                  if e.code == 409:
-                    print(f"  ℹ {label} já existe (409) — ok")
-                    return {'ok': True, 'exists': True}
-                  print(f"  ⚠ {label} tentativa {attempt} HTTP {e.code}: {body_e}")
-                  if e.code < 500: break
-                except Exception as e:
-                  print(f"  ⚠ {label} tentativa {attempt}: {e}")
-                time.sleep(3)
-              return None
-
-            api_call('/api/admin/season', {
-              'content_id':    content_id,
-              'season_number': season_num,
-              'title':         f"Temporada {season_num}",
-            }, f"Season {season_num}")
-
-            for ep_num in episode_list:
-              api_call('/api/admin/episode', {
-                'content_id':     content_id,
-                'season_number':  season_num,
-                'episode_number': ep_num,
-                'title':          episode_title or f"Episódio {ep_num}",
-                'duration':       round(probe['duration']),
-              }, f"Ep {ep_num}")
-
-            print(f"  ✅ Season + {len(episode_list)} episódio(s) registados")
+              if e.code < 500 and e.code != 429: print(f"  Erro cliente ({e.code})"); break
+              print(f"⚠ Tentativa {attempt} — HTTP {e.code}")
+            except Exception as e: print(f"⚠ Tentativa {attempt} — {e}")
+            time.sleep([5,10,20,40][attempt-1])
+          print("✓ Registo concluído")
           PYEOF
 
-      # ── Webhook ─────────────────────────────────────────────────────────
       - name: Notificar dispatcher (webhook FIFO)
         if: always()
         run: |
-          if [ -z "$PIPELINE_API" ]; then
-            echo "⚠ PIPELINE_API não configurado — webhook ignorado"
-            exit 0
-          fi
-
-          if [ "${{ job.status }}" = "success" ]; then
-            WEBHOOK_STATUS="done"
-          else
-            WEBHOOK_STATUS="failed"
-          fi
-
+          if [ -z "$PIPELINE_API" ]; then exit 0; fi
+          if [ "${{ job.status }}" = "success" ]; then WEBHOOK_STATUS="done"; else WEBHOOK_STATUS="failed"; fi
           WEBHOOK_URL="$(echo "$PIPELINE_API" | sed 's|/api/.*||; s|/$||')/webhook"
+          curl -sf -X POST -H "Content-Type: application/json" -H "x-api-key: ${ADMIN_API_KEY}" \
+            --max-time 20 --retry 3 --retry-delay 5 "${WEBHOOK_URL}" \
+            -d "{\"job_id\":\"${JOB_ID}\",\"status\":\"${WEBHOOK_STATUS}\"}"
+          echo "✓ Webhook enviado"
 
-          echo "→ POST ${WEBHOOK_URL} job_id=${JOB_ID} status=${WEBHOOK_STATUS}"
-
-          HTTP_CODE=$(curl -s -o /tmp/wh_resp.txt -w "%{http_code}" \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: ${ADMIN_API_KEY}" \
-            --max-time 20 \
-            --retry 3 \
-            --retry-delay 5 \
-            "${WEBHOOK_URL}" \
-            -d "{\"job_id\":\"${JOB_ID}\",\"status\":\"${WEBHOOK_STATUS}\"}")
-
-          echo "  HTTP ${HTTP_CODE}: $(cat /tmp/wh_resp.txt)"
-
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "✓ Slot libertado — próximo job na fila será despachado"
-          elif [ "$HTTP_CODE" = "404" ]; then
-            echo "ℹ Job não encontrado no dispatcher (job manual ou expirado) — ok"
-          else
-            echo "⚠ Webhook falhou (HTTP ${HTTP_CODE}) — slot libertado pelo watchdog em ~360min"
-          fi
-
-      # ── Cleanup ─────────────────────────────────────────────────────────
       - name: Cleanup
         if: always()
         run: |
