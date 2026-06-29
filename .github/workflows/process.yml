@@ -46,7 +46,7 @@ on:
         description: 'Índices dos ficheiros no torrent'
         required: false
         default: ''
-      # NOVOS: parâmetros para auto-recorrência
+      # INTERNOS: parâmetros para auto-recorrência
       upload_mode:
         description: 'INTERNO: modo de upload'
         required: false
@@ -127,7 +127,6 @@ jobs:
 
           print(f"  Lote {batch_index+1}/{total_batches}")
 
-          # Extrair batch
           batch_file = f'/tmp/batches/batch_{batch_index:03d}.tar'
           if not os.path.exists(batch_file):
             print(f"  ✗ Arquivo {batch_file} não encontrado")
@@ -159,14 +158,12 @@ jobs:
           upload_url = release['upload_url'].split('{')[0]
           existing = {a['name']: a['id'] for a in release.get('assets', [])}
 
-          # Upload com controle de rate limit
           ok = 0
           start_time = time.time()
           
           for i, fname in enumerate(seg_files):
             fpath = os.path.join(f'{work_dir}/hls', fname)
             
-            # Remover duplicado
             if fname in existing:
               subprocess.run([
                 'curl', '-sf', '-X', 'DELETE',
@@ -176,7 +173,6 @@ jobs:
               ], capture_output=True)
               time.sleep(0.5)
 
-            # Upload
             r = subprocess.run([
               'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
               '-X', 'POST',
@@ -196,7 +192,6 @@ jobs:
             elif code == '429':
               print(f"  ⚠ Rate limit - pausa 60s...")
               time.sleep(60)
-              # Retry
               r = subprocess.run([
                 'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
                 '-X', 'POST',
@@ -215,18 +210,11 @@ jobs:
 
           print(f"  ✅ Lote {batch_index+1}: {ok}/{len(seg_files)} uploaded")
 
-          # Verificar se é o último lote
           is_last = (batch_index + 1 >= total_batches)
           with open(github_env, 'a') as f:
             f.write(f"IS_LAST_BATCH={'true' if is_last else 'false'}\n")
             f.write(f"BATCH_OK={ok}\n")
           PYEOF
-
-      - name: '[BATCH] Notificar conclusão do lote'
-        if: env.IS_BATCH_MODE == 'true'
-        run: |
-          echo "  Lote ${{ env.BATCH_INDEX }} concluído"
-          echo "  Último lote: ${{ env.IS_LAST_BATCH }}"
 
       # ═══════════════════════════════════════════════════════════════════
       # MODO COMPLETO: download + encode + metadados + disparar lotes
@@ -246,7 +234,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends python3-libtorrent
           python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
-      # Coordinator (mantido igual)
+      # ── Coordinator ────────────────────────────────────────────────────
       - name: '[Coordinator] Detectar episódios e disparar jobs filhos'
         if: |
           env.IS_BATCH_MODE != 'true' &&
@@ -288,132 +276,297 @@ jobs:
           print(f"Coordinator: {metadata.get('title','?')} S{season_num:02d} | {url[:70]}...")
 
           ses = lt.session({'listen_interfaces': '0.0.0.0:6882'})
-          ses.apply_settings({'connections_limit':50,'active_downloads':1,'active_seeds':0})
+          try:
+            ses.apply_settings({'connections_limit':50,'active_downloads':1,'active_seeds':0})
+          except Exception as e:
+            print(f"  apply_settings parcial: {e}")
+
           os.makedirs('/tmp/coord_meta', exist_ok=True)
 
           if url.startswith('magnet:') or 'infohash:' in url:
             params = lt.parse_magnet_uri(url)
             params.save_path = '/tmp/coord_meta'
           else:
-            urllib.request.urlretrieve(url, '/tmp/coord.torrent')
+            torrent_path = '/tmp/coord.torrent'
+            urllib.request.urlretrieve(url, torrent_path)
+            ti = lt.torrent_info(torrent_path)
             params = lt.add_torrent_params()
-            params.ti = lt.torrent_info('/tmp/coord.torrent')
+            params.ti = ti
             params.save_path = '/tmp/coord_meta'
 
           params.flags = lt.torrent_flags.upload_mode | lt.torrent_flags.paused
           handle = ses.add_torrent(params)
           handle.resume()
 
+          print("  Aguardando metadados...")
           t0 = time.time()
           while not handle.status().has_metadata:
             if time.time() - t0 > 120:
-              print("ERRO: timeout metadados"); sys.exit(1)
+              print("ERRO: timeout metadados (120s)")
+              ses.remove_torrent(handle)
+              sys.exit(1)
             ses.wait_for_alert(1000)
+            elapsed = int(time.time() - t0)
+            if elapsed % 15 == 0 and elapsed > 0:
+              st = handle.status()
+              print(f"  ... {elapsed}s | peers: {st.num_peers}")
 
           info = handle.get_torrent_info()
-          fs = info.files()
+          fs   = info.files()
+          print(f"  Metadados OK: {info.name()} | {fs.num_files()} ficheiros | {info.total_size()//(1024*1024)} MB")
           ses.remove_torrent(handle)
 
           video_files = []
           for i in range(fs.num_files()):
-            ext = os.path.splitext(fs.file_path(i))[1].lower()
+            path = fs.file_path(i)
+            size = fs.file_size(i)
+            ext  = os.path.splitext(path)[1].lower()
             if ext in VIDEO_EXTS:
-              video_files.append({'index':i, 'path':fs.file_path(i), 'size':fs.file_size(i), 'name':os.path.basename(fs.file_path(i))})
+              video_files.append({'index': i, 'path': path, 'size': size, 'name': os.path.basename(path)})
 
-          if not video_files: print("ERRO: sem vídeos"); sys.exit(1)
+          if not video_files:
+            print("ERRO: nenhum ficheiro de vídeo nos metadados")
+            sys.exit(1)
+
+          print(f"  Vídeos encontrados: {len(video_files)}")
 
           def extract_ep(name):
-            for pat in [r'[Ss]\d+[Ee](\d+)', r'[Ee][Pp]?[\s._-]?(\d{1,3})', r'[\s._-](\d{2,3})[\s._-]']:
-              m = re.search(pat, os.path.splitext(name)[0], re.I)
-              if m: return int(m.group(1))
+            base = os.path.splitext(name)[0]
+            patterns = [
+              r'[Ss]\d+[Ee](\d+)',
+              r'[Ee][Pp]?[\s._-]?(\d{1,3})',
+              r'[\s._-](\d{2,3})[\s._-]',
+              r'^(\d{1,3})[\s._-]',
+              r'[\s._-](\d{1,3})\.',
+            ]
+            for pat in patterns:
+              m = re.search(pat, base, re.IGNORECASE)
+              if m:
+                return int(m.group(1))
             return None
 
-          for vf in video_files: vf['ep_num'] = extract_ep(vf['name'])
+          for vf in video_files:
+            vf['ep_num'] = extract_ep(vf['name'])
+
           video_files.sort(key=lambda x: (x['ep_num'] is None, x['ep_num'] or 0, x['name']))
 
           used_nums = {v['ep_num'] for v in video_files if v['ep_num'] is not None}
-          counter = 1
+          counter   = 1
           for vf in video_files:
             if vf['ep_num'] is None:
-              while counter in used_nums: counter += 1
-              vf['ep_num'] = counter; used_nums.add(counter); counter += 1
+              while counter in used_nums:
+                counter += 1
+              vf['ep_num'] = counter
+              used_nums.add(counter)
+              counter += 1
+
+          for vf in video_files:
+            print(f"  [{vf['index']:2d}] ep{vf['ep_num']:02d} | {vf['name']} | {vf['size']//(1024*1024)}MB")
+
+          def est(size):
+            return int(size * 0.55 * 1.17)
 
           batches, cur, cur_size = [], [], 0
           for vf in video_files:
-            e = int(vf['size'] * 0.55 * 1.17)
+            e = est(vf['size'])
             if cur and cur_size + e > BATCH_LIMIT:
-              batches.append(cur); cur, cur_size = [vf], e
-            else: cur.append(vf); cur_size += e
-          if cur: batches.append(cur)
+              batches.append(cur)
+              cur, cur_size = [vf], e
+            else:
+              cur.append(vf)
+              cur_size += e
+          if cur:
+            batches.append(cur)
 
-          safe_cid = re.sub(r'[^a-z0-9-]','',(content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
-          dispatcher_base = os.environ.get('PIPELINE_API','').rstrip('/').replace('/api','')
-          admin_key = os.environ.get('ADMIN_API_KEY','')
+          print(f"  Batches: {len(batches)}")
+          for i, b in enumerate(batches):
+            print(f"    Batch {i+1}: eps {[v['ep_num'] for v in b]} | ~{sum(v['size'] for v in b)//(1024*1024)}MB raw")
+
+          safe_cid   = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
           dispatched = 0
 
+          dispatcher_base = re.sub(r'/api/.*$', '', os.environ.get('PIPELINE_API','').rstrip('/'))
+          admin_key       = os.environ.get('ADMIN_API_KEY', '')
+
           for bi, batch in enumerate(batches):
-            child_id = f"{safe_cid}-s{season_num:02d}-ep{batch[0]['ep_num']:02d}-b{bi+1}"
+            indices_str = ','.join(str(v['index']) for v in batch)
+            ep_numbers  = ','.join(str(v['ep_num']) for v in batch)
+            first_ep    = batch[0]['ep_num']
+            child_id    = f"{safe_cid}-s{season_num:02d}-ep{first_ep:02d}-b{bi+1}"
+            child_meta  = {**metadata, 'contentId': content_id or safe_cid}
+
             payload = json.dumps({
-              'job_id':child_id, 'video_url':url,
-              'seg_duration':os.environ.get('INPUT_SEG','4'),
-              'max_encode_height':os.environ.get('INPUT_HEIGHT','720'),
-              'metadata':{**metadata,'contentId':content_id or safe_cid},
-              'season_number':str(season_num),
-              'episode_number':','.join(str(v['ep_num']) for v in batch),
-              'file_indices':','.join(str(v['index']) for v in batch),
+              'job_id':            child_id,
+              'video_url':         url,
+              'thumbnail_url':     os.environ.get('INPUT_THUMBNAIL',''),
+              'seg_duration':      os.environ.get('INPUT_SEG','4'),
+              'max_encode_height': os.environ.get('INPUT_HEIGHT','720'),
+              'warm_concurrency':  os.environ.get('INPUT_WARM','8'),
+              'metadata':          child_meta,
+              'season_number':     str(season_num),
+              'episode_number':    ep_numbers,
+              'episode_title':     '',
+              'file_indices':      indices_str,
             }).encode()
 
+            req = urllib.request.Request(
+              f"{dispatcher_base}/dispatch",
+              data=payload,
+              headers={
+                'Content-Type': 'application/json',
+                'x-api-key':    admin_key,
+                'User-Agent':   'StreamVault-Coordinator/3.0',
+              },
+              method='POST'
+            )
             try:
-              req = urllib.request.Request(f"{dispatcher_base}/dispatch", data=payload,
-                headers={'Content-Type':'application/json','x-api-key':admin_key}, method='POST')
               with urllib.request.urlopen(req, timeout=30) as r:
-                print(f"  ✓ Batch {bi+1} → {child_id}"); dispatched += 1
-            except Exception as e: print(f"  ✗ Batch {bi+1}: {e}")
-            time.sleep(0.5)
+                resp = json.loads(r.read().decode())
+                pos  = resp.get('queue_position', 0)
+                st   = resp.get('status', '?')
+                print(f"  ✓ Batch {bi+1} → {child_id} ({st} fila #{pos+1})")
+                dispatched += 1
+            except urllib.error.HTTPError as e:
+              print(f"  ✗ Batch {bi+1} HTTP {e.code}: {e.read().decode()[:200]}")
+            except Exception as e:
+              print(f"  ✗ Batch {bi+1} erro: {e}")
 
-          print(f"✅ {dispatched}/{len(batches)} jobs disparados")
+            if bi < len(batches) - 1:
+              time.sleep(1)
+
+          print(f"\n✅ Coordinator: {dispatched}/{len(batches)} jobs em fila FIFO")
           sys.exit(0)
           PYEOF
 
-      # Download (mantido igual)
+      # ── Download vídeo ─────────────────────────────────────────────────
       - name: '[Modo A] Descarregar vídeo'
         if: env.IS_BATCH_MODE != 'true' && inputs.video_url != ''
         run: |
           URL="${{ inputs.video_url }}"
           if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
+            echo "→ Modo torrent (libtorrent Python)"
             python3 << 'PYEOF'
-          import libtorrent as lt, os, sys, time, pathlib
-          url = os.environ['video_url_env']
+          import libtorrent as lt
+          import os, sys, time, pathlib
+
+          url      = os.environ['video_url_env']
           dest_dir = os.environ['WORK_DIR'] + '/incoming'
-          ses = lt.session({'listen_interfaces':'0.0.0.0:6881'})
-          ses.apply_settings({'connections_limit':200,'active_downloads':1,'active_seeds':0})
+          MAX_WAIT = 3600
+
+          ses = lt.session({
+            'listen_interfaces': '0.0.0.0:6881',
+            'alert_mask': lt.alert.category_t.status_notification |
+                          lt.alert.category_t.error_notification,
+          })
+          try:
+            ses.apply_settings({
+              'connections_limit': 200,
+              'active_downloads':  1,
+              'active_seeds':      0,
+            })
+          except Exception as e:
+            print(f"⚠ apply_settings parcial: {e}")
+
           params = lt.add_torrent_params()
           params.save_path = dest_dir
+
           if url.startswith('magnet:') or 'infohash:' in url:
-            params = lt.parse_magnet_uri(url); params.save_path = dest_dir
+            params = lt.parse_magnet_uri(url)
+            params.save_path = dest_dir
+            print(f"  Adicionando magnet: {url[:80]}...")
           else:
             import urllib.request
-            urllib.request.urlretrieve(url, '/tmp/input.torrent')
-            params.ti = lt.torrent_info('/tmp/input.torrent')
-          handle = ses.add_torrent(params); handle.set_sequential_download(True)
-          start_t = time.time()
+            torrent_path = '/tmp/input.torrent'
+            print(f"  Descarregando .torrent de: {url}")
+            urllib.request.urlretrieve(url, torrent_path)
+            info = lt.torrent_info(torrent_path)
+            params.ti = info
+            print(f"  Torrent: {info.name()} ({info.total_size() // (1024*1024)} MB)")
+
+          handle = ses.add_torrent(params)
+          handle.set_sequential_download(True)
+
+          file_indices_raw = os.environ.get('FILE_INDICES_ENV', '').strip()
+          if file_indices_raw:
+            print(f"  Modo worker — aguardando metadados para definir prioridades...")
+            t0_meta = time.time()
+            while not handle.status().has_metadata:
+              if time.time() - t0_meta > 60:
+                print("  ⚠ Timeout metadados — continuando sem prioridades")
+                break
+              ses.wait_for_alert(500)
+            if handle.status().has_metadata:
+              info_w    = handle.get_torrent_info()
+              num_files = info_w.files().num_files()
+              wanted    = set(int(x) for x in file_indices_raw.split(',') if x.strip().isdigit())
+              for fi in range(num_files):
+                prio = 7 if fi in wanted else 0
+                handle.file_priority(fi, prio)
+              print(f"  Prioridades definidas: {sorted(wanted)} activos | {num_files - len(wanted)} ignorados")
+            else:
+              print("  ⚠ Sem metadados — descarregando tudo (fallback)")
+
+          print(f"  Destino: {dest_dir}")
+          last_pct    = -1
+          start_t     = time.time()
+          stall_t     = time.time()
+          stall_bytes = 0
+
           while True:
-            s = handle.status()
-            if s.progress >= 1.0 or s.is_seeding: break
-            if time.time() - start_t > 3600:
-              if s.progress < 0.5: sys.exit(1)
+            s   = handle.status()
+            pct = int(s.progress * 100)
+            if pct != last_pct:
+              dl_kb   = s.download_rate // 1024
+              peers   = s.num_peers
+              elapsed = int(time.time() - start_t)
+              print(f"  [{elapsed:4d}s] {pct:3d}% | {dl_kb:6d} KB/s | peers: {peers}")
+              last_pct = pct
+            current_bytes = int(s.progress * (s.total_wanted or 1))
+            if current_bytes > stall_bytes:
+              stall_bytes = current_bytes
+              stall_t     = time.time()
+            elif s.num_peers > 0 and (time.time() - stall_t) > 300:
+              print('⚠ Sem progresso por 5 min — continuando...')
+              stall_t = time.time()
+            if s.is_seeding or s.progress >= 1.0:
+              print(f"✓ Download completo ({int(time.time()-start_t)}s)")
+              break
+            if (time.time() - start_t) > MAX_WAIT:
+              print(f'⚠ Timeout após {MAX_WAIT}s — progresso: {pct}%')
+              if pct == 0: sys.exit(1)
+              if pct < 50: sys.exit(1)
+              print('  Download parcial (>50%) — continuando...')
               break
             ses.wait_for_alert(1000)
+
           ses.remove_torrent(handle, 0)
-          videos = [f for f in pathlib.Path(dest_dir).rglob('*') if f.suffix.lower() in {'.mp4','.mkv','.avi','.mov'}]
-          if videos: print(f"✓ {len(videos)} vídeo(s)")
-          else: print("⚠ Nenhum vídeo encontrado")
+          files      = list(pathlib.Path(dest_dir).rglob('*'))
+          video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
+          videos     = [f for f in files if f.suffix.lower() in video_exts]
+          print(f"  Ficheiros descarregados: {len(files)}")
+          for v in videos:
+            print(f"  → Vídeo: {v} ({v.stat().st_size // (1024*1024)} MB)")
+          if not videos:
+            print('⚠ Nenhum vídeo encontrado no torrent')
+            for f in files:
+              print(f'  {f} ({f.stat().st_size} bytes)')
           PYEOF
           else
-            curl -L --retry 3 --retry-delay 5 -o "$WORK_DIR/incoming/input.video" "$URL"
+            echo "→ Modo URL directa (curl)"
+            curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
+              -o "$WORK_DIR/incoming/input.video" \
+              "$URL"
+            SIZE=$(stat -c%s "$WORK_DIR/incoming/input.video" 2>/dev/null || echo 0)
+            echo "✓ Download: $(du -sh $WORK_DIR/incoming/input.video | cut -f1) ($SIZE bytes)"
+            if [ "$SIZE" -lt 10000 ]; then
+              echo "⚠ Ficheiro demasiado pequeno — download falhou"
+              cat "$WORK_DIR/incoming/input.video" || true
+              exit 1
+            fi
           fi
         env:
-          video_url_env: ${{ inputs.video_url }}
+          video_url_env:    ${{ inputs.video_url }}
+          FILE_INDICES_ENV: ${{ inputs.file_indices }}
 
       - name: '[Modo B] Obter vídeo via Artifact'
         if: env.IS_BATCH_MODE != 'true' && inputs.video_url == ''
@@ -422,115 +575,444 @@ jobs:
           name: video-${{ inputs.job_id }}
           path: ${{ env.WORK_DIR }}/incoming/
 
-      - name: Detectar ficheiro de vídeo
+      - name: Detectar ficheiro de vídeo (+ extrair .rar/.zip se necessário)
         if: env.IS_BATCH_MODE != 'true'
         run: |
-          VIDEO_PATH=$(find "$WORK_DIR/incoming/" -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.mov" \) | head -1)
-          if [ -z "$VIDEO_PATH" ]; then echo "ERRO: sem vídeo"; exit 1; fi
-          echo "VIDEO_PATH=$VIDEO_PATH" >> $GITHUB_ENV
-          echo "✓ Vídeo: $VIDEO_PATH"
+          VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
 
+          FILE_INDICES="${{ inputs.file_indices }}"
+          if [ -n "$FILE_INDICES" ]; then
+            echo "→ Modo worker | file_indices: $FILE_INDICES"
+            echo "FILE_INDICES_ACTIVE=true" >> $GITHUB_ENV
+          else
+            echo "FILE_INDICES_ACTIVE=false" >> $GITHUB_ENV
+          fi
+
+          find_video() {
+            for ext in $VIDEO_EXTS; do
+              FOUND=$(find "$WORK_DIR/incoming/" -iname "*.${ext}" | head -1)
+              if [ -n "$FOUND" ]; then echo "$FOUND"; return; fi
+            done
+          }
+
+          VIDEO_PATH=$(find_video)
+
+          if [ -z "$VIDEO_PATH" ]; then
+            echo "Nenhum vídeo directo — procurando arquivos comprimidos..."
+            RAR_FILES=$(find "$WORK_DIR/incoming/" -iname "*.rar" | head -1)
+            ZIP_FILES=$(find "$WORK_DIR/incoming/" -iname "*.zip" | head -1)
+            TAR_FILES=$(find "$WORK_DIR/incoming/" -iname "*.tar*" | head -1)
+
+            if [ -n "$RAR_FILES" ]; then
+              echo "→ Encontrado .rar: $RAR_FILES"
+              sudo apt-get install -y --no-install-recommends unrar-free 2>/dev/null || \
+              sudo apt-get install -y --no-install-recommends unrar 2>/dev/null || true
+              EXTRACT_DIR="$WORK_DIR/incoming/extracted"
+              mkdir -p "$EXTRACT_DIR"
+              if command -v unrar &>/dev/null; then
+                unrar x -o+ "$RAR_FILES" "$EXTRACT_DIR/" && echo "✓ unrar concluído"
+              elif command -v unrar-free &>/dev/null; then
+                unrar-free -x "$RAR_FILES" "$EXTRACT_DIR/" && echo "✓ unrar-free concluído"
+              else
+                echo "  unrar não disponível — tentando bsdtar"
+                bsdtar -x -f "$RAR_FILES" -C "$EXTRACT_DIR/" && echo "✓ bsdtar concluído"
+              fi
+              VIDEO_PATH=$(find_video)
+            elif [ -n "$ZIP_FILES" ]; then
+              echo "→ Encontrado .zip: $ZIP_FILES"
+              EXTRACT_DIR="$WORK_DIR/incoming/extracted"
+              mkdir -p "$EXTRACT_DIR"
+              unzip -o "$ZIP_FILES" -d "$EXTRACT_DIR/"
+              VIDEO_PATH=$(find_video)
+            elif [ -n "$TAR_FILES" ]; then
+              echo "→ Encontrado .tar: $TAR_FILES"
+              EXTRACT_DIR="$WORK_DIR/incoming/extracted"
+              mkdir -p "$EXTRACT_DIR"
+              tar -xf "$TAR_FILES" -C "$EXTRACT_DIR/"
+              VIDEO_PATH=$(find_video)
+            fi
+          fi
+
+          if [ -z "$VIDEO_PATH" ]; then
+            echo "ERRO: nenhum vídeo encontrado após extracção"
+            find "$WORK_DIR/incoming/" -type f | head -20
+            exit 1
+          fi
+
+          echo "VIDEO_PATH=$VIDEO_PATH" >> $GITHUB_ENV
+          echo "✓ Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
+
+      # ── Probe ───────────────────────────────────────────────────────────
       - name: Probe do vídeo
         if: env.IS_BATCH_MODE != 'true'
         run: |
-          ffprobe -v quiet -print_format json -show_streams -show_format "$VIDEO_PATH" > "$WORK_DIR/probe.json"
+          ffprobe -v quiet -print_format json \
+            -show_streams -show_format "$VIDEO_PATH" \
+            > "$WORK_DIR/probe.json"
           python3 << 'PYEOF'
           import json, os
-          d = json.load(open(os.environ['WORK_DIR'] + '/probe.json'))
-          vs = next((s for s in d['streams'] if s['codec_type']=='video'), {})
+          d   = json.load(open(os.environ['WORK_DIR'] + '/probe.json'))
+          vs  = next((s for s in d['streams'] if s['codec_type'] == 'video'), {})
           fmt = d['format']
           num, den = map(int, vs.get('r_frame_rate','24/1').split('/'))
-          fps = num/den if den else num
-          probe = {'duration':float(fmt.get('duration',0)), 'width':vs.get('width',1920), 'height':vs.get('height',1080),
-                   'codec':vs.get('codec_name','unknown'), 'fps':fps, 'bitrate':int(fmt.get('bit_rate',0))}
-          json.dump(probe, open(os.environ['WORK_DIR']+'/probe_parsed.json','w'))
-          max_h = int(os.environ['MAX_H'])
-          eff_h = min(probe['height'], max_h)
-          eff_w = round((probe['width']/probe['height'])*eff_h/2)*2 if probe['height']>max_h else probe['width']
-          label = '4k' if eff_h>=2160 else '1440p' if eff_h>=1440 else '1080p' if eff_h>=1080 else '720p' if eff_h>=720 else f'{eff_h}p'
+          fps       = num / den if den else num
+          src_codec = vs.get('codec_name', 'unknown')
+          probe = {
+            'duration': float(fmt.get('duration', 0)),
+            'width':    vs.get('width',  1920),
+            'height':   vs.get('height', 1080),
+            'codec':    src_codec,
+            'fps':      fps,
+            'bitrate':  int(fmt.get('bit_rate', 0)),
+            'size':     int(fmt.get('size', 0)),
+          }
+          json.dump(probe, open(os.environ['WORK_DIR'] + '/probe_parsed.json','w'))
+          max_h      = int(os.environ['MAX_H'])
+          eff_h      = min(probe['height'], max_h)
+          will_scale = probe['height'] > max_h
+          eff_w      = round((probe['width'] / probe['height']) * eff_h / 2) * 2 if will_scale else probe['width']
+          h          = eff_h
+          label = ('4k'    if h>=2160 else
+                   '1440p' if h>=1440 else
+                   '1080p' if h>=1080 else
+                   '720p'  if h>=720  else
+                   '480p'  if h>=480  else
+                   '360p'  if h>=360  else f'{h}p')
           with open(os.environ['GITHUB_ENV'], 'a') as f:
-            for k,v in {'PROBE_DURATION':probe['duration'], 'EFF_HEIGHT':eff_h, 'EFF_WIDTH':eff_w, 
-                        'PROBE_FPS':fps, 'PROBE_CODEC':probe['codec'], 'PROBE_BITRATE':probe['bitrate'],
-                        'QUALITY_LABEL':label, 'WILL_SCALE':'true' if probe['height']>max_h else 'false'}.items():
-              f.write(f"{k}={v}\n")
+            f.write(f"PROBE_DURATION={probe['duration']}\n")
+            f.write(f"PROBE_WIDTH={probe['width']}\n")
+            f.write(f"PROBE_HEIGHT={probe['height']}\n")
+            f.write(f"PROBE_CODEC={probe['codec']}\n")
+            f.write(f"PROBE_FPS={fps}\n")
+            f.write(f"PROBE_BITRATE={probe['bitrate']}\n")
+            f.write(f"EFF_HEIGHT={eff_h}\n")
+            f.write(f"EFF_WIDTH={eff_w}\n")
+            f.write(f"WILL_SCALE={'true' if will_scale else 'false'}\n")
+            f.write(f"QUALITY_LABEL={label}\n")
+          print(f"✓ {probe['width']}x{probe['height']} | codec: {src_codec} | {fps:.2f}fps | {probe['duration']:.1f}s")
+          print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale}")
           PYEOF
 
-      - name: HLS encode (fMP4)
+      # ── HLS encode ─────────────────────────────────────────────────────
+      - name: HLS encode (fMP4 + libx264 superfast CRF26 + AAC 128k)
         if: env.IS_BATCH_MODE != 'true'
         run: |
           HLS_DIR="$WORK_DIR/hls"
-          SCALE_ARGS=""
-          [ "$WILL_SCALE" = "true" ] && SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}"
+          if [ "$WILL_SCALE" = "true" ]; then
+            SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}"
+          else
+            SCALE_ARGS=""
+          fi
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
-          ffmpeg -hide_banner -loglevel warning -stats -i "$VIDEO_PATH" $SCALE_ARGS \
-            -c:v libx264 -preset superfast -crf 26 -tune fastdecode -profile:v high -level 4.0 \
-            -pix_fmt yuv420p -g $GOP -keyint_min ${SEG_DURATION} -c:a aac -b:a 128k -ac 2 \
-            -f hls -hls_time ${SEG_DURATION} -hls_playlist_type vod -hls_segment_type fmp4 \
-            -hls_fmp4_init_filename "init.mp4" -hls_flags independent_segments \
-            -hls_segment_filename "$HLS_DIR/seg%05d.m4s" -y "$HLS_DIR/index.m3u8"
-          echo "✓ $(ls $HLS_DIR/*.m4s | wc -l) segmentos"
+          echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s)"
+          echo "  Re-encode para h264 (codec entrada: ${PROBE_CODEC}) — compatibilidade universal"
+          ffmpeg -hide_banner -loglevel warning -stats \
+            -i "$VIDEO_PATH" \
+            $SCALE_ARGS \
+            -c:v libx264 -preset superfast -crf 26 -tune fastdecode \
+            -profile:v high -level 4.0 \
+            -pix_fmt yuv420p \
+            -g $GOP -keyint_min ${SEG_DURATION} \
+            -c:a aac -b:a 128k -ac 2 \
+            -f hls \
+            -hls_time ${SEG_DURATION} \
+            -hls_playlist_type vod \
+            -hls_segment_type fmp4 \
+            -hls_fmp4_init_filename "init.mp4" \
+            -hls_flags independent_segments \
+            -hls_segment_filename "$HLS_DIR/seg%05d.m4s" \
+            -y "$HLS_DIR/index.m3u8"
+          echo "✓ $(ls $HLS_DIR/*.m4s | wc -l) segmentos .m4s gerados (fMP4 h264)"
+          echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
+      # ── Thumbnails ──────────────────────────────────────────────────────
       - name: Obter thumbnails
         if: env.IS_BATCH_MODE != 'true'
+        env:
+          INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
         run: |
           python3 << 'PYEOF'
           import subprocess, os, json
+
           thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
-          duration = float(os.environ['PROBE_DURATION'])
-          video = os.environ['VIDEO_PATH']
-          os.makedirs(thumb_dir, exist_ok=True)
-          t = max(1.0, duration * 0.07)
-          r = subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-ss',f'{t:.2f}','-i',video,
-            '-vframes','1','-vf','scale=1280:-2','-q:v','2','-y',f'{thumb_dir}/thumb_0.jpg'], capture_output=True)
-          thumbs = [{'path':f'{thumb_dir}/thumb_0.jpg','time':t,'index':0}] if r.returncode==0 else []
-          json.dump(thumbs, open(os.environ['WORK_DIR']+'/thumbs_manifest.json','w'))
+          duration  = float(os.environ['PROBE_DURATION'])
+          video     = os.environ['VIDEO_PATH']
+          thumb_url = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
+          thumbs    = []
+
+          def is_valid_image(path, min_bytes=5000):
+            if not os.path.exists(path): return False
+            if os.path.getsize(path) < min_bytes: return False
+            with open(path, 'rb') as f:
+              h = f.read(12)
+            return (
+              h[:3] == b'\xff\xd8\xff' or
+              h[:4] == b'\x89PNG' or
+              h[:4] == b'RIFF' or
+              h[:6] in (b'GIF87a', b'GIF89a') or
+              h[:2] == b'BM' or
+              h[:4] in (b'II*\x00', b'MM\x00*') or
+              h[:4] in (b'\x00\x00\x00\x18', b'\x00\x00\x00\x1c',
+                        b'\x00\x00\x00\x20') or
+              (len(h) >= 8 and h[4:8] == b'ftyp')
+            )
+
+          def extract_frame(video, out_path, time_pct=0.07):
+            t = max(1.0, duration * time_pct)
+            r = subprocess.run([
+              'ffmpeg', '-hide_banner', '-loglevel', 'error',
+              '-ss', f'{t:.2f}', '-i', video,
+              '-vframes', '1', '-vf', 'scale=1280:-2', '-q:v', '2',
+              '-y', out_path,
+            ], capture_output=True)
+            return r.returncode == 0 and is_valid_image(out_path)
+
+          if thumb_url:
+            out = f"{thumb_dir}/thumb_0.jpg"
+            print(f"  Descarregando thumbnail: {thumb_url}")
+            subprocess.run([
+              'curl', '-L', '--retry', '5', '--retry-delay', '3', '--max-time', '60',
+              '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              '-H', 'Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+              '-H', 'Accept-Language: pt-BR,pt;q=0.9,en;q=0.8',
+              '-H', 'Sec-Fetch-Dest: image',
+              '-H', 'Sec-Fetch-Mode: no-cors',
+              '-H', 'Sec-Fetch-Site: cross-site',
+              '-o', out, thumb_url,
+            ], capture_output=True)
+            if not is_valid_image(out):
+              if os.path.exists(out): os.remove(out)
+              subprocess.run([
+                'wget', '--timeout=30', '--tries=5',
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                '-O', out, thumb_url,
+              ], capture_output=True)
+            if is_valid_image(out):
+              norm = f"{thumb_dir}/thumb_0_norm.jpg"
+              subprocess.run([
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-i', out, '-vframes', '1', '-q:v', '2',
+                '-vf', "scale='min(1280,iw)':-2", '-y', norm,
+              ], capture_output=True)
+              if is_valid_image(norm): os.replace(norm, out)
+              thumbs.append({'path': out, 'time': 0, 'index': 0})
+              print(f"✓ Thumbnail válida ({os.path.getsize(out)//1024} KB)")
+            else:
+              if os.path.exists(out): os.remove(out)
+              print(f"⚠ Thumbnail inválida — extraindo frame do vídeo")
+              if extract_frame(video, out):
+                thumbs.append({'path': out, 'time': 0, 'index': 0})
+                print(f"✓ Frame extraído como fallback: {os.path.getsize(out)//1024} KB")
+              else:
+                print('✗ Falha ao extrair frame de fallback')
+          else:
+            out = f"{thumb_dir}/thumb_0.jpg"
+            print(f"  Extraindo frame a 7% ({duration*0.07:.1f}s)")
+            if extract_frame(video, out, time_pct=0.07):
+              thumbs.append({'path': out, 'time': duration*0.07, 'index': 0})
+              print(f"✓ Frame extraído: {os.path.getsize(out)//1024} KB")
+            elif extract_frame(video, out, time_pct=0.05):
+              thumbs.append({'path': out, 'time': duration*0.05, 'index': 0})
+              print(f"✓ Frame extraído a 5%: {os.path.getsize(out)//1024} KB")
+            else:
+              print('✗ Não foi possível extrair frame')
+
+          json.dump(thumbs, open(os.environ['WORK_DIR'] + '/thumbs_manifest.json', 'w'))
           print(f"✓ {len(thumbs)} thumbnail(s)")
           PYEOF
 
+      # ── Encrypt ─────────────────────────────────────────────────────────
       - name: Encriptar segmentos → .bin
         if: env.IS_BATCH_MODE != 'true'
         run: |
           python3 << 'PYEOF'
           import os, json, secrets, struct
           from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
-          key = bytes.fromhex(os.environ['CHACHA_KEY'])
+          key_hex = os.environ['CHACHA_KEY']
+          if len(key_hex) != 64:
+            raise ValueError('CHACHA_KEY inválido')
+          key     = bytes.fromhex(key_hex)
           hls_dir = os.environ['WORK_DIR'] + '/hls'
           CHUNK_SIZE = 65536
 
           def encrypt_segment(data, key):
             chunks = [data[i:i+CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
-            out = [struct.pack('<I', len(chunks))]
+            out    = [struct.pack('<I', len(chunks))]
             for chunk in chunks:
-              nonce = secrets.token_bytes(12)
+              nonce       = secrets.token_bytes(12)
               nonce_field = struct.pack('<I', 1) + nonce
-              ct = Cipher(algorithms.ChaCha20(key, nonce_field), None).encryptor().update(chunk)
-              out.append(nonce); out.append(struct.pack('<I', len(ct))); out.append(ct)
+              ct          = Cipher(algorithms.ChaCha20(key, nonce_field), None).encryptor().update(chunk)
+              out.append(nonce)
+              out.append(struct.pack('<I', len(ct)))
+              out.append(ct)
             return b''.join(out)
 
           nonce_map = {}
-          init_src = os.path.join(hls_dir, 'init.mp4')
+          init_src  = os.path.join(hls_dir, 'init.mp4')
+          init_dst  = os.path.join(hls_dir, 'init.bin')
           if os.path.exists(init_src):
             with open(init_src, 'rb') as f: data = f.read()
             encrypted = encrypt_segment(data, key)
-            with open(os.path.join(hls_dir, 'init.bin'), 'wb') as f: f.write(encrypted)
+            with open(init_dst, 'wb') as f: f.write(encrypted)
             os.remove(init_src)
-            nonce_map['init.bin'] = f"chunked:{struct.unpack('<I', encrypted[:4])[0]}"
+            n_chunks = struct.unpack('<I', encrypted[:4])[0]
+            nonce_map['init.bin'] = f'chunked:{n_chunks}'
+            print(f"  init.mp4 → init.bin ({len(data)//1024}KB → {n_chunks} chunks)")
 
           seg_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.m4s'))
-          for fname in seg_files:
-            with open(os.path.join(hls_dir, fname), 'rb') as f: data = f.read()
-            encrypted = encrypt_segment(data, key)
-            bin_name = fname.replace('.m4s', '.bin')
-            with open(os.path.join(hls_dir, bin_name), 'wb') as f: f.write(encrypted)
-            os.remove(os.path.join(hls_dir, fname))
-            nonce_map[bin_name] = f"chunked:{struct.unpack('<I', encrypted[:4])[0]}"
+          if not seg_files: raise RuntimeError('Nenhum .m4s encontrado')
 
-          json.dump({'key_id':os.environ['CHACHA_KEY'][:8], 'format':'chunk-v2', 'nonces':nonce_map},
-                    open(os.environ['WORK_DIR']+'/nonces.json','w'))
-          print(f"✓ {len(seg_files)} encriptados")
+          for fname in seg_files:
+            src      = os.path.join(hls_dir, fname)
+            bin_name = fname.replace('.m4s', '.bin')
+            dst      = os.path.join(hls_dir, bin_name)
+            with open(src, 'rb') as f: data = f.read()
+            encrypted = encrypt_segment(data, key)
+            with open(dst, 'wb') as f: f.write(encrypted)
+            os.remove(src)
+            n_chunks = struct.unpack('<I', encrypted[:4])[0]
+            nonce_map[bin_name] = f'chunked:{n_chunks}'
+            print(f"  {fname} → {bin_name} ({len(data)//1024}KB → {n_chunks} chunks)")
+
+          out = {'key_id': os.environ['CHACHA_KEY'][:8], 'format': 'chunk-v2', 'nonces': nonce_map}
+          json.dump(out, open(os.environ['WORK_DIR'] + '/nonces.json','w'))
+          print(f"✓ {len(seg_files)} segmentos + init encriptados (chunk-v2, fMP4)")
           PYEOF
 
-      # ── NOVO: Verificar necessidade de lotes ────────────────────────────
+      # ── Split >1.9GB ────────────────────────────────────────────────────
+      - name: Dividir ficheiros .bin > 1.9GB em partes
+        if: env.IS_BATCH_MODE != 'true'
+        run: |
+          python3 << 'PYEOF'
+          import os, json
+
+          hls_dir    = os.environ['WORK_DIR'] + '/hls'
+          SPLIT_SIZE = int(1.9 * 1024 * 1024 * 1024)
+          split_map  = {}
+
+          for fname in sorted(os.listdir(hls_dir)):
+            if not fname.endswith('.bin'):
+              continue
+            fpath = os.path.join(hls_dir, fname)
+            size  = os.path.getsize(fpath)
+            if size <= SPLIT_SIZE:
+              continue
+
+            print(f"  ⚠ {fname} ({size/(1024**3):.2f}GB) excede limite — dividindo...")
+            n_parts = 0
+            with open(fpath, 'rb') as src:
+              part_idx = 0
+              while True:
+                chunk = src.read(SPLIT_SIZE)
+                if not chunk:
+                  break
+                part_name = f"{fname}.part{part_idx:03d}"
+                with open(os.path.join(hls_dir, part_name), 'wb') as dst:
+                  dst.write(chunk)
+                part_idx += 1
+                n_parts += 1
+
+            os.remove(fpath)
+            split_map[fname] = n_parts
+            print(f"    → {n_parts} partes ({fname}.part000 .. {fname}.part{n_parts-1:03d})")
+
+          manifest_path = os.environ['WORK_DIR'] + '/split_manifest.json'
+          json.dump(split_map, open(manifest_path, 'w'))
+
+          if split_map:
+            print(f"✓ {len(split_map)} ficheiro(s) dividido(s): {split_map}")
+          else:
+            print("✓ Nenhum ficheiro excede o limite — split não necessário")
+          PYEOF
+
+      # ── Reescrever index.m3u8 ───────────────────────────────────────────
+      - name: Reescrever index.m3u8 com URLs CDN
+        if: env.IS_BATCH_MODE != 'true'
+        run: |
+          python3 << 'PYEOF'
+          import re, os
+          hls_dir  = os.environ['WORK_DIR'] + '/hls'
+          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
+          job_id   = os.environ['JOB_ID']
+          with open(hls_dir + '/index.m3u8') as f:
+            content = f.read()
+          content = re.sub(
+            r'#EXT-X-MAP:URI="init\.mp4"',
+            f'#EXT-X-MAP:URI="{cdn_base}/{job_id}/hls/init.bin"',
+            content
+          )
+          content = re.sub(
+            r'^(seg\d+)\.m4s$',
+            lambda m: f"{cdn_base}/{job_id}/hls/{m.group(1)}.bin",
+            content, flags=re.MULTILINE
+          )
+          with open(hls_dir + '/index.m3u8', 'w') as f:
+            f.write(content)
+          print(f"✓ index.m3u8 reescrito → {cdn_base}/{job_id}/hls/")
+          PYEOF
+
+      # ── Gerar master.m3u8 ───────────────────────────────────────────────
+      - name: Gerar master.m3u8
+        if: env.IS_BATCH_MODE != 'true'
+        run: |
+          python3 << 'PYEOF'
+          import os
+          cdn_base  = os.environ['CDN_DOMAIN'].rstrip('/')
+          job_id    = os.environ['JOB_ID']
+          work_dir  = os.environ['WORK_DIR']
+          eff_w     = os.environ['EFF_WIDTH']
+          eff_h     = os.environ['EFF_HEIGHT']
+          hls_dir   = work_dir + '/hls'
+          bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin')
+          if bin_files:
+            total_bytes  = sum(os.path.getsize(os.path.join(hls_dir, f)) for f in bin_files)
+            seg_dur      = int(os.environ['SEG_DURATION'])
+            duration_s   = len(bin_files) * seg_dur
+            real_bitrate = int((total_bytes * 8) / duration_s) if duration_s > 0 else 2000000
+          else:
+            real_bitrate = int(os.environ.get('PROBE_BITRATE') or 2000000)
+          master = '\n'.join([
+            '#EXTM3U',
+            '#EXT-X-VERSION:6',
+            '',
+            f'#EXT-X-STREAM-INF:BANDWIDTH={real_bitrate},RESOLUTION={eff_w}x{eff_h}',
+            f'{cdn_base}/{job_id}/hls/index.m3u8',
+          ])
+          with open(work_dir + '/master.m3u8', 'w') as f:
+            f.write(master)
+          print(f"✓ master.m3u8: {eff_w}x{eff_h} | {real_bitrate}bps (EXT-X-VERSION:6 fMP4)")
+          print(f"  → CDN: {cdn_base}/{job_id}/master.m3u8")
+          PYEOF
+
+      # ── Gerar cdn_urls.json ─────────────────────────────────────────────
+      - name: Gerar cdn_urls.json
+        if: env.IS_BATCH_MODE != 'true'
+        run: |
+          python3 << 'PYEOF'
+          import os, json
+          work_dir = os.environ['WORK_DIR']
+          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
+          job_id   = os.environ['JOB_ID']
+
+          nonces = json.load(open(work_dir + '/nonces.json'))
+          thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
+
+          cdn_urls = (
+            [
+              f"{cdn_base}/{job_id}/master.m3u8",
+              f"{cdn_base}/{job_id}/nonces.json",
+              f"{cdn_base}/{job_id}/hls/index.m3u8",
+              f"{cdn_base}/{job_id}/hls/init.bin",
+            ] +
+            [f"{cdn_base}/{job_id}/hls/{bn}" for bn in nonces['nonces'] if bn != 'init.bin'] +
+            [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
+          )
+
+          json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
+          print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs")
+          PYEOF
+
+      # ── Verificar necessidade de lotes ──────────────────────────────────
       - name: Verificar necessidade de upload em lotes
         if: env.IS_BATCH_MODE != 'true'
         id: check_batches
@@ -540,8 +1022,10 @@ jobs:
           hls_dir = os.environ['WORK_DIR'] + '/hls'
           thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
           
-          seg_count = len([f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin'])
-          meta_count = 6  # master, index, nonces, split_manifest, init.bin, thumb
+          seg_count = len([f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin' and '.part' not in f])
+          meta_count = 4
+          if os.path.exists(os.path.join(hls_dir, 'init.bin')): meta_count += 1
+          if os.path.isdir(thumb_dir): meta_count += len([f for f in os.listdir(thumb_dir) if f.endswith('.jpg')])
           
           total = meta_count + seg_count
           NEED_BATCHES = total > 900
@@ -553,11 +1037,12 @@ jobs:
             f.write(f"TOTAL_BATCHES={total_batches}\n")
             f.write(f"SEG_COUNT={seg_count}\n")
           
-          print(f"  Segmentos: {seg_count} | {'⚠ Precisa lotes' if NEED_BATCHES else '✓ Upload normal'}")
+          print(f"  Segmentos: {seg_count} | Metadados: {meta_count} | Total: {total}")
+          print(f"  {'⚠ Precisa lotes' if NEED_BATCHES else '✓ Upload normal'}")
           if NEED_BATCHES: print(f"  Lotes: {total_batches} × {BATCH_SIZE} segmentos")
           PYEOF
 
-      # ── NOVO: Upload de metadados (sempre) ──────────────────────────────
+      # ── Upload metadados + init.bin + thumbs ────────────────────────────
       - name: Upload metadados + init.bin + thumbs
         if: env.IS_BATCH_MODE != 'true'
         env:
@@ -576,7 +1061,6 @@ jobs:
           quality = os.environ['QUALITY_LABEL']
           github_env = os.environ['GITHUB_ENV']
           
-          # Coletar metadados
           meta_files = []
           for fname, mime in [
             ('master.m3u8', 'application/vnd.apple.mpegurl'),
@@ -600,7 +1084,6 @@ jobs:
           
           print(f"  Upload {len(meta_files)} metadados → Release {job_id}")
           
-          # Criar/obter release
           r = subprocess.run([
             'curl', '-sf', '-H', f'Authorization: Bearer {storage_token}',
             '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28',
@@ -633,17 +1116,10 @@ jobs:
             else: print(f"  ✗ {fname} HTTP {r.stdout.strip()}")
           
           print(f"  ✅ {ok}/{len(meta_files)} metadados")
-          
-          # Verificar se precisa de lotes
-          need_batches = os.environ.get('NEED_BATCHES','false') == 'true'
-          if not need_batches:
-            print("  Modo normal — todos assets serão uploaded no step seguinte")
-            with open(github_env, 'a') as f: f.write("METADATA_UPLOADED=true\n")
-          else:
-            with open(github_env, 'a') as f: f.write("METADATA_UPLOADED=true\n")
+          with open(github_env, 'a') as f: f.write("METADATA_UPLOADED=true\n")
           PYEOF
 
-      # ── NOVO: Empacotar segmentos para lotes ───────────────────────────
+      # ── Empacotar segmentos para lotes ──────────────────────────────────
       - name: Empacotar segmentos em lotes
         if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES == 'true'
         run: |
@@ -679,7 +1155,7 @@ jobs:
           path: /tmp/uploader_batches/
           retention-days: 1
 
-      # ── NOVO: Upload normal (≤900 assets) ──────────────────────────────
+      # ── Upload normal (≤900 assets) ─────────────────────────────────────
       - name: Upload segmentos (modo normal)
         if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true'
         env:
@@ -722,8 +1198,8 @@ jobs:
           print(f"  ✅ {ok}/{len(seg_files)} segmentos")
           PYEOF
 
-      # ── NOVO: Disparar próximo lote ────────────────────────────────────
-      - name: Disparar próximo lote (auto-recorrência)
+      # ── Disparar lote 0 (usa STORAGE_GITHUB_TOKEN) ──────────────────────
+      - name: Disparar lote 0 (auto-recorrência)
         if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES == 'true'
         run: |
           python3 << 'PYEOF'
@@ -731,10 +1207,9 @@ jobs:
           
           job_id = os.environ['JOB_ID']
           total_batches = int(os.environ['TOTAL_BATCHES'])
-          github_token = os.environ['GITHUB_TOKEN']
+          dispatch_token = os.environ['DISPATCH_TOKEN']
           github_repo = os.environ['GITHUB_REPOSITORY']
           
-          # Disparar lote 0
           payload = {
             'ref': 'main',
             'inputs': {
@@ -751,7 +1226,7 @@ jobs:
           r = subprocess.run([
             'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
             '-X', 'POST',
-            '-H', f'Authorization: Bearer {github_token}',
+            '-H', f'Authorization: Bearer {dispatch_token}',
             '-H', 'Accept: application/vnd.github+json',
             '-H', 'X-GitHub-Api-Version: 2022-11-28',
             f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
@@ -760,58 +1235,235 @@ jobs:
           
           code = r.stdout.strip()
           if code == '204':
-            print(f"  ✓ Lote 0/{total_batches} disparado")
+            print(f"  ✓ Lote 0/{total_batches} disparado com sucesso")
           else:
             print(f"  ✗ Erro ao disparar lote 0: HTTP {code}")
             print(f"  stderr: {r.stderr[:200]}")
           PYEOF
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISPATCH_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
 
-      # ── NOVO: Continuar para próximo lote (batch mode) ─────────────────
+      # ── Disparar próximo lote (batch mode) ──────────────────────────────
       - name: '[BATCH] Disparar próximo lote'
         if: env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH != 'true'
         run: |
           NEXT_BATCH=$((${{ inputs.upload_batch }} + 1))
           
-          curl -sf -o /dev/null -w '%{http_code}' \
+          HTTP_CODE=$(curl -sf -o /dev/null -w '%{http_code}' \
             -X POST \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Authorization: Bearer ${{ secrets.STORAGE_GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/process.yml/dispatches" \
-            -d "{\"ref\":\"main\",\"inputs\":{\"job_id\":\"${{ inputs.job_id }}\",\"upload_mode\":\"batch_upload\",\"upload_batch\":\"$NEXT_BATCH\",\"total_batches\":\"${{ inputs.total_batches }}\",\"video_url\":\"\",\"metadata\":\"{}\",\"file_indices\":\"\"}}"
+            -d "{\"ref\":\"main\",\"inputs\":{\"job_id\":\"${{ inputs.job_id }}\",\"upload_mode\":\"batch_upload\",\"upload_batch\":\"$NEXT_BATCH\",\"total_batches\":\"${{ inputs.total_batches }}\",\"video_url\":\"\",\"metadata\":\"{}\",\"file_indices\":\"\"}}")
           
-          echo "  ✓ Lote $NEXT_BATCH/${{ inputs.total_batches }} disparado"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          if [ "$HTTP_CODE" = "204" ]; then
+            echo "  ✓ Lote $NEXT_BATCH/${{ inputs.total_batches }} disparado com sucesso"
+          else
+            echo "  ✗ Erro ao disparar lote $NEXT_BATCH: HTTP $HTTP_CODE"
+          fi
 
-      # ── Registar no EdgeOne (após último lote ou modo normal) ──────────
-      - name: Registar no EdgeOne
+      # ── Registar no EdgeOne ─────────────────────────────────────────────
+      - name: Registar no EdgeOne (Turso + KV)
         if: |
           (env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true') ||
           (env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH == 'true')
+        env:
+          METADATA:       ${{ inputs.metadata }}
+          SEASON_NUMBER:  ${{ inputs.season_number }}
+          EPISODE_NUMBER: ${{ inputs.episode_number }}
+          EPISODE_TITLE:  ${{ inputs.episode_title }}
+          FILE_INDICES:   ${{ inputs.file_indices }}
         run: |
-          echo "✓ Job completo — registando..."
-          # Manter a lógica existente de registo EdgeOne aqui
           python3 << 'PYEOF'
-          print("✓ Conteúdo registado (placeholder)")
+          import json, os, urllib.request, urllib.error, datetime, time
+
+          pipeline_api = os.environ.get('PIPELINE_API','').rstrip('/')
+          if not pipeline_api:
+            print('⚠ PIPELINE_API não configurado — ignorado')
+            exit(0)
+
+          work_dir = os.environ['WORK_DIR']
+          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
+          job_id   = os.environ['JOB_ID']
+          quality  = os.environ['QUALITY_LABEL']
+          seg_dur  = int(os.environ['SEG_DURATION'])
+          eff_w    = int(os.environ['EFF_WIDTH'])
+          eff_h    = int(os.environ['EFF_HEIGHT'])
+
+          try:    metadata = json.loads(os.environ.get('METADATA','{}'))
+          except: metadata = {}
+
+          probe    = json.load(open(work_dir + '/probe_parsed.json'))
+          nonces   = json.load(open(work_dir + '/nonces.json'))
+          thumbs   = json.load(open(work_dir + '/thumbs_manifest.json'))
+          cdn_urls = json.load(open(work_dir + '/cdn_urls.json'))
+
+          content_id = metadata.get('contentId', job_id)
+          seg_count  = len([k for k in nonces['nonces'] if k != 'init.bin'])
+          thumb_urls = [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
+
+          body = {
+            'contentId':    content_id,
+            'title':        metadata.get('title','Untitled'),
+            'description':  metadata.get('description',''),
+            'type':         metadata.get('type','movie'),
+            'year':         int(metadata.get('year') or datetime.datetime.now().year),
+            'lang':         metadata.get('lang','en'),
+            'duration':     round(probe['duration']),
+            'thumbnail':    thumb_urls[0] if thumb_urls else '',
+            'thumbnails':   thumb_urls,
+            'qualities':    [quality],
+            'width':        eff_w,
+            'height':       eff_h,
+            'codec':        'h264',
+            'fps':          probe['fps'],
+            'bitrate':      probe['bitrate'],
+            'segmentCount': seg_count,
+            'segDuration':  seg_dur,
+            'videoID':      content_id,
+            'cdnUrls':      cdn_urls,
+            'encrypted':    True,
+            'encryption':   'chacha20-chunk-v2',
+            'container':    'fmp4',
+            'segExt':       'bin',
+            'masterUrl':    f"{cdn_base}/{job_id}/master.m3u8",
+            'noncesUrl':    f"{cdn_base}/{job_id}/nonces.json",
+          }
+
+          payload      = json.dumps(body).encode()
+          MAX_ATTEMPTS = 5
+          BACKOFF      = [5, 10, 20, 40]
+
+          for attempt in range(1, MAX_ATTEMPTS + 1):
+            req = urllib.request.Request(
+              f"{pipeline_api}/api/pipeline/register",
+              data=payload,
+              headers={
+                'Content-Type': 'application/json',
+                'X-API-Key':    os.environ.get('ADMIN_API_KEY',''),
+              },
+              method='POST'
+            )
+            try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                print(f"✓ Conteúdo registado ({r.status}) na tentativa {attempt}")
+                break
+            except urllib.error.HTTPError as e:
+              body_err = e.read().decode()[:300]
+              print(f"⚠ Tentativa {attempt}/{MAX_ATTEMPTS} — HTTP {e.code}: {body_err}")
+              if e.code < 500 and e.code != 429:
+                print(f"  Erro de cliente ({e.code}) — sem retry")
+                break
+            except Exception as e:
+              print(f"⚠ Tentativa {attempt}/{MAX_ATTEMPTS} — {e}")
+            if attempt < MAX_ATTEMPTS:
+              wait = BACKOFF[attempt - 1]
+              print(f"  Aguardando {wait}s...")
+              time.sleep(wait)
+            else:
+              print(f"✗ Registo falhou após {MAX_ATTEMPTS} tentativas")
+
+          content_type  = metadata.get('type', 'movie')
+          season_num    = int(os.environ.get('SEASON_NUMBER', '0') or '0')
+          episode_nums  = os.environ.get('EPISODE_NUMBER', '').strip()
+          episode_title = os.environ.get('EPISODE_TITLE', '').strip()
+          file_indices  = os.environ.get('FILE_INDICES', '').strip()
+          IS_SERIES     = content_type in ('series', 'anime', 'dorama') and season_num > 0 and file_indices != ''
+
+          if IS_SERIES:
+            episode_list = [int(x) for x in episode_nums.split(',') if x.strip().isdigit()]
+            print(f"\n→ Registando série: contentId={content_id} | S{season_num:02d} | eps={episode_list}")
+
+            def api_call(endpoint, body_dict, label):
+              payload_s = json.dumps(body_dict).encode()
+              for attempt in range(1, 4):
+                req_s = urllib.request.Request(
+                  f"{pipeline_api}{endpoint}",
+                  data=payload_s,
+                  headers={'Content-Type': 'application/json', 'X-API-Key': os.environ.get('ADMIN_API_KEY','')},
+                  method='POST'
+                )
+                try:
+                  with urllib.request.urlopen(req_s, timeout=30) as r:
+                    resp = json.loads(r.read().decode())
+                    print(f"  ✓ {label} ({r.status})")
+                    return resp
+                except urllib.error.HTTPError as e:
+                  body_e = e.read().decode()[:200]
+                  if e.code == 409:
+                    print(f"  ℹ {label} já existe (409) — ok")
+                    return {'ok': True, 'exists': True}
+                  print(f"  ⚠ {label} tentativa {attempt} HTTP {e.code}: {body_e}")
+                  if e.code < 500: break
+                except Exception as e:
+                  print(f"  ⚠ {label} tentativa {attempt}: {e}")
+                time.sleep(3)
+              return None
+
+            api_call('/api/admin/season', {
+              'content_id':    content_id,
+              'season_number': season_num,
+              'title':         f"Temporada {season_num}",
+            }, f"Season {season_num}")
+
+            for ep_num in episode_list:
+              api_call('/api/admin/episode', {
+                'content_id':     content_id,
+                'season_number':  season_num,
+                'episode_number': ep_num,
+                'title':          episode_title or f"Episódio {ep_num}",
+                'duration':       round(probe['duration']),
+              }, f"Ep {ep_num}")
+
+            print(f"  ✅ Season + {len(episode_list)} episódio(s) registados")
           PYEOF
 
-      # ── Webhook ────────────────────────────────────────────────────────
-      - name: Notificar dispatcher
+      # ── Webhook ─────────────────────────────────────────────────────────
+      - name: Notificar dispatcher (webhook FIFO)
         if: always()
         run: |
-          [ -z "$PIPELINE_API" ] && exit 0
-          if [ "${{ job.status }}" = "success" ]; then STATUS="done"; else STATUS="failed"; fi
-          WEBHOOK_URL="$(echo "$PIPELINE_API" | sed 's|/api/.*||; s|/$||')/webhook"
-          curl -sf -X POST -H "Content-Type: application/json" -H "x-api-key: ${ADMIN_API_KEY}" \
-            --max-time 20 "${WEBHOOK_URL}" \
-            -d "{\"job_id\":\"${JOB_ID}\",\"status\":\"${STATUS}\"}"
-          echo "✓ Webhook enviado"
+          if [ -z "$PIPELINE_API" ]; then
+            echo "⚠ PIPELINE_API não configurado — webhook ignorado"
+            exit 0
+          fi
 
-      # ── Cleanup ────────────────────────────────────────────────────────
+          if [ "${{ job.status }}" = "success" ]; then
+            WEBHOOK_STATUS="done"
+          else
+            WEBHOOK_STATUS="failed"
+          fi
+
+          WEBHOOK_URL="$(echo "$PIPELINE_API" | sed 's|/api/.*||; s|/$||')/webhook"
+
+          echo "→ POST ${WEBHOOK_URL} job_id=${JOB_ID} status=${WEBHOOK_STATUS}"
+
+          HTTP_CODE=$(curl -s -o /tmp/wh_resp.txt -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ADMIN_API_KEY}" \
+            --max-time 20 \
+            --retry 3 \
+            --retry-delay 5 \
+            "${WEBHOOK_URL}" \
+            -d "{\"job_id\":\"${JOB_ID}\",\"status\":\"${WEBHOOK_STATUS}\"}")
+
+          echo "  HTTP ${HTTP_CODE}: $(cat /tmp/wh_resp.txt)"
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✓ Slot libertado — próximo job na fila será despachado"
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "ℹ Job não encontrado no dispatcher (job manual ou expirado) — ok"
+          else
+            echo "⚠ Webhook falhou (HTTP ${HTTP_CODE}) — slot libertado pelo watchdog em ~360min"
+          fi
+
+      # ── Cleanup ─────────────────────────────────────────────────────────
       - name: Cleanup
         if: always()
-        run: rm -rf "$WORK_DIR" /tmp/batches/ 2>/dev/null; echo "✓ Limpo"
+        run: |
+          rm -rf "$WORK_DIR"
+          rm -rf /tmp/batches/ 2>/dev/null || true
+          rm -f /tmp/wh_resp.txt
+          echo "✓ Workspace limpo"
