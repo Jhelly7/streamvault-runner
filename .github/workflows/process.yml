@@ -1296,10 +1296,10 @@ jobs:
 
       - name: Notificar dispatcher (webhook FIFO)
         if: |
-          always() && (
+          (success() || failure()) && (
             (env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true') ||
             (env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH == 'true') ||
-            (job.status != 'success')
+            failure()
           )
         continue-on-error: true
         run: |
