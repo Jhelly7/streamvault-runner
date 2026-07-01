@@ -986,7 +986,7 @@ jobs:
         with:
           name: segs-${{ inputs.job_id }}
           path: /tmp/uploader_batches/
-          retention-days: 3
+          retention-days: 5
 
       - name: Upload segmentos (modo normal)
         if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true'
@@ -1295,7 +1295,12 @@ jobs:
           PYEOF
 
       - name: Notificar dispatcher (webhook FIFO)
-        if: always()
+        if: |
+          always() && (
+            (env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true') ||
+            (env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH == 'true') ||
+            (job.status != 'success')
+          )
         continue-on-error: true
         run: |
           if [ -z "$PIPELINE_API" ]; then
