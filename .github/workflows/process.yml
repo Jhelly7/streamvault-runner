@@ -471,7 +471,6 @@ jobs:
             print(f"  Torrent: {info.name()} ({info.total_size() // (1024*1024)} MB)")
 
           handle = ses.add_torrent(params)
-          handle.set_sequential_download(True)
 
           file_indices_raw = os.environ.get('FILE_INDICES_ENV', '').strip()
           if file_indices_raw:
