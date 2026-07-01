@@ -110,6 +110,7 @@ jobs:
           name: segs-${{ inputs.job_id }}
           path: /tmp/batches/
           run-id: ${{ inputs.parent_run_id }}
+          github-token: ${{ secrets.STORAGE_GITHUB_TOKEN }}
 
       - name: '[BATCH] Extrair lote e fazer upload'
         if: env.IS_BATCH_MODE == 'true'
