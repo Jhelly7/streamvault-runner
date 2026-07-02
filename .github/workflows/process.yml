@@ -131,7 +131,10 @@ jobs:
           work_dir      = os.environ['WORK_DIR']
           github_env    = os.environ['GITHUB_ENV']
 
-          print(f"  Lote {batch_index+1}/{total_batches}")
+          # Cada lote usa a sua própria release: {job_id}-bN
+          # Isso evita o limite de 2GB por release do GitHub.
+          batch_tag = f"{job_id}-b{batch_index}"
+          print(f"  Lote {batch_index+1}/{total_batches} → release: {batch_tag}")
 
           batch_file = f'/tmp/batches/batch_{batch_index:03d}.tar'
           if not os.path.exists(batch_file):
@@ -147,22 +150,43 @@ jobs:
                              if f.endswith('.bin') or '.bin.part' in f])
           print(f"  {len(seg_files)} segmentos extraídos")
 
+          # Criar release {job_id}-bN (nova, sem assets anteriores para colidir)
           r = subprocess.run([
-            'curl', '-sf',
+            'curl', '-sf', '-X', 'POST',
             '-H', f'Authorization: Bearer {storage_token}',
             '-H', 'Accept: application/vnd.github+json',
             '-H', 'X-GitHub-Api-Version: 2022-11-28',
-            f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{job_id}',
+            f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases',
+            '-d', json.dumps({
+              'tag_name':   batch_tag,
+              'name':       batch_tag,
+              'body':       f'jobId={job_id} | batch={batch_index}',
+              'draft':      False,
+              'prerelease': False,
+            }),
           ], capture_output=True, text=True)
 
-          if r.returncode != 0:
-            print(f"  ✗ Release {job_id} não encontrada")
-            print(r.stderr[:300])
+          if r.returncode != 0 or not r.stdout.strip():
+            # Release pode já existir (retry de lote falhado) — tentar obter
+            print(f"  ⚠ Criar release falhou — a tentar obter release existente...")
+            r = subprocess.run([
+              'curl', '-sf',
+              '-H', f'Authorization: Bearer {storage_token}',
+              '-H', 'Accept: application/vnd.github+json',
+              '-H', 'X-GitHub-Api-Version: 2022-11-28',
+              f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{batch_tag}',
+            ], capture_output=True, text=True)
+
+          try:
+            release = json.loads(r.stdout)
+            upload_url = release['upload_url'].split('{')[0]
+          except Exception as e:
+            print(f"  ✗ Não foi possível obter upload_url: {e}")
+            print(f"  Resposta: {r.stdout[:300]}")
             exit(1)
 
-          release = json.loads(r.stdout)
-          upload_url = release['upload_url'].split('{')[0]
           existing = {a['name']: a['id'] for a in release.get('assets', [])}
+          print(f"  ✓ Release {batch_tag} pronta | assets existentes: {len(existing)}")
 
           ok = 0
           start_time = time.time()
@@ -170,6 +194,7 @@ jobs:
           for i, fname in enumerate(seg_files):
             fpath = os.path.join(f'{work_dir}/hls', fname)
 
+            # Se asset já existe (retry), apagar antes de re-upload
             if fname in existing:
               subprocess.run([
                 'curl', '-sf', '-X', 'DELETE',
@@ -177,7 +202,7 @@ jobs:
                 '-H', 'Accept: application/vnd.github+json',
                 f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{existing[fname]}',
               ], capture_output=True)
-              time.sleep(0.5)
+              time.sleep(0.3)
 
             r = subprocess.run([
               'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
@@ -195,6 +220,39 @@ jobs:
               if ok % 50 == 0:
                 elapsed = time.time() - start_time
                 print(f"  ... {ok}/{len(seg_files)} ({elapsed:.0f}s)")
+            elif code == '422':
+              # 422 = asset já existe com este nome (race condition) — apagar e retry
+              print(f"  ⚠ {fname} 422 (duplicado) — a apagar e retentar...")
+              r2 = subprocess.run([
+                'curl', '-sf',
+                '-H', f'Authorization: Bearer {storage_token}',
+                '-H', 'Accept: application/vnd.github+json',
+                f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{batch_tag}',
+              ], capture_output=True, text=True)
+              try:
+                fresh_assets = {a['name']: a['id'] for a in json.loads(r2.stdout).get('assets', [])}
+                if fname in fresh_assets:
+                  subprocess.run([
+                    'curl', '-sf', '-X', 'DELETE',
+                    '-H', f'Authorization: Bearer {storage_token}',
+                    f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{fresh_assets[fname]}',
+                  ], capture_output=True)
+                  time.sleep(0.5)
+                  r3 = subprocess.run([
+                    'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
+                    '-X', 'POST',
+                    '-H', f'Authorization: Bearer {storage_token}',
+                    '-H', 'Content-Type: application/octet-stream',
+                    '--max-time', '120',
+                    f'{upload_url}?name={fname}',
+                    '--data-binary', f'@{fpath}',
+                  ], capture_output=True, text=True)
+                  if r3.stdout.strip() == '201':
+                    ok += 1
+                  else:
+                    print(f"  ✗ {fname} HTTP {r3.stdout.strip()} após retry 422")
+              except Exception as e:
+                print(f"  ✗ {fname} erro no retry 422: {e}")
             elif code == '429':
               print(f"  ⚠ Rate limit - pausa 60s...")
               time.sleep(60)
@@ -210,11 +268,11 @@ jobs:
               if r.stdout.strip() == '201':
                 ok += 1
               else:
-                print(f"  ✗ {fname} HTTP {r.stdout.strip()} após retry")
+                print(f"  ✗ {fname} HTTP {r.stdout.strip()} após retry 429")
             else:
               print(f"  ✗ {fname} HTTP {code}")
 
-          print(f"  ✅ Lote {batch_index+1}: {ok}/{len(seg_files)} uploaded")
+          print(f"  ✅ Lote {batch_index+1}: {ok}/{len(seg_files)} uploaded → {batch_tag}")
 
           is_last = (batch_index + 1 >= total_batches)
           with open(github_env, 'a') as f:
@@ -814,14 +872,43 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import re, os
-          hls_dir  = os.environ['WORK_DIR'] + '/hls'
-          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
-          job_id   = os.environ['JOB_ID']
+          hls_dir     = os.environ['WORK_DIR'] + '/hls'
+          cdn_base    = os.environ['CDN_DOMAIN'].rstrip('/')
+          job_id      = os.environ['JOB_ID']
+          need_batches = os.environ.get('NEED_BATCHES', 'false') == 'true'
+          BATCH_SIZE  = 500
+
           with open(hls_dir + '/index.m3u8') as f: content = f.read()
-          content = re.sub(r'#EXT-X-MAP:URI="init\.mp4"', f'#EXT-X-MAP:URI="{cdn_base}/{job_id}/hls/init.bin"', content)
-          content = re.sub(r'^(seg\d+)\.m4s$', lambda m: f"{cdn_base}/{job_id}/hls/{m.group(1)}.bin", content, flags=re.MULTILINE)
+
+          # init.bin sempre na release principal {job_id} — é metadata, não segmento
+          content = re.sub(
+            r'#EXT-X-MAP:URI="init\.mp4"',
+            f'#EXT-X-MAP:URI="{cdn_base}/{job_id}/hls/init.bin"',
+            content
+          )
+
+          if need_batches:
+            # Cada segmento aponta para a release do seu lote: {job_id}-bN
+            # seg_number = int(nome) → lote = seg_number // BATCH_SIZE
+            def seg_url(m):
+              seg_name   = m.group(1)            # ex: seg00500
+              seg_number = int(seg_name[3:])     # ex: 500
+              batch_idx  = seg_number // BATCH_SIZE
+              release    = f"{job_id}-b{batch_idx}"
+              return f"{cdn_base}/{release}/hls/{seg_name}.bin"
+
+            content = re.sub(r'^(seg\d+)\.m4s$', seg_url, content, flags=re.MULTILINE)
+            print(f"✓ index.m3u8 reescrito com URLs por lote (-b0, -b1, ...) → {cdn_base}/{job_id}-bN/hls/")
+          else:
+            # Modo normal: release única {job_id}
+            content = re.sub(
+              r'^(seg\d+)\.m4s$',
+              lambda m: f"{cdn_base}/{job_id}/hls/{m.group(1)}.bin",
+              content, flags=re.MULTILINE
+            )
+            print(f"✓ index.m3u8 reescrito (release única) → {cdn_base}/{job_id}/hls/")
+
           with open(hls_dir + '/index.m3u8', 'w') as f: f.write(content)
-          print(f"✓ index.m3u8 reescrito → {cdn_base}/{job_id}/hls/")
           PYEOF
 
       - name: Gerar master.m3u8
@@ -855,17 +942,39 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os, json
-          work_dir = os.environ['WORK_DIR']
-          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
-          job_id   = os.environ['JOB_ID']
+          work_dir     = os.environ['WORK_DIR']
+          cdn_base     = os.environ['CDN_DOMAIN'].rstrip('/')
+          job_id       = os.environ['JOB_ID']
+          need_batches = os.environ.get('NEED_BATCHES', 'false') == 'true'
+          BATCH_SIZE   = 500
+
           nonces = json.load(open(work_dir + '/nonces.json'))
           thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
-          cdn_urls = ([f"{cdn_base}/{job_id}/master.m3u8", f"{cdn_base}/{job_id}/nonces.json",
-            f"{cdn_base}/{job_id}/hls/index.m3u8", f"{cdn_base}/{job_id}/hls/init.bin"] +
-            [f"{cdn_base}/{job_id}/hls/{bn}" for bn in nonces['nonces'] if bn != 'init.bin'] +
-            [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))])
+
+          # Metadados e init.bin sempre na release principal {job_id}
+          cdn_urls = [
+            f"{cdn_base}/{job_id}/master.m3u8",
+            f"{cdn_base}/{job_id}/nonces.json",
+            f"{cdn_base}/{job_id}/hls/index.m3u8",
+            f"{cdn_base}/{job_id}/hls/init.bin",
+          ]
+
+          # Segmentos: se batch, cada um aponta para {job_id}-bN; senão para {job_id}
+          seg_names = sorted(bn for bn in nonces['nonces'] if bn != 'init.bin')
+          for bn in seg_names:
+            seg_number = int(bn[3:bn.index('.')]) if '.' in bn else int(bn[3:])
+            if need_batches:
+              batch_idx = seg_number // BATCH_SIZE
+              release   = f"{job_id}-b{batch_idx}"
+            else:
+              release = job_id
+            cdn_urls.append(f"{cdn_base}/{release}/hls/{bn}")
+
+          # Thumbnails sempre na release principal
+          cdn_urls += [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
+
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
-          print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs")
+          print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs {'(multi-release)' if need_batches else '(release única)'}")
           PYEOF
 
       - name: Verificar necessidade de upload em lotes
