@@ -1138,37 +1138,49 @@ jobs:
         if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES == 'true'
         run: |
           python3 << 'PYEOF'
-          import os, subprocess, json
-          job_id = os.environ['JOB_ID']
+          import os, subprocess, json, time
+          job_id        = os.environ['JOB_ID']
           total_batches = int(os.environ['TOTAL_BATCHES'])
           dispatch_token = os.environ['DISPATCH_TOKEN']
-          github_repo = os.environ['GITHUB_REPOSITORY']
+          github_repo   = os.environ['GITHUB_REPOSITORY']
           parent_run_id = os.environ['GITHUB_RUN_ID']
 
           payload = {
             'ref': 'main',
             'inputs': {
-              'job_id': job_id,
-              'upload_mode': 'batch_upload',
-              'upload_batch': '0',
+              'job_id':        job_id,
+              'upload_mode':   'batch_upload',
+              'upload_batch':  '0',
               'total_batches': str(total_batches),
               'parent_run_id': parent_run_id,
-              'video_url': '',
-              'metadata': '{}',
-              'file_indices': '',
+              'video_url':     '',
+              'metadata':      '{}',
+              'file_indices':  '',
             }
           }
 
-          r = subprocess.run(['curl','-sf','-o','/dev/null','-w','%{http_code}','-X','POST',
-            '-H',f'Authorization: Bearer {dispatch_token}',
-            '-H','Accept: application/vnd.github+json',
-            '-H','X-GitHub-Api-Version: 2022-11-28',
-            f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
-            '-d',json.dumps(payload)], capture_output=True, text=True)
-
-          code = r.stdout.strip()
-          if code == '204': print(f"  ✓ Lote 0/{total_batches} disparado (run={parent_run_id})")
-          else: print(f"  ✗ Erro HTTP {code}: {r.stderr[:200]}")
+          for attempt in range(1, 5):
+            r = subprocess.run([
+              'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
+              '-H', f'Authorization: Bearer {dispatch_token}',
+              '-H', 'Accept: application/vnd.github+json',
+              '-H', 'X-GitHub-Api-Version: 2022-11-28',
+              f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
+              '-d', json.dumps(payload),
+            ], capture_output=True, text=True)
+            code = r.stdout.strip()
+            if code == '204':
+              print(f"  ✓ Lote 0/{total_batches} disparado (run={parent_run_id})")
+              break
+            elif code.startswith('5') or code == '':
+              wait = [10, 30, 60][attempt - 1] if attempt <= 3 else 60
+              print(f"  ⚠ Tentativa {attempt}/4 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
+              time.sleep(wait)
+            else:
+              print(f"  ✗ Erro HTTP {code} (não retry): {r.stderr[:200]}")
+              break
+          else:
+            print(f"  ✗ Lote 0 não disparado após 4 tentativas — verificar GitHub API")
           PYEOF
         env:
           DISPATCH_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
@@ -1180,18 +1192,85 @@ jobs:
         if: env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH != 'true'
         run: |
           NEXT_BATCH=$((${{ inputs.upload_batch }} + 1))
-          HTTP_CODE=$(curl -sf -o /dev/null -w '%{http_code}' \
-            -X POST \
-            -H "Authorization: Bearer ${{ secrets.STORAGE_GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/process.yml/dispatches" \
-            -d "{\"ref\":\"main\",\"inputs\":{\"job_id\":\"${{ inputs.job_id }}\",\"upload_mode\":\"batch_upload\",\"upload_batch\":\"$NEXT_BATCH\",\"total_batches\":\"${{ inputs.total_batches }}\",\"parent_run_id\":\"${{ inputs.parent_run_id }}\",\"video_url\":\"\",\"metadata\":\"{}\",\"file_indices\":\"\"}}")
-          if [ "$HTTP_CODE" = "204" ]; then
-            echo "  ✓ Lote $NEXT_BATCH/${{ inputs.total_batches }} disparado"
-          else
-            echo "  ✗ Erro HTTP $HTTP_CODE"
-          fi
+          for attempt in 1 2 3 4; do
+            HTTP_CODE=$(curl -sf -o /dev/null -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${{ secrets.STORAGE_GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/process.yml/dispatches" \
+              -d "{\"ref\":\"main\",\"inputs\":{\"job_id\":\"${{ inputs.job_id }}\",\"upload_mode\":\"batch_upload\",\"upload_batch\":\"$NEXT_BATCH\",\"total_batches\":\"${{ inputs.total_batches }}\",\"parent_run_id\":\"${{ inputs.parent_run_id }}\",\"video_url\":\"\",\"metadata\":\"{}\",\"file_indices\":\"\"}}" \
+              2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "204" ]; then
+              echo "  ✓ Lote $NEXT_BATCH/${{ inputs.total_batches }} disparado (tentativa $attempt)"
+              break
+            elif [[ "$HTTP_CODE" =~ ^5 ]] || [ "$HTTP_CODE" = "000" ]; then
+              case $attempt in
+                1) WAIT=10 ;; 2) WAIT=30 ;; 3) WAIT=60 ;; *) WAIT=60 ;;
+              esac
+              echo "  ⚠ Tentativa $attempt/4 — HTTP $HTTP_CODE — aguarda ${WAIT}s..."
+              sleep $WAIT
+            else
+              echo "  ✗ Erro HTTP $HTTP_CODE (não retry)"
+              break
+            fi
+          done
+
+      # ── Eliminar artifact após último lote ──────────────────────────────
+      # O artifact segs-{job_id} é temporário (só serve para transferir
+      # segmentos do job principal para os jobs de batch). Depois do último
+      # lote fazer upload, o artifact já não é necessário e ocupa espaço
+      # no limite de storage do repositório (privado: 500MB free tier;
+      # público: sem limite prático). Eliminar aqui liberta espaço imediato.
+      - name: '[BATCH] Eliminar artifact temporário'
+        if: env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH == 'true'
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess, json
+
+          github_repo    = os.environ['GITHUB_REPOSITORY']
+          dispatch_token = os.environ['DISPATCH_TOKEN']
+          job_id         = os.environ['JOB_ID']
+          artifact_name  = f"segs-{job_id}"
+
+          # Descobrir artifact ID pelo nome
+          r = subprocess.run([
+            'curl', '-sf',
+            '-H', f'Authorization: Bearer {dispatch_token}',
+            '-H', 'Accept: application/vnd.github+json',
+            '-H', 'X-GitHub-Api-Version: 2022-11-28',
+            f'https://api.github.com/repos/{github_repo}/actions/artifacts?name={artifact_name}&per_page=5',
+          ], capture_output=True, text=True)
+
+          try:
+            artifacts = json.loads(r.stdout).get('artifacts', [])
+          except Exception:
+            print(f"  ⚠ Não foi possível listar artifacts: {r.stdout[:200]}")
+            raise SystemExit(0)
+
+          if not artifacts:
+            print(f"  ⚠ Artifact '{artifact_name}' não encontrado (já eliminado?)")
+            raise SystemExit(0)
+
+          for art in artifacts:
+            art_id = art['id']
+            r2 = subprocess.run([
+              'curl', '-sf', '-X', 'DELETE',
+              '-H', f'Authorization: Bearer {dispatch_token}',
+              '-H', 'Accept: application/vnd.github+json',
+              '-H', 'X-GitHub-Api-Version: 2022-11-28',
+              f'https://api.github.com/repos/{github_repo}/actions/artifacts/{art_id}',
+            ], capture_output=True, text=True)
+            if r2.returncode == 0:
+              size_mb = art.get('size_in_bytes', 0) // (1024 * 1024)
+              print(f"  ✓ Artifact '{artifact_name}' eliminado (ID={art_id}, {size_mb}MB libertados)")
+            else:
+              print(f"  ⚠ Falha ao eliminar artifact ID={art_id}: {r2.stderr[:100]}")
+          PYEOF
+        env:
+          DISPATCH_TOKEN:     ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:  ${{ github.repository }}
 
       # ── Aquecer cache (Cloudflare Worker) — 2 passagens ─────────────────
       # Roda apenas quando o conteúdo está completo e publicamente acessível
