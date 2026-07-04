@@ -1154,7 +1154,7 @@ jobs:
               'total_batches': str(total_batches),
               'parent_run_id': parent_run_id,
               'video_url':     '',
-              'metadata':      '{}',
+              'metadata':      os.environ.get('METADATA', '{}'),
               'file_indices':  '',
             }
           }
@@ -1183,38 +1183,77 @@ jobs:
             print(f"  ✗ Lote 0 não disparado após 4 tentativas — verificar GitHub API")
           PYEOF
         env:
-          DISPATCH_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          DISPATCH_TOKEN:    ${{ secrets.STORAGE_GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ID:     ${{ github.run_id }}
+          METADATA:          ${{ inputs.metadata }}
 
       # ── Disparar próximo lote (batch mode) ──────────────────────────────
       - name: '[BATCH] Disparar próximo lote'
         if: env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH != 'true'
+        env:
+          DISPATCH_TOKEN:    ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          METADATA:          ${{ inputs.metadata }}
+          JOB_ID_INPUT:      ${{ inputs.job_id }}
+          NEXT_BATCH:        ${{ inputs.upload_batch }}
+          TOTAL_BATCHES:     ${{ inputs.total_batches }}
+          PARENT_RUN_ID:     ${{ inputs.parent_run_id }}
         run: |
-          NEXT_BATCH=$((${{ inputs.upload_batch }} + 1))
-          for attempt in 1 2 3 4; do
-            HTTP_CODE=$(curl -sf -o /dev/null -w '%{http_code}' \
-              -X POST \
-              -H "Authorization: Bearer ${{ secrets.STORAGE_GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/process.yml/dispatches" \
-              -d "{\"ref\":\"main\",\"inputs\":{\"job_id\":\"${{ inputs.job_id }}\",\"upload_mode\":\"batch_upload\",\"upload_batch\":\"$NEXT_BATCH\",\"total_batches\":\"${{ inputs.total_batches }}\",\"parent_run_id\":\"${{ inputs.parent_run_id }}\",\"video_url\":\"\",\"metadata\":\"{}\",\"file_indices\":\"\"}}" \
-              2>/dev/null || echo "000")
-            if [ "$HTTP_CODE" = "204" ]; then
-              echo "  ✓ Lote $NEXT_BATCH/${{ inputs.total_batches }} disparado (tentativa $attempt)"
+          python3 << 'PYEOF'
+          import os, subprocess, json, time
+
+          next_batch    = int(os.environ['NEXT_BATCH']) + 1
+          total_batches = int(os.environ['TOTAL_BATCHES'])
+          job_id        = os.environ['JOB_ID_INPUT']
+          dispatch_token = os.environ['DISPATCH_TOKEN']
+          github_repo   = os.environ['GITHUB_REPOSITORY']
+          parent_run_id = os.environ['PARENT_RUN_ID']
+          metadata_raw  = os.environ.get('METADATA', '{}')
+
+          # Validar que metadata é JSON válido — se não for, usar {}
+          try:
+            json.loads(metadata_raw)
+          except Exception:
+            metadata_raw = '{}'
+
+          payload = {
+            'ref': 'main',
+            'inputs': {
+              'job_id':        job_id,
+              'upload_mode':   'batch_upload',
+              'upload_batch':  str(next_batch),
+              'total_batches': str(total_batches),
+              'parent_run_id': parent_run_id,
+              'video_url':     '',
+              'metadata':      metadata_raw,
+              'file_indices':  '',
+            }
+          }
+
+          for attempt in range(1, 5):
+            r = subprocess.run([
+              'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
+              '-H', f'Authorization: Bearer {dispatch_token}',
+              '-H', 'Accept: application/vnd.github+json',
+              '-H', 'X-GitHub-Api-Version: 2022-11-28',
+              f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
+              '-d', json.dumps(payload),
+            ], capture_output=True, text=True)
+            code = r.stdout.strip()
+            if code == '204':
+              print(f"  ✓ Lote {next_batch}/{total_batches} disparado (tentativa {attempt})")
               break
-            elif [[ "$HTTP_CODE" =~ ^5 ]] || [ "$HTTP_CODE" = "000" ]; then
-              case $attempt in
-                1) WAIT=10 ;; 2) WAIT=30 ;; 3) WAIT=60 ;; *) WAIT=60 ;;
-              esac
-              echo "  ⚠ Tentativa $attempt/4 — HTTP $HTTP_CODE — aguarda ${WAIT}s..."
-              sleep $WAIT
-            else
-              echo "  ✗ Erro HTTP $HTTP_CODE (não retry)"
+            elif code.startswith('5') or code == '':
+              wait = [10, 30, 60][attempt - 1] if attempt <= 3 else 60
+              print(f"  ⚠ Tentativa {attempt}/4 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
+              time.sleep(wait)
+            else:
+              print(f"  ✗ Erro HTTP {code} (não retry)")
               break
-            fi
-          done
+          else:
+            print(f"  ✗ Lote {next_batch} não disparado após 4 tentativas")
+          PYEOF
 
       # ── Eliminar artifact após último lote ──────────────────────────────
       # O artifact segs-{job_id} é temporário (só serve para transferir
