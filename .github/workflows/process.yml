@@ -1382,44 +1382,61 @@ jobs:
             print('⚠ Nenhuma URL para aquecer')
             raise SystemExit(0)
 
-          # ── Passo 1: Cloudflare Cache Purge API ─────────────────────────
-          # Purge forçado via API garante que o Cloudflare invalida qualquer
-          # estado anterior (ex: 404 cacheado de run anterior) e repopula
-          # o cache na próxima request. Disponível em todos os planos desde
-          # Abril 2025. Limite: 30 URLs por request — dividimos em chunks.
-          cf_zone   = os.environ.get('CF_ZONE_ID', '').strip()
-          cf_token  = os.environ.get('CF_API_TOKEN', '').strip()
+          # ── Cloudflare Cache Purge by Prefix ────────────────────────────
+          # Purge by Prefix é mais eficiente que Purge by URL para conteúdo
+          # em batch — cobre todos os assets do job_id com 1-2 requests.
+          # Disponível no Free tier. Limite: 100 prefixos por request.
+          # Após purge, o Tiered Cache upper-tier faz MISS controlado na
+          # próxima request e popula todos os PoPs subsequentes.
+          cf_zone  = os.environ.get('CF_ZONE_ID', '').strip()
+          cf_token = os.environ.get('CF_API_TOKEN', '').strip()
 
           if cf_zone and cf_token:
+            # Colectar prefixos únicos (job_id e job_id-bN)
+            prefixes = set()
+            for u in cdn_urls:
+              # ex: https://cdn.pixgo.qzz.io/abc123-b0/hls/seg00000.bin
+              # prefixo: https://cdn.pixgo.qzz.io/abc123-b0/
+              parts = u.split('/')
+              if len(parts) >= 4:
+                prefix = '/'.join(parts[:4]) + '/'
+                prefixes.add(prefix)
+            # Sempre incluir o prefixo raiz do job_id (manifestos + thumbs)
+            prefixes.add(f"{cdn_base}/{job_id}/")
+            prefixes = list(prefixes)
+
+            print(f"  Prefixos a purgar: {prefixes}")
+
+            # Purge by Prefix — máximo 30 por request no free tier
             chunk_size = 30
-            chunks = [cdn_urls[i:i+chunk_size] for i in range(0, len(cdn_urls), chunk_size)]
             purge_ok = 0
-            for chunk in chunks:
+            for i in range(0, len(prefixes), chunk_size):
+              chunk = prefixes[i:i+chunk_size]
               r = subprocess.run([
                 'curl', '-sf', '-X', 'POST',
                 '-H', f'Authorization: Bearer {cf_token}',
                 '-H', 'Content-Type: application/json',
                 f'https://api.cloudflare.com/client/v4/zones/{cf_zone}/purge_cache',
-                '-d', json.dumps({'files': chunk}),
+                '-d', json.dumps({'prefixes': chunk}),
               ], capture_output=True, text=True)
               try:
                 resp = json.loads(r.stdout)
                 if resp.get('success'):
                   purge_ok += len(chunk)
+                  print(f"  ✓ Purge {len(chunk)} prefixos OK")
                 else:
-                  print(f"  ⚠ Purge chunk falhou: {resp.get('errors', '')}")
+                  print(f"  ⚠ Purge falhou: {resp.get('errors', '')}")
               except Exception:
-                print(f"  ⚠ Purge parse error: {r.stdout[:100]}")
-            print(f"✓ CF Cache Purge API: {purge_ok}/{len(cdn_urls)} URLs purgadas")
-            time.sleep(2)  # dar tempo ao Cloudflare para propagar o purge
+                print(f"  ⚠ Purge parse error: {r.stdout[:200]}")
+
+            print(f"✓ CF Cache Purge by Prefix: {purge_ok}/{len(prefixes)} prefixos purgados")
+            time.sleep(3)
           else:
             print("  ⚠ CF_ZONE_ID ou CF_API_TOKEN não configurados — purge ignorado")
-            print("  → Adiciona os secrets CF_ZONE_ID e CF_API_TOKEN ao repositório")
 
-          # ── Passo 2: Warm HTTP (2 passagens) ────────────────────────────
-          # 1ª passagem: força o Cloudflare a buscar na origem e cachear
-          # 2ª passagem: confirma HIT — se não HIT, o Tiered Cache ainda
-          #              pode propagar em background para outros PoPs
+          # ── Warm HTTP (2 passagens) ──────────────────────────────────────
+          # Após purge, bate nas URLs para popular o Tiered Cache upper-tier.
+          # O upper-tier serve todos os PoPs subsequentes sem tocar o GitHub.
             try:
               req = ur.Request(url, headers={'User-Agent': 'StreamVault-Warm/1.0'})
               with ur.urlopen(req, timeout=120) as r:
