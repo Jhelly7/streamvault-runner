@@ -1353,21 +1353,46 @@ jobs:
             cdn_urls = json.load(open(cdn_urls_path))
             print(f"  Fonte: cdn_urls.json ({len(cdn_urls)} URLs)")
           else:
-            hls_dir  = os.path.join(work_dir, 'hls')
-            bin_files = []
-            if os.path.isdir(hls_dir):
-              bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin'))
-
+            # Modo batch: cdn_urls.json não existe porque cada lote roda numa
+            # run isolada do Actions. Antes reconstruíamos só a partir dos
+            # .bin locais desta run — o que cobria apenas o ÚLTIMO lote e
+            # deixava todos os lotes anteriores frios (nunca aquecidos).
+            #
+            # Fix: o artifact segs-{job_id} inclui manifest.json com
+            # {batches, batch_size, total_segs} — escrito no step "Empacotar
+            # segmentos em lotes" do job principal. Esse artifact é baixado
+            # para /tmp/batches/ em toda run de lote (antes de ser eliminado
+            # no fim do ÚLTIMO lote). Usamos o manifest para reconstruir os
+            # nomes de TODOS os segmentos de TODOS os lotes — sem precisar
+            # dos ficheiros físicos, só da convenção seg{N:05d}.bin e da
+            # regra batch_idx = seg_number // batch_size já usada no resto
+            # do pipeline.
+            manifest_path = '/tmp/batches/manifest.json'
             cdn_urls = []
-            for f in bin_files:
-              if is_batch and batch_index >= 0:
-                # No modo batch, cada segmento pertence à release {job_id}-b{batch_index}
-                # O batch_index é o índice deste lote — os segmentos extraídos aqui
-                # foram uploadados para a release {job_id}-b{batch_index}
-                release = f"{job_id}-b{batch_index}"
-              else:
-                release = job_id
-              cdn_urls.append(f"{cdn_base}/{release}/hls/{f}")
+
+            if is_batch and os.path.exists(manifest_path):
+              manifest    = json.load(open(manifest_path))
+              total_segs  = manifest['total_segs']
+              m_batch_sz  = manifest['batch_size']
+              for seg_n in range(total_segs):
+                b_idx   = seg_n // m_batch_sz
+                release = f"{job_id}-b{b_idx}"
+                cdn_urls.append(f"{cdn_base}/{release}/hls/seg{seg_n:05d}.bin")
+              print(f"  Fonte: manifest.json — {total_segs} segs em {manifest['batches']} lotes reconstruídos")
+            else:
+              # Fallback: sem manifest disponível (ou modo não-batch sem
+              # cdn_urls.json) — cobre pelo menos os .bin locais desta run.
+              hls_dir   = os.path.join(work_dir, 'hls')
+              bin_files = []
+              if os.path.isdir(hls_dir):
+                bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin'))
+              for f in bin_files:
+                if is_batch and batch_index >= 0:
+                  release = f"{job_id}-b{batch_index}"
+                else:
+                  release = job_id
+                cdn_urls.append(f"{cdn_base}/{release}/hls/{f}")
+              print(f"  ⚠ Fonte: fallback local — {len(bin_files)} segs (release {job_id}-b{batch_index}) apenas — manifest.json indisponível")
 
             # Manifestos sempre na release principal
             cdn_urls += [
@@ -1376,7 +1401,6 @@ jobs:
               f"{cdn_base}/{job_id}/hls/index.m3u8",
             ]
             cdn_urls = list(dict.fromkeys(cdn_urls))
-            print(f"  Fonte: reconstruída — {len(bin_files)} segs (release {job_id}-b{batch_index}) + manifestos")
 
           if not cdn_urls:
             print('⚠ Nenhuma URL para aquecer')
