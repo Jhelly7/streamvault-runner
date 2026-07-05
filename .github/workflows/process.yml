@@ -1044,9 +1044,12 @@ jobs:
             if os.path.exists(fpath): meta_files.append((fpath, fname, mime))
 
           thumb_dir = os.path.join(work_dir, 'thumbs')
+          thumb_names = []
           if os.path.isdir(thumb_dir):
             for f in sorted(os.listdir(thumb_dir)):
-              if f.endswith('.jpg'): meta_files.append((os.path.join(thumb_dir, f), f, 'image/jpeg'))
+              if f.endswith('.jpg'):
+                meta_files.append((os.path.join(thumb_dir, f), f, 'image/jpeg'))
+                thumb_names.append(f)
 
           print(f"  Upload {len(meta_files)} metadados → Release {job_id}")
 
@@ -1066,20 +1069,81 @@ jobs:
           upload_url = release['upload_url'].split('{')[0]
           existing = {a['name']: a['id'] for a in release.get('assets', [])}
 
+          # ── FIX: thumb 404 no CDN ────────────────────────────────────────
+          # Antes, este step fazia upload sem retry em 422 (nome duplicado por
+          # corrida entre jobs concorrentes) ou 429 (rate limit da API do
+          # GitHub). Uma falha aqui era só impressa (✗) e o job continuava
+          # normalmente — o step "Registar no EdgeOne" monta as URLs de thumb
+          # a partir do thumbs_manifest.json LOCAL, sem saber se o upload real
+          # deu certo. Resultado: Turso ficava com uma URL de thumbnail que
+          # nunca existiu na Release → 404 no catálogo, mesmo com o job
+          # marcado como sucesso.
+          # Agora: retry igual ao já usado no upload de segmentos (422 →
+          # apagar+reenviar; 429 → aguardar 60s+reenviar) e, se mesmo assim
+          # falhar, o nome do ficheiro é propagado via FAILED_THUMBS para o
+          # step de registo poder omiti-lo do Turso em vez de gravar uma URL
+          # morta.
+          def refresh_assets():
+            rr = subprocess.run(['curl','-sf','-H',f'Authorization: Bearer {storage_token}',
+              '-H','Accept: application/vnd.github+json',
+              f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{job_id}'],
+              capture_output=True, text=True)
+            try:
+              return {a['name']: a['id'] for a in json.loads(rr.stdout).get('assets', [])}
+            except Exception:
+              return {}
+
+          def do_upload(fpath, fname, mime):
+            return subprocess.run(['curl','-sf','-o','/dev/null','-w','%{http_code}','-X','POST',
+              '-H',f'Authorization: Bearer {storage_token}','-H',f'Content-Type: {mime}',
+              '--max-time','120',f'{upload_url}?name={fname}','--data-binary',f'@{fpath}'],
+              capture_output=True, text=True).stdout.strip()
+
           ok = 0
+          failed_files = []
+
           for fpath, fname, mime in meta_files:
             if fname in existing:
               subprocess.run(['curl','-sf','-X','DELETE','-H',f'Authorization: Bearer {storage_token}',
                 f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{existing[fname]}'], capture_output=True)
               time.sleep(0.5)
-            r = subprocess.run(['curl','-sf','-o','/dev/null','-w','%{http_code}','-X','POST',
-              '-H',f'Authorization: Bearer {storage_token}','-H',f'Content-Type: {mime}',
-              '--max-time','120',f'{upload_url}?name={fname}','--data-binary',f'@{fpath}'], capture_output=True, text=True)
-            if r.stdout.strip() == '201': print(f"  ✓ {fname}"); ok += 1
-            else: print(f"  ✗ {fname} HTTP {r.stdout.strip()}")
+
+            code = do_upload(fpath, fname, mime)
+
+            if code == '201':
+              print(f"  ✓ {fname}"); ok += 1
+              continue
+
+            if code == '422':
+              print(f"  ⚠ {fname} 422 (duplicado) — a apagar e retentar...")
+              fresh = refresh_assets()
+              if fname in fresh:
+                subprocess.run(['curl','-sf','-X','DELETE','-H',f'Authorization: Bearer {storage_token}',
+                  f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{fresh[fname]}'], capture_output=True)
+                time.sleep(0.5)
+              code = do_upload(fpath, fname, mime)
+            elif code == '429':
+              print(f"  ⚠ {fname} rate limit — pausa 60s...")
+              time.sleep(60)
+              code = do_upload(fpath, fname, mime)
+
+            if code == '201':
+              print(f"  ✓ {fname} (após retry)"); ok += 1
+            else:
+              print(f"  ✗ {fname} HTTP {code} — FALHOU definitivamente")
+              failed_files.append(fname)
 
           print(f"  ✅ {ok}/{len(meta_files)} metadados")
-          with open(github_env, 'a') as f: f.write("METADATA_UPLOADED=true\n")
+
+          failed_thumbs   = [f for f in failed_files if f in thumb_names]
+          critical_failed = [f for f in failed_files if f not in thumb_names]
+
+          with open(github_env, 'a') as f:
+            f.write("METADATA_UPLOADED=true\n")
+            f.write(f"FAILED_THUMBS={','.join(failed_thumbs)}\n")
+            if critical_failed:
+              f.write("METADATA_CRITICAL_FAILED=true\n")
+              print(f"  ✗✗ Ficheiros críticos falharam: {critical_failed}")
           PYEOF
 
       - name: Empacotar segmentos em lotes
@@ -1599,7 +1663,21 @@ jobs:
 
           thumbs_path = os.path.join(work_dir, 'thumbs_manifest.json')
           thumbs = json.load(open(thumbs_path)) if os.path.exists(thumbs_path) else []
-          thumb_urls = [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
+
+          # ── FIX: thumb 404 no CDN ────────────────────────────────────────
+          # thumbs_manifest.json só confirma que a imagem existe LOCALMENTE
+          # (extraída/descarregada com sucesso) — não que o upload para a
+          # Release do GitHub deu certo. FAILED_THUMBS vem do step de upload
+          # de metadados e lista os ficheiros que falharam definitivamente
+          # (mesmo após retry de 422/429). Sem este filtro, o Turso recebia
+          # uma URL de thumbnail apontando para um asset inexistente → 404
+          # no catálogo.
+          failed_thumbs = set(f for f in os.environ.get('FAILED_THUMBS','').split(',') if f)
+          thumb_urls = [
+            f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg"
+            for i in range(len(thumbs))
+            if f"thumb_{i}.jpg" not in failed_thumbs
+          ]
 
           cdn_urls_path = os.path.join(work_dir, 'cdn_urls.json')
           if os.path.exists(cdn_urls_path):
