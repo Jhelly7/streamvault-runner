@@ -867,6 +867,45 @@ jobs:
           print(f"✓ {len(seg_files)} segmentos encriptados")
           PYEOF
 
+      # ── FIX #1 ────────────────────────────────────────────────────────
+      # Este step foi movido para ANTES de "Reescrever index.m3u8 com URLs
+      # CDN" (e de "Gerar cdn_urls.json"). Antes, ele rodava DEPOIS desses
+      # dois steps, mas escrevia NEED_BATCHES/TOTAL_BATCHES via $GITHUB_ENV
+      # — que só fica disponível a partir do PRÓXIMO step do job, nunca no
+      # mesmo ou em steps anteriores. Resultado: os dois steps que geram as
+      # URLs liam sempre env.NEED_BATCHES == '' (vazio) → caíam no ramo
+      # "release única" mesmo quando o vídeo excedia 900 assets e ia, de
+      # facto, para releases em lote ({job_id}-bN). O index.m3u8/cdn_urls.json
+      # ficavam com URLs {job_id}/hls/segNNNNN.bin que nunca existiam,
+      # enquanto os segmentos reais estavam em {job_id}-bN/hls/segNNNNN.bin.
+      # Só depende do hls_dir (já populado após a encriptação) e do
+      # thumb_dir — por isso pode rodar aqui, logo depois de "Encriptar
+      # segmentos → .bin".
+      - name: Verificar necessidade de upload em lotes
+        if: env.IS_BATCH_MODE != 'true'
+        id: check_batches
+        run: |
+          python3 << 'PYEOF'
+          import os
+          hls_dir = os.environ['WORK_DIR'] + '/hls'
+          thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
+          seg_count = len([f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin' and '.part' not in f])
+          meta_count = 4
+          if os.path.exists(os.path.join(hls_dir, 'init.bin')): meta_count += 1
+          if os.path.isdir(thumb_dir): meta_count += len([f for f in os.listdir(thumb_dir) if f.endswith('.jpg')])
+          total = meta_count + seg_count
+          NEED_BATCHES = total > 900
+          BATCH_SIZE = 500
+          total_batches = (seg_count + BATCH_SIZE - 1) // BATCH_SIZE if NEED_BATCHES else 0
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"NEED_BATCHES={'true' if NEED_BATCHES else 'false'}\n")
+            f.write(f"TOTAL_BATCHES={total_batches}\n")
+            f.write(f"SEG_COUNT={seg_count}\n")
+          print(f"  Segmentos: {seg_count} | Metadados: {meta_count} | Total: {total}")
+          print(f"  {'⚠ Precisa lotes' if NEED_BATCHES else '✓ Upload normal'}")
+          if NEED_BATCHES: print(f"  Lotes: {total_batches} × {BATCH_SIZE} segmentos")
+          PYEOF
+
       - name: Reescrever index.m3u8 com URLs CDN
         if: env.IS_BATCH_MODE != 'true'
         run: |
@@ -975,31 +1014,6 @@ jobs:
 
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
           print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs {'(multi-release)' if need_batches else '(release única)'}")
-          PYEOF
-
-      - name: Verificar necessidade de upload em lotes
-        if: env.IS_BATCH_MODE != 'true'
-        id: check_batches
-        run: |
-          python3 << 'PYEOF'
-          import os
-          hls_dir = os.environ['WORK_DIR'] + '/hls'
-          thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
-          seg_count = len([f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin' and '.part' not in f])
-          meta_count = 4
-          if os.path.exists(os.path.join(hls_dir, 'init.bin')): meta_count += 1
-          if os.path.isdir(thumb_dir): meta_count += len([f for f in os.listdir(thumb_dir) if f.endswith('.jpg')])
-          total = meta_count + seg_count
-          NEED_BATCHES = total > 900
-          BATCH_SIZE = 500
-          total_batches = (seg_count + BATCH_SIZE - 1) // BATCH_SIZE if NEED_BATCHES else 0
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-            f.write(f"NEED_BATCHES={'true' if NEED_BATCHES else 'false'}\n")
-            f.write(f"TOTAL_BATCHES={total_batches}\n")
-            f.write(f"SEG_COUNT={seg_count}\n")
-          print(f"  Segmentos: {seg_count} | Metadados: {meta_count} | Total: {total}")
-          print(f"  {'⚠ Precisa lotes' if NEED_BATCHES else '✓ Upload normal'}")
-          if NEED_BATCHES: print(f"  Lotes: {total_batches} × {BATCH_SIZE} segmentos")
           PYEOF
 
       - name: Upload metadados + init.bin + thumbs
@@ -1330,6 +1344,7 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os, json, concurrent.futures, urllib.request as ur, urllib.error as ue, time, subprocess
+          from urllib.parse import urlparse
 
           job_id   = os.environ['JOB_ID']
           warm_c   = int(os.environ.get('WARM_C', '8') or '8')
@@ -1416,17 +1431,27 @@ jobs:
           cf_token = os.environ.get('CF_API_TOKEN', '').strip()
 
           if cf_zone and cf_token:
-            # Colectar prefixos únicos (job_id e job_id-bN)
+            # FIX #2 ────────────────────────────────────────────────────
+            # A API purge_cache por "prefixes" da Cloudflare exige o prefixo
+            # SEM o esquema (http/https) — apenas "host/path". A versão
+            # anterior fazia '/'.join(url.split('/')[:4]) + '/', o que
+            # preservava "https://" no resultado (ex.:
+            # "https://cdn.pixgo.qzz.io/abc-b0/") e a API respondia sempre
+            # com o erro 1119 "URI schemes must not be provided", zerando
+            # 100% dos purges. Usamos urlparse para extrair só netloc +
+            # primeiro segmento do path.
             prefixes = set()
             for u in cdn_urls:
-              # ex: https://cdn.pixgo.qzz.io/abc123-b0/hls/seg00000.bin
-              # prefixo: https://cdn.pixgo.qzz.io/abc123-b0/
-              parts = u.split('/')
-              if len(parts) >= 4:
-                prefix = '/'.join(parts[:4]) + '/'
-                prefixes.add(prefix)
+              parsed = urlparse(u)
+              path_parts = [p for p in parsed.path.split('/') if p]
+              if path_parts:
+                prefix = f"{parsed.netloc}/{path_parts[0]}/"
+              else:
+                prefix = f"{parsed.netloc}/"
+              prefixes.add(prefix)
             # Sempre incluir o prefixo raiz do job_id (manifestos + thumbs)
-            prefixes.add(f"{cdn_base}/{job_id}/")
+            root_parsed = urlparse(f"{cdn_base}/{job_id}/")
+            prefixes.add(f"{root_parsed.netloc}{root_parsed.path}")
             prefixes = list(prefixes)
 
             print(f"  Prefixos a purgar: {prefixes}")
