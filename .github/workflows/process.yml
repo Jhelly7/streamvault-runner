@@ -1324,9 +1324,12 @@ jobs:
         if: |
           (env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true') ||
           (env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH == 'true')
+        env:
+          CF_ZONE_ID:  ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
           python3 << 'PYEOF'
-          import os, json, concurrent.futures, urllib.request as ur, urllib.error as ue, time
+          import os, json, concurrent.futures, urllib.request as ur, urllib.error as ue, time, subprocess
 
           job_id   = os.environ['JOB_ID']
           warm_c   = int(os.environ.get('WARM_C', '8') or '8')
@@ -1342,35 +1345,81 @@ jobs:
           # tiveram seus segmentos enviados e ficam disponíveis para warm no
           # 1º acesso real, ou podem ser quentes via Tiered Cache.
           cdn_urls_path = os.path.join(work_dir, 'cdn_urls.json')
+          batch_index   = int(os.environ.get('BATCH_INDEX', '-1'))
+          is_batch      = os.environ.get('IS_BATCH_MODE', 'false') == 'true'
+          BATCH_SIZE    = 500
 
           if os.path.exists(cdn_urls_path):
             cdn_urls = json.load(open(cdn_urls_path))
             print(f"  Fonte: cdn_urls.json ({len(cdn_urls)} URLs)")
           else:
-            hls_dir = os.path.join(work_dir, 'hls')
+            hls_dir  = os.path.join(work_dir, 'hls')
             bin_files = []
             if os.path.isdir(hls_dir):
               bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin'))
-            cdn_urls = [f"{cdn_base}/{job_id}/hls/{f}" for f in bin_files]
+
+            cdn_urls = []
+            for f in bin_files:
+              if is_batch and batch_index >= 0:
+                # No modo batch, cada segmento pertence à release {job_id}-b{batch_index}
+                # O batch_index é o índice deste lote — os segmentos extraídos aqui
+                # foram uploadados para a release {job_id}-b{batch_index}
+                release = f"{job_id}-b{batch_index}"
+              else:
+                release = job_id
+              cdn_urls.append(f"{cdn_base}/{release}/hls/{f}")
+
+            # Manifestos sempre na release principal
             cdn_urls += [
               f"{cdn_base}/{job_id}/master.m3u8",
               f"{cdn_base}/{job_id}/nonces.json",
               f"{cdn_base}/{job_id}/hls/index.m3u8",
             ]
             cdn_urls = list(dict.fromkeys(cdn_urls))
-            print(f"  Fonte: reconstruída do WORK_DIR local ({len(cdn_urls)} URLs)")
-            print(f"  ⚠ AVISO: modo batch — cada lote roda em runner isolado do Actions,")
-            print(f"  sem disco persistente entre lotes. Este warm cobre apenas o ÚLTIMO")
-            print(f"  lote ({len(bin_files)} segmentos) + manifestos.")
-            print(f"  Lotes anteriores já foram enviados ao GitHub Releases e ficam")
-            print(f"  disponíveis, mas só esquentam no Worker no 1º acesso real do")
-            print(f"  espectador (ou via Tiered Cache, se acessados por outra rota).")
+            print(f"  Fonte: reconstruída — {len(bin_files)} segs (release {job_id}-b{batch_index}) + manifestos")
 
           if not cdn_urls:
             print('⚠ Nenhuma URL para aquecer')
             raise SystemExit(0)
 
-          def fetch_url(url):
+          # ── Passo 1: Cloudflare Cache Purge API ─────────────────────────
+          # Purge forçado via API garante que o Cloudflare invalida qualquer
+          # estado anterior (ex: 404 cacheado de run anterior) e repopula
+          # o cache na próxima request. Disponível em todos os planos desde
+          # Abril 2025. Limite: 30 URLs por request — dividimos em chunks.
+          cf_zone   = os.environ.get('CF_ZONE_ID', '').strip()
+          cf_token  = os.environ.get('CF_API_TOKEN', '').strip()
+
+          if cf_zone and cf_token:
+            chunk_size = 30
+            chunks = [cdn_urls[i:i+chunk_size] for i in range(0, len(cdn_urls), chunk_size)]
+            purge_ok = 0
+            for chunk in chunks:
+              r = subprocess.run([
+                'curl', '-sf', '-X', 'POST',
+                '-H', f'Authorization: Bearer {cf_token}',
+                '-H', 'Content-Type: application/json',
+                f'https://api.cloudflare.com/client/v4/zones/{cf_zone}/purge_cache',
+                '-d', json.dumps({'files': chunk}),
+              ], capture_output=True, text=True)
+              try:
+                resp = json.loads(r.stdout)
+                if resp.get('success'):
+                  purge_ok += len(chunk)
+                else:
+                  print(f"  ⚠ Purge chunk falhou: {resp.get('errors', '')}")
+              except Exception:
+                print(f"  ⚠ Purge parse error: {r.stdout[:100]}")
+            print(f"✓ CF Cache Purge API: {purge_ok}/{len(cdn_urls)} URLs purgadas")
+            time.sleep(2)  # dar tempo ao Cloudflare para propagar o purge
+          else:
+            print("  ⚠ CF_ZONE_ID ou CF_API_TOKEN não configurados — purge ignorado")
+            print("  → Adiciona os secrets CF_ZONE_ID e CF_API_TOKEN ao repositório")
+
+          # ── Passo 2: Warm HTTP (2 passagens) ────────────────────────────
+          # 1ª passagem: força o Cloudflare a buscar na origem e cachear
+          # 2ª passagem: confirma HIT — se não HIT, o Tiered Cache ainda
+          #              pode propagar em background para outros PoPs
             try:
               req = ur.Request(url, headers={'User-Agent': 'StreamVault-Warm/1.0'})
               with ur.urlopen(req, timeout=120) as r:
