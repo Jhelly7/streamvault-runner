@@ -1437,6 +1437,7 @@ jobs:
           # ── Warm HTTP (2 passagens) ──────────────────────────────────────
           # Após purge, bate nas URLs para popular o Tiered Cache upper-tier.
           # O upper-tier serve todos os PoPs subsequentes sem tocar o GitHub.
+          def fetch_url(url):
             try:
               req = ur.Request(url, headers={'User-Agent': 'StreamVault-Warm/1.0'})
               with ur.urlopen(req, timeout=120) as r:
