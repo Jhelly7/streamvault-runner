@@ -1632,7 +1632,13 @@ jobs:
               req = ur.Request(url, headers={'User-Agent': 'StreamVault-Warm/1.0'})
               with ur.urlopen(req, timeout=120) as r:
                 body      = r.read()
-                cf_status = r.headers.get('cf-cache-status', 'UNKNOWN')
+                # FIX: worker v7+ usa caches.default (Cache API) em vez do
+                # cache de edge nativo da Cloudflare — esse caminho nunca
+                # escreve 'cf-cache-status' (só existe quando o edge nativo
+                # serve sem invocar o Worker, o que nunca acontece aqui). O
+                # worker expõe 'X-Cdn-Cache' (HIT/MISS) explicitamente;
+                # lemos esse header em vez do nativo.
+                cf_status = r.headers.get('x-cdn-cache', r.headers.get('cf-cache-status', 'UNKNOWN'))
                 cors      = r.headers.get('access-control-allow-origin', '')
                 cc        = r.headers.get('cache-control', 'none')
                 return {'url': url, 'status': cf_status, 'http': r.status, 'size': len(body), 'cors': cors, 'cc': cc}
