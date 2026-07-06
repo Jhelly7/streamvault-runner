@@ -769,6 +769,30 @@ jobs:
           thumb_url = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
           thumbs    = []
 
+          # ── FIX: suporte a múltiplas extensões de thumbnail ─────────────
+          # Antes, o ficheiro era SEMPRE gravado como "thumb_0.jpg" mesmo
+          # quando thumbnail_url apontava para um .webp/.png real — os bytes
+          # eram webp/png mas o nome ficava .jpg. Isso não quebra o browser
+          # (que faz sniffing pelo conteúdo), mas o Worker do CDN decide o
+          # TTL de cache pela EXTENSÃO do nome do ficheiro — um webp
+          # "disfarçado" de .jpg acabava a cair certo no TTL de imagem só
+          # por coincidência de mapeamento, mas o inverso (perder a extensão
+          # correta) impede adicionar regras específicas por formato depois.
+          # Agora detectamos o formato real pelos magic bytes e gravamos com
+          # a extensão correta; a extensão vai também para o manifest.
+          def detect_image_ext(path):
+            with open(path, 'rb') as f:
+              h = f.read(16)
+            if h[:3] == b'\xff\xd8\xff':                                    return 'jpg'
+            if h[:4] == b'\x89PNG':                                          return 'png'
+            if h[:4] == b'RIFF' and len(h) >= 12 and h[8:12] == b'WEBP':     return 'webp'
+            if h[:4] == b'RIFF':                                             return 'webp'  # RIFF sem confirmar subtipo — assume webp (caso mais comum aqui)
+            if h[:6] in (b'GIF87a', b'GIF89a'):                              return 'gif'
+            if h[:2] == b'BM':                                               return 'bmp'
+            if h[:4] in (b'II*\x00', b'MM\x00*'):                            return 'tiff'
+            if len(h) >= 12 and h[4:8] == b'ftyp':                           return 'heic'
+            return 'jpg'
+
           def is_valid_image(path, min_bytes=5000):
             if not os.path.exists(path): return False
             if os.path.getsize(path) < min_bytes: return False
@@ -779,6 +803,14 @@ jobs:
                     h[:4] in (b'II*\x00', b'MM\x00*') or
                     (len(h) >= 8 and h[4:8] == b'ftyp'))
 
+          def finalize_thumb(tmp_path, index=0, time_s=0):
+            """Renomeia tmp_path para thumb_{index}.{ext_real} e devolve o path final."""
+            ext = detect_image_ext(tmp_path)
+            final_path = f"{thumb_dir}/thumb_{index}.{ext}"
+            if tmp_path != final_path:
+              os.replace(tmp_path, final_path)
+            return final_path, ext
+
           def extract_frame(video, out_path, time_pct=0.07):
             t = max(1.0, duration * time_pct)
             r = subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-ss',f'{t:.2f}',
@@ -786,30 +818,32 @@ jobs:
             return r.returncode == 0 and is_valid_image(out_path)
 
           if thumb_url:
-            out = f"{thumb_dir}/thumb_0.jpg"
+            tmp = f"{thumb_dir}/thumb_0.tmp"
             print(f"  Descarregando thumbnail: {thumb_url}")
             subprocess.run(['curl','-L','--retry','5','--retry-delay','3','--max-time','60',
-              '-H','User-Agent: Mozilla/5.0','-o',out,thumb_url], capture_output=True)
-            if not is_valid_image(out):
-              if os.path.exists(out): os.remove(out)
-              subprocess.run(['wget','--timeout=30','--tries=5','-O',out,thumb_url], capture_output=True)
-            if is_valid_image(out):
-              thumbs.append({'path':out,'time':0,'index':0})
-              print(f"✓ Thumbnail válida ({os.path.getsize(out)//1024} KB)")
+              '-H','User-Agent: Mozilla/5.0','-o',tmp,thumb_url], capture_output=True)
+            if not is_valid_image(tmp):
+              if os.path.exists(tmp): os.remove(tmp)
+              subprocess.run(['wget','--timeout=30','--tries=5','-O',tmp,thumb_url], capture_output=True)
+            if is_valid_image(tmp):
+              final_path, ext = finalize_thumb(tmp, 0)
+              thumbs.append({'path':final_path,'ext':ext,'time':0,'index':0})
+              print(f"✓ Thumbnail válida ({os.path.getsize(final_path)//1024} KB, .{ext})")
             else:
-              if os.path.exists(out): os.remove(out)
+              if os.path.exists(tmp): os.remove(tmp)
+              out = f"{thumb_dir}/thumb_0.jpg"
               if extract_frame(video, out):
-                thumbs.append({'path':out,'time':0,'index':0})
+                thumbs.append({'path':out,'ext':'jpg','time':0,'index':0})
                 print(f"✓ Frame extraído como fallback")
               else: print('✗ Falha ao extrair frame')
           else:
             out = f"{thumb_dir}/thumb_0.jpg"
             print(f"  Extraindo frame a 7% ({duration*0.07:.1f}s)")
             if extract_frame(video, out, time_pct=0.07):
-              thumbs.append({'path':out,'time':duration*0.07,'index':0})
+              thumbs.append({'path':out,'ext':'jpg','time':duration*0.07,'index':0})
               print(f"✓ Frame extraído: {os.path.getsize(out)//1024} KB")
             elif extract_frame(video, out, time_pct=0.05):
-              thumbs.append({'path':out,'time':duration*0.05,'index':0})
+              thumbs.append({'path':out,'ext':'jpg','time':duration*0.05,'index':0})
               print(f"✓ Frame extraído a 5%: {os.path.getsize(out)//1024} KB")
             else: print('✗ Não foi possível extrair frame')
 
@@ -889,10 +923,11 @@ jobs:
           import os
           hls_dir = os.environ['WORK_DIR'] + '/hls'
           thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
+          IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic')
           seg_count = len([f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin' and '.part' not in f])
           meta_count = 4
           if os.path.exists(os.path.join(hls_dir, 'init.bin')): meta_count += 1
-          if os.path.isdir(thumb_dir): meta_count += len([f for f in os.listdir(thumb_dir) if f.endswith('.jpg')])
+          if os.path.isdir(thumb_dir): meta_count += len([f for f in os.listdir(thumb_dir) if f.lower().endswith(IMG_EXTS)])
           total = meta_count + seg_count
           NEED_BATCHES = total > 900
           BATCH_SIZE = 500
@@ -1009,8 +1044,10 @@ jobs:
               release = job_id
             cdn_urls.append(f"{cdn_base}/{release}/hls/{bn}")
 
-          # Thumbnails sempre na release principal
-          cdn_urls += [f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg" for i in range(len(thumbs))]
+          # Thumbnails: usa o nome real do ficheiro (extensão correta),
+          # em vez de assumir sempre .jpg — thumbs_manifest.json guarda o
+          # 'path' já com a extensão detectada (jpg/png/webp/gif/...).
+          cdn_urls += [f"{cdn_base}/{job_id}/thumbs/{os.path.basename(t['path'])}" for t in thumbs]
 
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
           print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs {'(multi-release)' if need_batches else '(release única)'}")
@@ -1045,10 +1082,21 @@ jobs:
 
           thumb_dir = os.path.join(work_dir, 'thumbs')
           thumb_names = []
+          # ── FIX: suporte a múltiplas extensões de thumbnail ─────────────
+          # Antes só ficheiros ".jpg" eram considerados aqui — thumbs em
+          # webp/png/gif nunca eram sequer enviados (thumb_names ficava
+          # vazio para eles, então FAILED_THUMBS também não os detectava;
+          # simplesmente não subiam e o pipeline seguia calado).
+          MIME_BY_EXT = {
+            'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+            'webp': 'image/webp', 'gif': 'image/gif', 'bmp': 'image/bmp',
+            'tiff': 'image/tiff', 'heic': 'image/heic',
+          }
           if os.path.isdir(thumb_dir):
             for f in sorted(os.listdir(thumb_dir)):
-              if f.endswith('.jpg'):
-                meta_files.append((os.path.join(thumb_dir, f), f, 'image/jpeg'))
+              ext = f.rsplit('.', 1)[-1].lower() if '.' in f else ''
+              if ext in MIME_BY_EXT:
+                meta_files.append((os.path.join(thumb_dir, f), f, MIME_BY_EXT[ext]))
                 thumb_names.append(f)
 
           print(f"  Upload {len(meta_files)} metadados → Release {job_id}")
@@ -1223,6 +1271,35 @@ jobs:
           github_repo   = os.environ['GITHUB_REPOSITORY']
           parent_run_id = os.environ['GITHUB_RUN_ID']
 
+          # ── FIX: poster vazio em vídeos com upload em lotes ─────────────
+          # "Registar no EdgeOne" só roda no ÚLTIMO lote, que é uma run do
+          # Actions ISOLADA (runner novo, disco novo) — nunca teve acesso ao
+          # thumbs_manifest.json desta run principal. Resultado: thumb_urls
+          # ficava sempre [] e o poster gravado no Turso ficava vazio, mesmo
+          # com o thumb já upado e acessível directamente via CDN.
+          # Fix: como 'metadata' já atravessa intacto toda a cadeia de
+          # dispatch de lotes (cada lote reenvia o mesmo JSON que recebeu),
+          # injectamos aqui os thumb_urls (já filtrados pelos que falharam
+          # o upload) dentro de metadata['_thumbUrls']. Usa o nome REAL do
+          # ficheiro (thumbs_manifest.json['path']) para preservar a
+          # extensão correta (jpg/png/webp/gif/...) em vez de assumir .jpg.
+          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
+          thumbs_manifest_path = os.environ['WORK_DIR'] + '/thumbs_manifest.json'
+          failed_thumbs = set(f for f in os.environ.get('FAILED_THUMBS','').split(',') if f)
+          thumb_urls = []
+          if os.path.exists(thumbs_manifest_path):
+            thumbs = json.load(open(thumbs_manifest_path))
+            for t in thumbs:
+              fname = os.path.basename(t['path'])
+              if fname not in failed_thumbs:
+                thumb_urls.append(f"{cdn_base}/{job_id}/thumbs/{fname}")
+
+          try:
+            metadata = json.loads(os.environ.get('METADATA', '{}'))
+          except Exception:
+            metadata = {}
+          metadata['_thumbUrls'] = thumb_urls
+
           payload = {
             'ref': 'main',
             'inputs': {
@@ -1232,7 +1309,7 @@ jobs:
               'total_batches': str(total_batches),
               'parent_run_id': parent_run_id,
               'video_url':     '',
-              'metadata':      os.environ.get('METADATA', '{}'),
+              'metadata':      json.dumps(metadata),
               'file_indices':  '',
             }
           }
@@ -1248,7 +1325,7 @@ jobs:
             ], capture_output=True, text=True)
             code = r.stdout.strip()
             if code == '204':
-              print(f"  ✓ Lote 0/{total_batches} disparado (run={parent_run_id})")
+              print(f"  ✓ Lote 0/{total_batches} disparado (run={parent_run_id}) | {len(thumb_urls)} thumb(s) propagado(s)")
               break
             elif code.startswith('5') or code == '':
               wait = [10, 30, 60][attempt - 1] if attempt <= 3 else 60
@@ -1661,23 +1738,38 @@ jobs:
             print('  ⚠ nonces.json ausente — segmentCount não pode ser confirmado localmente')
             seg_count = 0
 
-          thumbs_path = os.path.join(work_dir, 'thumbs_manifest.json')
-          thumbs = json.load(open(thumbs_path)) if os.path.exists(thumbs_path) else []
-
-          # ── FIX: thumb 404 no CDN ────────────────────────────────────────
-          # thumbs_manifest.json só confirma que a imagem existe LOCALMENTE
-          # (extraída/descarregada com sucesso) — não que o upload para a
-          # Release do GitHub deu certo. FAILED_THUMBS vem do step de upload
-          # de metadados e lista os ficheiros que falharam definitivamente
-          # (mesmo após retry de 422/429). Sem este filtro, o Turso recebia
-          # uma URL de thumbnail apontando para um asset inexistente → 404
-          # no catálogo.
-          failed_thumbs = set(f for f in os.environ.get('FAILED_THUMBS','').split(',') if f)
-          thumb_urls = [
-            f"{cdn_base}/{job_id}/thumbs/thumb_{i}.jpg"
-            for i in range(len(thumbs))
-            if f"thumb_{i}.jpg" not in failed_thumbs
-          ]
+          # ── FIX: poster vazio/404 em vídeos com upload em lotes + suporte
+          #        a múltiplas extensões de thumbnail ──────────────────────
+          # Causas cobertas aqui:
+          #
+          # 1) thumbs_manifest.json só confirma que a imagem existe
+          #    LOCALMENTE — não que o upload para a Release do GitHub deu
+          #    certo. FAILED_THUMBS vem do step de upload de metadados e
+          #    lista os ficheiros que falharam definitivamente (mesmo após
+          #    retry de 422/429).
+          #
+          # 2) Em vídeos que precisam de upload em lotes (NEED_BATCHES),
+          #    este step só corre no ÚLTIMO lote, numa run isolada sem
+          #    acesso a thumbs_manifest.json. O step "Disparar lote 0" já
+          #    propaga os thumb_urls (filtrados) via metadata['_thumbUrls'],
+          #    que atravessa intacto toda a cadeia de dispatch. Damos
+          #    prioridade a essa chave; só caímos para o thumbs_manifest.json
+          #    local quando ela não existe (modo sem lotes).
+          #
+          # 3) thumbs_manifest.json guarda o 'path' já com a extensão REAL
+          #    detectada (jpg/png/webp/gif/...) — usamos os.path.basename()
+          #    em vez de assumir sempre "thumb_{i}.jpg".
+          if '_thumbUrls' in metadata:
+            thumb_urls = metadata['_thumbUrls']
+          else:
+            thumbs_path = os.path.join(work_dir, 'thumbs_manifest.json')
+            thumbs = json.load(open(thumbs_path)) if os.path.exists(thumbs_path) else []
+            failed_thumbs = set(f for f in os.environ.get('FAILED_THUMBS','').split(',') if f)
+            thumb_urls = []
+            for t in thumbs:
+              fname = os.path.basename(t['path'])
+              if fname not in failed_thumbs:
+                thumb_urls.append(f"{cdn_base}/{job_id}/thumbs/{fname}")
 
           cdn_urls_path = os.path.join(work_dir, 'cdn_urls.json')
           if os.path.exists(cdn_urls_path):
