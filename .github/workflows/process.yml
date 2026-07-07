@@ -356,27 +356,34 @@ jobs:
             params.ti = ti
             params.save_path = '/tmp/coord_meta'
 
-          params.flags = lt.torrent_flags.upload_mode | lt.torrent_flags.paused
+          # ── FIX #4: Coordinator preso em 0 peers, independente do swarm ─
+          # A causa real NÃO era o timeout de metadados (esse já tinha sido
+          # alargado para 900s abaixo, sem resolver nada). O bug estava
+          # aqui: `params.flags = upload_mode | paused` marcava o torrent
+          # como "só vou oferecer dados, nunca vou pedir" — e a sessão
+          # define `active_seeds: 0` logo acima. Para o auto-management do
+          # libtorrent, um torrent em upload_mode é tratado como candidato
+          # a slot de SEED, não de download; com active_seeds=0 ele nunca
+          # ganhava slot para ficar activo, então NUNCA chegava a abrir
+          # conexões com peers — daí "0 peers" sempre, mesmo com seeders
+          # reais disponíveis, e independentemente de quanto tempo se
+          # esperasse. O modo filme ([Modo A] Descarregar vídeo) nunca teve
+          # essa flag e por isso sempre funcionou.
+          # Fix: não marcar upload_mode nem pausar — deixa o torrent entrar
+          # como download normal (compete pelo único slot de
+          # active_downloads:1, que está livre pois é o único torrent desta
+          # sessão). O Coordinator nunca baixa peças de facto: assim que os
+          # metadados chegam, lemos fs.num_files() e chamamos
+          # ses.remove_torrent(handle) — então não há necessidade de
+          # nenhuma flag especial de modo aqui.
           handle = ses.add_torrent(params)
-          handle.resume()
 
           print("  Aguardando metadados...")
           t0 = time.time()
-          # ── FIX: Coordinator abortava com 0 peers em CI ─────────────────
-          # Antes, o timeout aqui era de 120s (2 min) e fatal (sys.exit(1)).
-          # O modo filme ([Modo A] Descarregar vídeo) nunca teve esse limite
-          # tão curto — usa até 3600s (1h) no loop geral, e quando tem um
-          # timeout de metadados dedicado (60s), trata como NÃO-fatal e
-          # continua mesmo assim. Em runners do GitHub Actions, IPs
-          # partilhados/reciclados são frequentemente mal vistos por
-          # trackers e nós de bootstrap DHT (throttling anti-abuso), o que
-          # atrasa a descoberta de peers em relação a uma rede residencial.
-          # Com só 120s, muitas vezes o DHT desta sessão recém-criada nem
-          # tinha tido tempo de se popular o suficiente — daí "0 peers"
-          # sempre, independentemente do magnet ter seeders reais.
-          # Agora: mesmo timeout generoso do modo filme (600s = 10 min é
-          # suficiente na prática, mas deixamos 900s de margem), com nós de
-          # bootstrap DHT explícitos para acelerar a descoberta inicial.
+          # Nota: o timeout generoso abaixo (900s) e o bootstrap DHT
+          # explícito continuam válidos como rede de segurança para sessões
+          # realmente lentas a popular o DHT — mas a causa determinística do
+          # "0 peers sempre" era a flag upload_mode acima, já removida.
           try:
             ses.add_dht_router("router.bittorrent.com", 6881)
             ses.add_dht_router("router.utorrent.com", 6881)
