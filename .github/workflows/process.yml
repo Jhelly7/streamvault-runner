@@ -339,7 +339,7 @@ jobs:
           print(f"Coordinator: {metadata.get('title','?')} S{season_num:02d} | {url[:70]}...")
 
           ses = lt.session({'listen_interfaces': '0.0.0.0:6882'})
-          try: ses.apply_settings({'connections_limit':50,'active_downloads':1,'active_seeds':0})
+          try: ses.apply_settings({'connections_limit':200,'active_downloads':1,'active_seeds':0})
           except Exception as e: print(f"  apply_settings parcial: {e}")
 
           os.makedirs('/tmp/coord_meta', exist_ok=True)
@@ -361,9 +361,32 @@ jobs:
 
           print("  Aguardando metadados...")
           t0 = time.time()
+          # ── FIX: Coordinator abortava com 0 peers em CI ─────────────────
+          # Antes, o timeout aqui era de 120s (2 min) e fatal (sys.exit(1)).
+          # O modo filme ([Modo A] Descarregar vídeo) nunca teve esse limite
+          # tão curto — usa até 3600s (1h) no loop geral, e quando tem um
+          # timeout de metadados dedicado (60s), trata como NÃO-fatal e
+          # continua mesmo assim. Em runners do GitHub Actions, IPs
+          # partilhados/reciclados são frequentemente mal vistos por
+          # trackers e nós de bootstrap DHT (throttling anti-abuso), o que
+          # atrasa a descoberta de peers em relação a uma rede residencial.
+          # Com só 120s, muitas vezes o DHT desta sessão recém-criada nem
+          # tinha tido tempo de se popular o suficiente — daí "0 peers"
+          # sempre, independentemente do magnet ter seeders reais.
+          # Agora: mesmo timeout generoso do modo filme (600s = 10 min é
+          # suficiente na prática, mas deixamos 900s de margem), com nós de
+          # bootstrap DHT explícitos para acelerar a descoberta inicial.
+          try:
+            ses.add_dht_router("router.bittorrent.com", 6881)
+            ses.add_dht_router("router.utorrent.com", 6881)
+            ses.add_dht_router("dht.transmissionbt.com", 6881)
+          except Exception as e:
+            print(f"  ⚠ add_dht_router parcial: {e}")
+
+          METADATA_TIMEOUT = 900  # 15 min — alinhado à tolerância do modo filme
           while not handle.status().has_metadata:
-            if time.time() - t0 > 120:
-              print("ERRO: timeout metadados (120s)")
+            if time.time() - t0 > METADATA_TIMEOUT:
+              print(f"ERRO: timeout metadados ({METADATA_TIMEOUT}s)")
               ses.remove_torrent(handle)
               sys.exit(1)
             ses.wait_for_alert(1000)
