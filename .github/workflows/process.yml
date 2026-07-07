@@ -69,11 +69,12 @@ jobs:
     timeout-minutes: 340
 
     env:
-      WORK_DIR:      /tmp/sv_work/${{ inputs.job_id }}
-      CHACHA_KEY:    ${{ secrets.CHACHA_KEY }}
-      CDN_DOMAIN:    ${{ secrets.CDN_DOMAIN }}
-      PIPELINE_API:  ${{ secrets.PIPELINE_API }}
-      ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+      WORK_DIR:       /tmp/sv_work/${{ inputs.job_id }}
+      CHACHA_KEY:     ${{ secrets.CHACHA_KEY }}
+      CDN_DOMAIN:     ${{ secrets.CDN_DOMAIN }}
+      PIPELINE_API:   ${{ secrets.PIPELINE_API }}
+      ADMIN_API_KEY:  ${{ secrets.ADMIN_API_KEY }}
+      DISPATCHER_URL: ${{ secrets.DISPATCHER_URL }}
 
     steps:
       # ── 0. Detectar modo ────────────────────────────────────────────────
@@ -467,8 +468,19 @@ jobs:
           safe_cid   = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
           dispatched = 0
 
-          dispatcher_base = re.sub(r'/api/.*$', '', os.environ.get('PIPELINE_API','').rstrip('/'))
+          # ── FIX: 404 no /dispatch (batido no domínio errado) ────────────
+          # dispatcher_base era derivado cortando "/api/..." do PIPELINE_API,
+          # assumindo que o dispatcher (Render, atrás de um Cloudflare
+          # Tunnel) vive na mesma origem que a API (Tencent EdgeOne) — não
+          # vive. PIPELINE_API continua intocado (é usado correctamente no
+          # registo Turso/KV via /api/pipeline/register e no resto do
+          # pipeline). O dispatcher agora usa o seu próprio secret dedicado.
+          dispatcher_base = os.environ.get('DISPATCHER_URL', '').rstrip('/')
           admin_key       = os.environ.get('ADMIN_API_KEY', '')
+
+          if not dispatcher_base:
+            print("ERRO: DISPATCHER_URL não configurado — não é possível disparar jobs filhos")
+            sys.exit(1)
 
           for bi, batch in enumerate(batches):
             indices_str = ','.join(str(v['index']) for v in batch)
@@ -1845,8 +1857,10 @@ jobs:
           )
         continue-on-error: true
         run: |
-          if [ -z "$PIPELINE_API" ]; then
-            echo "⚠ PIPELINE_API não configurado — webhook ignorado"
+          # FIX: dispatcher (Render) não vive na mesma origem que PIPELINE_API
+          # (EdgeOne) — usa o secret dedicado DISPATCHER_URL.
+          if [ -z "$DISPATCHER_URL" ]; then
+            echo "⚠ DISPATCHER_URL não configurado — webhook ignorado"
             exit 0
           fi
           # Fix #3: JOB_ID pode estar vazio se o step "Detectar modo" falhou
@@ -1863,7 +1877,7 @@ jobs:
           else
             WEBHOOK_STATUS="failed"
           fi
-          WEBHOOK_URL="$(echo "$PIPELINE_API" | sed 's|/api/.*||; s|/$||')/webhook"
+          WEBHOOK_URL="${DISPATCHER_URL%/}/webhook"
           echo "→ POST ${WEBHOOK_URL} (job_id=${EFFECTIVE_JOB_ID}, status=${WEBHOOK_STATUS})"
 
           HTTP_CODE=$(curl -s -o /tmp/wh_resp.txt -w '%{http_code}' -X POST \
