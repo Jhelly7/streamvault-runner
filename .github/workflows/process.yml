@@ -62,6 +62,10 @@ on:
         description: 'INTERNO: run_id do job principal'
         required: false
         default: ''
+      coordinator_queue:
+        description: 'INTERNO: fila JSON de episódios pendentes (chaining directo via GitHub API, sem passar pelo dispatcher Render)'
+        required: false
+        default: ''
 
 jobs:
   process:
@@ -315,17 +319,19 @@ jobs:
             contains(inputs.video_url, 'infohash:')
           )
         env:
-          INPUT_METADATA:  ${{ inputs.metadata }}
-          INPUT_VIDEO_URL: ${{ inputs.video_url }}
-          INPUT_THUMBNAIL: ${{ inputs.thumbnail_url }}
-          INPUT_SEG:       ${{ inputs.seg_duration }}
-          INPUT_HEIGHT:    ${{ inputs.max_encode_height }}
-          INPUT_WARM:      ${{ inputs.warm_concurrency }}
-          INPUT_SEASON:    ${{ inputs.season_number }}
+          INPUT_METADATA:    ${{ inputs.metadata }}
+          INPUT_VIDEO_URL:   ${{ inputs.video_url }}
+          INPUT_THUMBNAIL:   ${{ inputs.thumbnail_url }}
+          INPUT_SEG:         ${{ inputs.seg_duration }}
+          INPUT_HEIGHT:      ${{ inputs.max_encode_height }}
+          INPUT_WARM:        ${{ inputs.warm_concurrency }}
+          INPUT_SEASON:      ${{ inputs.season_number }}
+          STORAGE_TOKEN:     ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python3 << 'PYEOF'
           import libtorrent as lt
-          import os, sys, re, json, time, urllib.request, urllib.error
+          import os, sys, re, json, time, subprocess, urllib.request, urllib.error
 
           url          = os.environ['INPUT_VIDEO_URL']
           metadata_raw = os.environ['INPUT_METADATA']
@@ -465,23 +471,34 @@ jobs:
           for i, b in enumerate(batches):
             print(f"    Batch {i+1}: eps {[v['ep_num'] for v in b]} | ~{sum(v['size'] for v in b)//(1024*1024)}MB raw")
 
-          safe_cid   = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
-          dispatched = 0
+          safe_cid = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
 
-          # ── FIX: 404 no /dispatch (batido no domínio errado) ────────────
-          # dispatcher_base era derivado cortando "/api/..." do PIPELINE_API,
-          # assumindo que o dispatcher (Render, atrás de um Cloudflare
-          # Tunnel) vive na mesma origem que a API (Tencent EdgeOne) — não
-          # vive. PIPELINE_API continua intocado (é usado correctamente no
-          # registo Turso/KV via /api/pipeline/register e no resto do
-          # pipeline). O dispatcher agora usa o seu próprio secret dedicado.
-          dispatcher_base = os.environ.get('DISPATCHER_URL', '').rstrip('/')
-          admin_key       = os.environ.get('ADMIN_API_KEY', '')
-
-          if not dispatcher_base:
-            print("ERRO: DISPATCHER_URL não configurado — não é possível disparar jobs filhos")
-            sys.exit(1)
-
+          # ── FIX: dispatch directo via GitHub API, sem passar pelo dispatcher
+          # (Render) ───────────────────────────────────────────────────────
+          # Antes, cada lote era disparado via HTTP para {DISPATCHER_URL}/dispatch.
+          # Nos logs, TODAS as 13 chamadas voltaram HTTP 404 com a página do
+          # Tencent EdgeOne — ou seja, DISPATCHER_URL está a apontar para o
+          # domínio EdgeOne (frontend/CDN), não para o serviço Render onde o
+          # dispatcher (index.js) realmente vive. O index.js devolve 404 em
+          # JSON, nunca HTML do EdgeOne — isso confirma o domínio errado no
+          # secret. Independente dessa correção de infraestrutura (que ainda
+          # precisa de ser feita no secret DISPATCHER_URL), passamos a usar o
+          # MESMO padrão já comprovado no modo lote grande de vídeo único
+          # ("Disparar lote 0" / "[BATCH] Disparar próximo lote"): dispatch
+          # directo à API do GitHub Actions, com o STORAGE_GITHUB_TOKEN que já
+          # existe e tem scope 'workflow'. Isso elimina a dependência do
+          # dispatcher para a cadeia de episódios da série.
+          #
+          # Em vez de disparar os N episódios de uma vez (o que sobrecarrega
+          # o runner e o tracker de torrent simultaneamente), disparamos só o
+          # PRIMEIRO episódio, e anexamos os restantes como fila JSON no novo
+          # input 'coordinator_queue'. Cada episódio, ao terminar o seu
+          # próprio processamento, dispara o próximo da fila (ver step
+          # "[Coordinator] Disparar próximo episódio da fila" mais abaixo no
+          # workflow) — reproduzindo o mesmo encadeamento sequencial (FIFO)
+          # que já existia para os lotes de um vídeo único, mas agora também
+          # para os episódios de uma série/anime/dorama.
+          children = []
           for bi, batch in enumerate(batches):
             indices_str = ','.join(str(v['index']) for v in batch)
             ep_numbers  = ','.join(str(v['ep_num']) for v in batch)
@@ -489,44 +506,63 @@ jobs:
             child_id    = f"{safe_cid}-s{season_num:02d}-ep{first_ep:02d}-b{bi+1}"
             child_meta  = {**metadata, 'contentId': content_id or safe_cid}
 
-            payload = json.dumps({
+            children.append({
               'job_id':            child_id,
               'video_url':         url,
               'thumbnail_url':     os.environ.get('INPUT_THUMBNAIL',''),
               'seg_duration':      os.environ.get('INPUT_SEG','4'),
               'max_encode_height': os.environ.get('INPUT_HEIGHT','720'),
               'warm_concurrency':  os.environ.get('INPUT_WARM','8'),
-              'metadata':          child_meta,
+              'metadata':          json.dumps(child_meta),
               'season_number':     str(season_num),
               'episode_number':    ep_numbers,
               'episode_title':     '',
               'file_indices':      indices_str,
-            }).encode()
+            })
 
-            req = urllib.request.Request(
-              f"{dispatcher_base}/dispatch",
-              data=payload,
-              headers={
-                'Content-Type': 'application/json',
-                'x-api-key':    admin_key,
-                'User-Agent':   'StreamVault-Coordinator/3.0',
-              },
-              method='POST'
-            )
-            try:
-              with urllib.request.urlopen(req, timeout=30) as r:
-                resp = json.loads(r.read().decode())
-                pos  = resp.get('queue_position', 0)
-                st   = resp.get('status', '?')
-                print(f"  ✓ Batch {bi+1} → {child_id} ({st} fila #{pos+1})")
-                dispatched += 1
-            except urllib.error.HTTPError as e:
-              print(f"  ✗ Batch {bi+1} HTTP {e.code}: {e.read().decode()[:200]}")
-            except Exception as e:
-              print(f"  ✗ Batch {bi+1} erro: {e}")
-            if bi < len(batches) - 1: time.sleep(1)
+          if not children:
+            print("ERRO: nenhum filho preparado")
+            sys.exit(1)
 
-          print(f"\n✅ Coordinator: {dispatched}/{len(batches)} jobs em fila FIFO")
+          storage_token = os.environ.get('STORAGE_TOKEN', '')
+          github_repo   = os.environ.get('GITHUB_REPOSITORY', '')
+
+          if not storage_token or not github_repo:
+            print("ERRO: STORAGE_TOKEN ou GITHUB_REPOSITORY indisponíveis — não é possível disparar directo via GitHub API")
+            sys.exit(1)
+
+          first_child, *rest_children = children
+          first_child['coordinator_queue'] = json.dumps(rest_children)
+
+          ok = False
+          for attempt in range(1, 5):
+            r = subprocess.run([
+              'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
+              '-H', f'Authorization: Bearer {storage_token}',
+              '-H', 'Accept: application/vnd.github+json',
+              '-H', 'X-GitHub-Api-Version: 2022-11-28',
+              f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
+              '-d', json.dumps({'ref': 'main', 'inputs': first_child}),
+            ], capture_output=True, text=True)
+            code = r.stdout.strip()
+            if code == '204':
+              print(f"  ✓ Episódio 1/{len(children)} disparado directamente via GitHub API: {first_child['job_id']}")
+              print(f"  ✓ {len(rest_children)} episódio(s) encadeado(s) na fila (coordinator_queue)")
+              ok = True
+              break
+            elif code.startswith('5') or code == '':
+              wait = [10, 30, 60][attempt-1] if attempt <= 3 else 60
+              print(f"  ⚠ Tentativa {attempt}/4 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
+              time.sleep(wait)
+            else:
+              print(f"  ✗ Erro HTTP {code} (não retry)")
+              break
+
+          if not ok:
+            print("✗ Falha ao disparar primeiro episódio — coordinator abortado")
+            sys.exit(1)
+
+          print(f"\n✅ Coordinator: cadeia FIFO iniciada — {len(children)} episódio(s) via GitHub Actions API directa (dispatcher Render não é mais necessário nesta etapa)")
           sys.exit(0)
           PYEOF
 
@@ -1378,71 +1414,70 @@ jobs:
           GITHUB_RUN_ID:     ${{ github.run_id }}
           METADATA:          ${{ inputs.metadata }}
 
-      # ── Disparar próximo lote (batch mode) ──────────────────────────────
-      - name: '[BATCH] Disparar próximo lote'
-        if: env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH != 'true'
+      # ── Encadeamento do coordinator: disparar próximo episódio da fila ──
+      # Roda no fim de QUALQUER job em modo completo (não-batch_upload) que
+      # tenha recebido uma fila (coordinator_queue não vazia) — ou seja,
+      # todo episódio de série/anime/dorama disparado pelo Coordinator ou
+      # por este mesmo step num episódio anterior. Usa "always()" para que
+      # a falha de UM episódio (ex: encode falhou) não interrompa a cadeia
+      # inteira — o próximo episódio ainda é disparado.
+      - name: '[Coordinator] Disparar próximo episódio da fila'
+        if: always() && env.IS_BATCH_MODE != 'true' && inputs.coordinator_queue != ''
         env:
-          DISPATCH_TOKEN:    ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          STORAGE_TOKEN:     ${{ secrets.STORAGE_GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          METADATA:          ${{ inputs.metadata }}
-          JOB_ID_INPUT:      ${{ inputs.job_id }}
-          NEXT_BATCH:        ${{ inputs.upload_batch }}
-          TOTAL_BATCHES:     ${{ inputs.total_batches }}
-          PARENT_RUN_ID:     ${{ inputs.parent_run_id }}
+          COORDINATOR_QUEUE: ${{ inputs.coordinator_queue }}
         run: |
           python3 << 'PYEOF'
-          import os, subprocess, json, time
+          import os, json, subprocess, time
 
-          next_batch    = int(os.environ['NEXT_BATCH']) + 1
-          total_batches = int(os.environ['TOTAL_BATCHES'])
-          job_id        = os.environ['JOB_ID_INPUT']
-          dispatch_token = os.environ['DISPATCH_TOKEN']
-          github_repo   = os.environ['GITHUB_REPOSITORY']
-          parent_run_id = os.environ['PARENT_RUN_ID']
-          metadata_raw  = os.environ.get('METADATA', '{}')
+          queue_raw = os.environ.get('COORDINATOR_QUEUE', '').strip()
+          if not queue_raw:
+            print("  Fila vazia — nada a encadear")
+            raise SystemExit(0)
 
-          # Validar que metadata é JSON válido — se não for, usar {}
           try:
-            json.loads(metadata_raw)
-          except Exception:
-            metadata_raw = '{}'
+            queue = json.loads(queue_raw)
+          except Exception as e:
+            print(f"  ✗ coordinator_queue inválida: {e}")
+            raise SystemExit(0)
 
-          payload = {
-            'ref': 'main',
-            'inputs': {
-              'job_id':        job_id,
-              'upload_mode':   'batch_upload',
-              'upload_batch':  str(next_batch),
-              'total_batches': str(total_batches),
-              'parent_run_id': parent_run_id,
-              'video_url':     '',
-              'metadata':      metadata_raw,
-              'file_indices':  '',
-            }
-          }
+          if not queue:
+            print("  ✓ Fila vazia — coordinator concluído (último episódio já disparado)")
+            raise SystemExit(0)
 
+          next_child, *rest = queue
+          next_child = dict(next_child)
+          next_child['coordinator_queue'] = json.dumps(rest)
+
+          storage_token = os.environ['STORAGE_TOKEN']
+          github_repo   = os.environ['GITHUB_REPOSITORY']
+
+          ok = False
           for attempt in range(1, 5):
             r = subprocess.run([
               'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
-              '-H', f'Authorization: Bearer {dispatch_token}',
+              '-H', f'Authorization: Bearer {storage_token}',
               '-H', 'Accept: application/vnd.github+json',
               '-H', 'X-GitHub-Api-Version: 2022-11-28',
               f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
-              '-d', json.dumps(payload),
+              '-d', json.dumps({'ref': 'main', 'inputs': next_child}),
             ], capture_output=True, text=True)
             code = r.stdout.strip()
             if code == '204':
-              print(f"  ✓ Lote {next_batch}/{total_batches} disparado (tentativa {attempt})")
+              print(f"  ✓ Próximo episódio disparado: {next_child.get('job_id')} | fila restante: {len(rest)}")
+              ok = True
               break
             elif code.startswith('5') or code == '':
-              wait = [10, 30, 60][attempt - 1] if attempt <= 3 else 60
+              wait = [10, 30, 60][attempt-1] if attempt <= 3 else 60
               print(f"  ⚠ Tentativa {attempt}/4 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
               time.sleep(wait)
             else:
-              print(f"  ✗ Erro HTTP {code} (não retry)")
+              print(f"  ✗ Erro HTTP {code} (não retry): {r.stdout[:200]}")
               break
-          else:
-            print(f"  ✗ Lote {next_batch} não disparado após 4 tentativas")
+
+          if not ok:
+            print(f"  ✗ Falha ao disparar próximo episódio após tentativas — cadeia interrompida em {next_child.get('job_id')}")
           PYEOF
 
       # ── Eliminar artifact após último lote ──────────────────────────────
