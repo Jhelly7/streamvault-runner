@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: 'Job ID (tag da Release)'
+        description: 'Job ID'
         required: true
       video_url:
         description: 'URL do vídeo — HTTP(S), magnet:, .torrent'
@@ -18,10 +18,6 @@ on:
         description: 'Altura máxima encode'
         required: false
         default: '720'
-      warm_concurrency:
-        description: 'Concorrência do warm'
-        required: false
-        default: '8'
       metadata:
         description: 'JSON: { contentId, title, description, type, year, lang }'
         required: false
@@ -46,22 +42,6 @@ on:
         description: 'Índices dos ficheiros no torrent'
         required: false
         default: ''
-      upload_mode:
-        description: 'INTERNO: modo de upload'
-        required: false
-        default: ''
-      upload_batch:
-        description: 'INTERNO: índice do lote'
-        required: false
-        default: '0'
-      total_batches:
-        description: 'INTERNO: total de lotes'
-        required: false
-        default: '0'
-      parent_run_id:
-        description: 'INTERNO: run_id do job principal'
-        required: false
-        default: ''
       coordinator_queue:
         description: 'INTERNO: fila JSON de episódios pendentes (chaining directo via GitHub API, sem passar pelo dispatcher Render)'
         required: false
@@ -75,237 +55,39 @@ jobs:
     env:
       WORK_DIR:       /tmp/sv_work/${{ inputs.job_id }}
       CHACHA_KEY:     ${{ secrets.CHACHA_KEY }}
-      CDN_DOMAIN:     ${{ secrets.CDN_DOMAIN }}
       PIPELINE_API:   ${{ secrets.PIPELINE_API }}
       ADMIN_API_KEY:  ${{ secrets.ADMIN_API_KEY }}
       DISPATCHER_URL: ${{ secrets.DISPATCHER_URL }}
 
     steps:
-      # ── 0. Detectar modo ────────────────────────────────────────────────
-      - name: Detectar modo de execução
-        id: mode
+      # ── 0. Preparar ambiente ─────────────────────────────────────────────
+      - name: Preparar ambiente
         run: |
-          if [ "${{ inputs.upload_mode }}" = "batch_upload" ]; then
-            echo "→ Modo: UPLOAD BATCH ${{ inputs.upload_batch }}/${{ inputs.total_batches }}"
-            echo "IS_BATCH_MODE=true" >> $GITHUB_ENV
-            echo "BATCH_INDEX=${{ inputs.upload_batch }}" >> $GITHUB_ENV
-            echo "TOTAL_BATCHES=${{ inputs.total_batches }}" >> $GITHUB_ENV
-            echo "PARENT_RUN_ID=${{ inputs.parent_run_id }}" >> $GITHUB_ENV
-          else
-            echo "→ Modo: COMPLETO (download + encode + upload)"
-            echo "IS_BATCH_MODE=false" >> $GITHUB_ENV
-          fi
           echo "JOB_ID=${{ inputs.job_id }}"             >> $GITHUB_ENV
           echo "SEG_DURATION=${{ inputs.seg_duration }}" >> $GITHUB_ENV
           echo "MAX_H=${{ inputs.max_encode_height }}"   >> $GITHUB_ENV
-          echo "WARM_C=${{ inputs.warm_concurrency }}"   >> $GITHUB_ENV
-
-      - name: Preparar ambiente
-        run: |
-          mkdir -p $WORK_DIR/incoming $WORK_DIR/hls $WORK_DIR/thumbs
-
-      # ═══════════════════════════════════════════════════════════════════
-      # MODO BATCH
-      # ═══════════════════════════════════════════════════════════════════
-
-      - name: '[BATCH] Download artifact da run pai'
-        if: env.IS_BATCH_MODE == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: segs-${{ inputs.job_id }}
-          path: /tmp/batches/
-          run-id: ${{ inputs.parent_run_id }}
-          github-token: ${{ secrets.STORAGE_GITHUB_TOKEN }}
-
-      - name: '[BATCH] Extrair lote e fazer upload'
-        if: env.IS_BATCH_MODE == 'true'
-        env:
-          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
-          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
-          STORAGE_REPO:  ${{ secrets.STORAGE_GITHUB_REPO }}
-        run: |
-          python3 << 'PYEOF'
-          import os, subprocess, json, tarfile, time
-
-          job_id        = os.environ['JOB_ID']
-          batch_index   = int(os.environ['BATCH_INDEX'])
-          total_batches = int(os.environ['TOTAL_BATCHES'])
-          storage_token = os.environ['STORAGE_TOKEN']
-          storage_owner = os.environ['STORAGE_OWNER']
-          storage_repo  = os.environ['STORAGE_REPO']
-          work_dir      = os.environ['WORK_DIR']
-          github_env    = os.environ['GITHUB_ENV']
-
-          # Cada lote usa a sua própria release: {job_id}-bN
-          # Isso evita o limite de 2GB por release do GitHub.
-          batch_tag = f"{job_id}-b{batch_index}"
-          print(f"  Lote {batch_index+1}/{total_batches} → release: {batch_tag}")
-
-          batch_file = f'/tmp/batches/batch_{batch_index:03d}.tar'
-          if not os.path.exists(batch_file):
-            print(f"  ✗ Arquivo {batch_file} não encontrado")
-            print(f"  Conteúdo de /tmp/batches/: {os.listdir('/tmp/batches/')}")
-            exit(1)
-
-          os.makedirs(f'{work_dir}/hls', exist_ok=True)
-          with tarfile.open(batch_file, 'r') as tar:
-            tar.extractall(f'{work_dir}/hls')
-
-          seg_files = sorted([f for f in os.listdir(f'{work_dir}/hls')
-                             if f.endswith('.bin') or '.bin.part' in f])
-          print(f"  {len(seg_files)} segmentos extraídos")
-
-          # Criar release {job_id}-bN (nova, sem assets anteriores para colidir)
-          r = subprocess.run([
-            'curl', '-sf', '-X', 'POST',
-            '-H', f'Authorization: Bearer {storage_token}',
-            '-H', 'Accept: application/vnd.github+json',
-            '-H', 'X-GitHub-Api-Version: 2022-11-28',
-            f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases',
-            '-d', json.dumps({
-              'tag_name':   batch_tag,
-              'name':       batch_tag,
-              'body':       f'jobId={job_id} | batch={batch_index}',
-              'draft':      False,
-              'prerelease': False,
-            }),
-          ], capture_output=True, text=True)
-
-          if r.returncode != 0 or not r.stdout.strip():
-            # Release pode já existir (retry de lote falhado) — tentar obter
-            print(f"  ⚠ Criar release falhou — a tentar obter release existente...")
-            r = subprocess.run([
-              'curl', '-sf',
-              '-H', f'Authorization: Bearer {storage_token}',
-              '-H', 'Accept: application/vnd.github+json',
-              '-H', 'X-GitHub-Api-Version: 2022-11-28',
-              f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{batch_tag}',
-            ], capture_output=True, text=True)
-
-          try:
-            release = json.loads(r.stdout)
-            upload_url = release['upload_url'].split('{')[0]
-          except Exception as e:
-            print(f"  ✗ Não foi possível obter upload_url: {e}")
-            print(f"  Resposta: {r.stdout[:300]}")
-            exit(1)
-
-          existing = {a['name']: a['id'] for a in release.get('assets', [])}
-          print(f"  ✓ Release {batch_tag} pronta | assets existentes: {len(existing)}")
-
-          ok = 0
-          start_time = time.time()
-
-          for i, fname in enumerate(seg_files):
-            fpath = os.path.join(f'{work_dir}/hls', fname)
-
-            # Se asset já existe (retry), apagar antes de re-upload
-            if fname in existing:
-              subprocess.run([
-                'curl', '-sf', '-X', 'DELETE',
-                '-H', f'Authorization: Bearer {storage_token}',
-                '-H', 'Accept: application/vnd.github+json',
-                f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{existing[fname]}',
-              ], capture_output=True)
-              time.sleep(0.3)
-
-            r = subprocess.run([
-              'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
-              '-X', 'POST',
-              '-H', f'Authorization: Bearer {storage_token}',
-              '-H', 'Content-Type: application/octet-stream',
-              '--max-time', '120',
-              f'{upload_url}?name={fname}',
-              '--data-binary', f'@{fpath}',
-            ], capture_output=True, text=True)
-
-            code = r.stdout.strip()
-            if code == '201':
-              ok += 1
-              if ok % 50 == 0:
-                elapsed = time.time() - start_time
-                print(f"  ... {ok}/{len(seg_files)} ({elapsed:.0f}s)")
-            elif code == '422':
-              # 422 = asset já existe com este nome (race condition) — apagar e retry
-              print(f"  ⚠ {fname} 422 (duplicado) — a apagar e retentar...")
-              r2 = subprocess.run([
-                'curl', '-sf',
-                '-H', f'Authorization: Bearer {storage_token}',
-                '-H', 'Accept: application/vnd.github+json',
-                f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{batch_tag}',
-              ], capture_output=True, text=True)
-              try:
-                fresh_assets = {a['name']: a['id'] for a in json.loads(r2.stdout).get('assets', [])}
-                if fname in fresh_assets:
-                  subprocess.run([
-                    'curl', '-sf', '-X', 'DELETE',
-                    '-H', f'Authorization: Bearer {storage_token}',
-                    f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{fresh_assets[fname]}',
-                  ], capture_output=True)
-                  time.sleep(0.5)
-                  r3 = subprocess.run([
-                    'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
-                    '-X', 'POST',
-                    '-H', f'Authorization: Bearer {storage_token}',
-                    '-H', 'Content-Type: application/octet-stream',
-                    '--max-time', '120',
-                    f'{upload_url}?name={fname}',
-                    '--data-binary', f'@{fpath}',
-                  ], capture_output=True, text=True)
-                  if r3.stdout.strip() == '201':
-                    ok += 1
-                  else:
-                    print(f"  ✗ {fname} HTTP {r3.stdout.strip()} após retry 422")
-              except Exception as e:
-                print(f"  ✗ {fname} erro no retry 422: {e}")
-            elif code == '429':
-              print(f"  ⚠ Rate limit - pausa 60s...")
-              time.sleep(60)
-              r = subprocess.run([
-                'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}',
-                '-X', 'POST',
-                '-H', f'Authorization: Bearer {storage_token}',
-                '-H', 'Content-Type: application/octet-stream',
-                '--max-time', '120',
-                f'{upload_url}?name={fname}',
-                '--data-binary', f'@{fpath}',
-              ], capture_output=True, text=True)
-              if r.stdout.strip() == '201':
-                ok += 1
-              else:
-                print(f"  ✗ {fname} HTTP {r.stdout.strip()} após retry 429")
-            else:
-              print(f"  ✗ {fname} HTTP {code}")
-
-          print(f"  ✅ Lote {batch_index+1}: {ok}/{len(seg_files)} uploaded → {batch_tag}")
-
-          is_last = (batch_index + 1 >= total_batches)
-          with open(github_env, 'a') as f:
-            f.write(f"IS_LAST_BATCH={'true' if is_last else 'false'}\n")
-            f.write(f"BATCH_OK={ok}\n")
-          PYEOF
-
-      # ═══════════════════════════════════════════════════════════════════
-      # MODO COMPLETO
-      # ═══════════════════════════════════════════════════════════════════
+          mkdir -p "/tmp/sv_work/${{ inputs.job_id }}/incoming" \
+                   "/tmp/sv_work/${{ inputs.job_id }}/hls" \
+                   "/tmp/sv_work/${{ inputs.job_id }}/thumbs"
 
       - name: Instalar FFmpeg
-        if: env.IS_BATCH_MODE != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ffmpeg
           ffmpeg -version | head -1
 
       - name: Instalar dependências Python + libtorrent
-        if: env.IS_BATCH_MODE != 'true'
         run: |
           pip install --quiet --upgrade cryptography
           sudo apt-get install -y --no-install-recommends python3-libtorrent
           python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
+      # ═══════════════════════════════════════════════════════════════════
+      # COORDINATOR (séries/anime/dorama)
+      # ═══════════════════════════════════════════════════════════════════
+
       - name: '[Coordinator] Detectar episódios e disparar jobs filhos'
         if: |
-          env.IS_BATCH_MODE != 'true' &&
           inputs.video_url != '' &&
           inputs.file_indices == '' &&
           (
@@ -324,7 +106,6 @@ jobs:
           INPUT_THUMBNAIL:   ${{ inputs.thumbnail_url }}
           INPUT_SEG:         ${{ inputs.seg_duration }}
           INPUT_HEIGHT:      ${{ inputs.max_encode_height }}
-          INPUT_WARM:        ${{ inputs.warm_concurrency }}
           INPUT_SEASON:      ${{ inputs.season_number }}
           STORAGE_TOKEN:     ${{ secrets.STORAGE_GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -368,21 +149,6 @@ jobs:
 
           print("  Aguardando metadados...")
           t0 = time.time()
-          # ── FIX: Coordinator abortava com 0 peers em CI ─────────────────
-          # Antes, o timeout aqui era de 120s (2 min) e fatal (sys.exit(1)).
-          # O modo filme ([Modo A] Descarregar vídeo) nunca teve esse limite
-          # tão curto — usa até 3600s (1h) no loop geral, e quando tem um
-          # timeout de metadados dedicado (60s), trata como NÃO-fatal e
-          # continua mesmo assim. Em runners do GitHub Actions, IPs
-          # partilhados/reciclados são frequentemente mal vistos por
-          # trackers e nós de bootstrap DHT (throttling anti-abuso), o que
-          # atrasa a descoberta de peers em relação a uma rede residencial.
-          # Com só 120s, muitas vezes o DHT desta sessão recém-criada nem
-          # tinha tido tempo de se popular o suficiente — daí "0 peers"
-          # sempre, independentemente do magnet ter seeders reais.
-          # Agora: mesmo timeout generoso do modo filme (600s = 10 min é
-          # suficiente na prática, mas deixamos 900s de margem), com nós de
-          # bootstrap DHT explícitos para acelerar a descoberta inicial.
           try:
             ses.add_dht_router("router.bittorrent.com", 6881)
             ses.add_dht_router("router.utorrent.com", 6881)
@@ -390,7 +156,7 @@ jobs:
           except Exception as e:
             print(f"  ⚠ add_dht_router parcial: {e}")
 
-          METADATA_TIMEOUT = 900  # 15 min — alinhado à tolerância do modo filme
+          METADATA_TIMEOUT = 900
           while not handle.status().has_metadata:
             if time.time() - t0 > METADATA_TIMEOUT:
               print(f"ERRO: timeout metadados ({METADATA_TIMEOUT}s)")
@@ -473,31 +239,6 @@ jobs:
 
           safe_cid = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
 
-          # ── FIX: dispatch directo via GitHub API, sem passar pelo dispatcher
-          # (Render) ───────────────────────────────────────────────────────
-          # Antes, cada lote era disparado via HTTP para {DISPATCHER_URL}/dispatch.
-          # Nos logs, TODAS as 13 chamadas voltaram HTTP 404 com a página do
-          # Tencent EdgeOne — ou seja, DISPATCHER_URL está a apontar para o
-          # domínio EdgeOne (frontend/CDN), não para o serviço Render onde o
-          # dispatcher (index.js) realmente vive. O index.js devolve 404 em
-          # JSON, nunca HTML do EdgeOne — isso confirma o domínio errado no
-          # secret. Independente dessa correção de infraestrutura (que ainda
-          # precisa de ser feita no secret DISPATCHER_URL), passamos a usar o
-          # MESMO padrão já comprovado no modo lote grande de vídeo único
-          # ("Disparar lote 0" / "[BATCH] Disparar próximo lote"): dispatch
-          # directo à API do GitHub Actions, com o STORAGE_GITHUB_TOKEN que já
-          # existe e tem scope 'workflow'. Isso elimina a dependência do
-          # dispatcher para a cadeia de episódios da série.
-          #
-          # Em vez de disparar os N episódios de uma vez (o que sobrecarrega
-          # o runner e o tracker de torrent simultaneamente), disparamos só o
-          # PRIMEIRO episódio, e anexamos os restantes como fila JSON no novo
-          # input 'coordinator_queue'. Cada episódio, ao terminar o seu
-          # próprio processamento, dispara o próximo da fila (ver step
-          # "[Coordinator] Disparar próximo episódio da fila" mais abaixo no
-          # workflow) — reproduzindo o mesmo encadeamento sequencial (FIFO)
-          # que já existia para os lotes de um vídeo único, mas agora também
-          # para os episódios de uma série/anime/dorama.
           children = []
           for bi, batch in enumerate(batches):
             indices_str = ','.join(str(v['index']) for v in batch)
@@ -512,7 +253,6 @@ jobs:
               'thumbnail_url':     os.environ.get('INPUT_THUMBNAIL',''),
               'seg_duration':      os.environ.get('INPUT_SEG','4'),
               'max_encode_height': os.environ.get('INPUT_HEIGHT','720'),
-              'warm_concurrency':  os.environ.get('INPUT_WARM','8'),
               'metadata':          json.dumps(child_meta),
               'season_number':     str(season_num),
               'episode_number':    ep_numbers,
@@ -528,7 +268,7 @@ jobs:
           github_repo   = os.environ.get('GITHUB_REPOSITORY', '')
 
           if not storage_token or not github_repo:
-            print("ERRO: STORAGE_TOKEN ou GITHUB_REPOSITORY indisponíveis — não é possível disparar directo via GitHub API")
+            print("ERRO: STORAGE_TOKEN ou GITHUB_REPOSITORY indisponíveis")
             sys.exit(1)
 
           first_child, *rest_children = children
@@ -546,8 +286,8 @@ jobs:
             ], capture_output=True, text=True)
             code = r.stdout.strip()
             if code == '204':
-              print(f"  ✓ Episódio 1/{len(children)} disparado directamente via GitHub API: {first_child['job_id']}")
-              print(f"  ✓ {len(rest_children)} episódio(s) encadeado(s) na fila (coordinator_queue)")
+              print(f"  ✓ Episódio 1/{len(children)} disparado: {first_child['job_id']}")
+              print(f"  ✓ {len(rest_children)} episódio(s) encadeado(s) na fila")
               ok = True
               break
             elif code.startswith('5') or code == '':
@@ -562,12 +302,16 @@ jobs:
             print("✗ Falha ao disparar primeiro episódio — coordinator abortado")
             sys.exit(1)
 
-          print(f"\n✅ Coordinator: cadeia FIFO iniciada — {len(children)} episódio(s) via GitHub Actions API directa (dispatcher Render não é mais necessário nesta etapa)")
+          print(f"\n✅ Coordinator: cadeia FIFO iniciada — {len(children)} episódio(s)")
           sys.exit(0)
           PYEOF
 
+      # ═══════════════════════════════════════════════════════════════════
+      # DOWNLOAD / ENCODE / ENCRIPTAÇÃO
+      # ═══════════════════════════════════════════════════════════════════
+
       - name: '[Modo A] Descarregar vídeo'
-        if: env.IS_BATCH_MODE != 'true' && inputs.video_url != ''
+        if: inputs.video_url != ''
         run: |
           URL="${{ inputs.video_url }}"
           if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
@@ -683,22 +427,18 @@ jobs:
           FILE_INDICES_ENV: ${{ inputs.file_indices }}
 
       - name: '[Modo B] Obter vídeo via Artifact'
-        if: env.IS_BATCH_MODE != 'true' && inputs.video_url == ''
+        if: inputs.video_url == ''
         uses: actions/download-artifact@v4
         with:
           name: video-${{ inputs.job_id }}
           path: ${{ env.WORK_DIR }}/incoming/
 
       - name: Detectar ficheiro de vídeo (+ extrair .rar/.zip se necessário)
-        if: env.IS_BATCH_MODE != 'true'
         run: |
           VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
           FILE_INDICES="${{ inputs.file_indices }}"
           if [ -n "$FILE_INDICES" ]; then
             echo "→ Modo worker | file_indices: $FILE_INDICES"
-            echo "FILE_INDICES_ACTIVE=true" >> $GITHUB_ENV
-          else
-            echo "FILE_INDICES_ACTIVE=false" >> $GITHUB_ENV
           fi
 
           find_video() {
@@ -756,7 +496,6 @@ jobs:
           echo "✓ Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
 
       - name: Probe do vídeo
-        if: env.IS_BATCH_MODE != 'true'
         run: |
           ffprobe -v quiet -print_format json -show_streams -show_format "$VIDEO_PATH" > "$WORK_DIR/probe.json"
           python3 << 'PYEOF'
@@ -798,7 +537,6 @@ jobs:
           PYEOF
 
       - name: HLS encode (fMP4 + libx264 superfast CRF26 + AAC 128k)
-        if: env.IS_BATCH_MODE != 'true'
         run: |
           HLS_DIR="$WORK_DIR/hls"
           if [ "$WILL_SCALE" = "true" ]; then
@@ -828,7 +566,6 @@ jobs:
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
       - name: Obter thumbnails
-        if: env.IS_BATCH_MODE != 'true'
         env:
           INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
         run: |
@@ -840,24 +577,13 @@ jobs:
           thumb_url = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
           thumbs    = []
 
-          # ── FIX: suporte a múltiplas extensões de thumbnail ─────────────
-          # Antes, o ficheiro era SEMPRE gravado como "thumb_0.jpg" mesmo
-          # quando thumbnail_url apontava para um .webp/.png real — os bytes
-          # eram webp/png mas o nome ficava .jpg. Isso não quebra o browser
-          # (que faz sniffing pelo conteúdo), mas o Worker do CDN decide o
-          # TTL de cache pela EXTENSÃO do nome do ficheiro — um webp
-          # "disfarçado" de .jpg acabava a cair certo no TTL de imagem só
-          # por coincidência de mapeamento, mas o inverso (perder a extensão
-          # correta) impede adicionar regras específicas por formato depois.
-          # Agora detectamos o formato real pelos magic bytes e gravamos com
-          # a extensão correta; a extensão vai também para o manifest.
           def detect_image_ext(path):
             with open(path, 'rb') as f:
               h = f.read(16)
             if h[:3] == b'\xff\xd8\xff':                                    return 'jpg'
             if h[:4] == b'\x89PNG':                                          return 'png'
             if h[:4] == b'RIFF' and len(h) >= 12 and h[8:12] == b'WEBP':     return 'webp'
-            if h[:4] == b'RIFF':                                             return 'webp'  # RIFF sem confirmar subtipo — assume webp (caso mais comum aqui)
+            if h[:4] == b'RIFF':                                             return 'webp'
             if h[:6] in (b'GIF87a', b'GIF89a'):                              return 'gif'
             if h[:2] == b'BM':                                               return 'bmp'
             if h[:4] in (b'II*\x00', b'MM\x00*'):                            return 'tiff'
@@ -875,7 +601,6 @@ jobs:
                     (len(h) >= 8 and h[4:8] == b'ftyp'))
 
           def finalize_thumb(tmp_path, index=0, time_s=0):
-            """Renomeia tmp_path para thumb_{index}.{ext_real} e devolve o path final."""
             ext = detect_image_ext(tmp_path)
             final_path = f"{thumb_dir}/thumb_{index}.{ext}"
             if tmp_path != final_path:
@@ -923,7 +648,6 @@ jobs:
           PYEOF
 
       - name: Encriptar segmentos → .bin
-        if: env.IS_BATCH_MODE != 'true'
         run: |
           python3 << 'PYEOF'
           import os, json, secrets, struct
@@ -972,100 +696,222 @@ jobs:
           print(f"✓ {len(seg_files)} segmentos encriptados")
           PYEOF
 
-      # ── FIX #1 ────────────────────────────────────────────────────────
-      # Este step foi movido para ANTES de "Reescrever index.m3u8 com URLs
-      # CDN" (e de "Gerar cdn_urls.json"). Antes, ele rodava DEPOIS desses
-      # dois steps, mas escrevia NEED_BATCHES/TOTAL_BATCHES via $GITHUB_ENV
-      # — que só fica disponível a partir do PRÓXIMO step do job, nunca no
-      # mesmo ou em steps anteriores. Resultado: os dois steps que geram as
-      # URLs liam sempre env.NEED_BATCHES == '' (vazio) → caíam no ramo
-      # "release única" mesmo quando o vídeo excedia 900 assets e ia, de
-      # facto, para releases em lote ({job_id}-bN). O index.m3u8/cdn_urls.json
-      # ficavam com URLs {job_id}/hls/segNNNNN.bin que nunca existiam,
-      # enquanto os segmentos reais estavam em {job_id}-bN/hls/segNNNNN.bin.
-      # Só depende do hls_dir (já populado após a encriptação) e do
-      # thumb_dir — por isso pode rodar aqui, logo depois de "Encriptar
-      # segmentos → .bin".
-      - name: Verificar necessidade de upload em lotes
-        if: env.IS_BATCH_MODE != 'true'
-        id: check_batches
+      # ═══════════════════════════════════════════════════════════════════
+      # GIT-SHARD REFACTORING CIRÚRGICO
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: Escolher shard de storage
+        env:
+          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
         run: |
           python3 << 'PYEOF'
-          import os
-          hls_dir = os.environ['WORK_DIR'] + '/hls'
-          thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
-          IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic')
-          seg_count = len([f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin' and '.part' not in f])
-          meta_count = 4
-          if os.path.exists(os.path.join(hls_dir, 'init.bin')): meta_count += 1
-          if os.path.isdir(thumb_dir): meta_count += len([f for f in os.listdir(thumb_dir) if f.lower().endswith(IMG_EXTS)])
-          total = meta_count + seg_count
-          NEED_BATCHES = total > 900
-          BATCH_SIZE = 500
-          total_batches = (seg_count + BATCH_SIZE - 1) // BATCH_SIZE if NEED_BATCHES else 0
+          import os, subprocess, json
+
+          THRESHOLD_KB = 3_500 * 1024
+          owner = os.environ['STORAGE_OWNER']
+          token = os.environ['STORAGE_TOKEN']
+          shard_cache = {}
+
+          def api(method, path, data=None):
+            cmd = ['curl','-sf','-X',method,'-H',f'Authorization: Bearer {token}',
+                   '-H','Accept: application/vnd.github+json',
+                   f'https://api.github.com{path}']
+            if data is not None:
+              cmd += ['-d', json.dumps(data)]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            return r.returncode, r.stdout
+
+          def pick_shard():
+            n = 1
+            while True:
+              repo = f'streamvault-storage-{n:02d}'
+              
+              if repo in shard_cache:
+                size_kb = shard_cache[repo]
+              else:
+                code, out = api('GET', f'/repos/{owner}/{repo}')
+                if code != 0:
+                  print(f"  → {repo} não existe, a criar...")
+                  cc, cout = api('POST', '/user/repos', 
+                    {'name': repo, 'private': False, 'auto_init': True})
+                  if cc != 0:
+                    print(f"  ✗ Falha ao criar {repo}: {cout[:200]}")
+                    raise SystemExit(1)
+                  return repo
+                size_kb = json.loads(out).get('size', 0)
+                shard_cache[repo] = size_kb
+              
+              size_mb = size_kb // 1024
+              print(f"  {repo}: {size_mb}MB")
+              
+              if size_kb < THRESHOLD_KB:
+                return repo
+              
+              n += 1
+
+          shard = pick_shard()
+          print(f"✓ Shard escolhido: {shard}")
+
           with open(os.environ['GITHUB_ENV'], 'a') as f:
-            f.write(f"NEED_BATCHES={'true' if NEED_BATCHES else 'false'}\n")
-            f.write(f"TOTAL_BATCHES={total_batches}\n")
-            f.write(f"SEG_COUNT={seg_count}\n")
-          print(f"  Segmentos: {seg_count} | Metadados: {meta_count} | Total: {total}")
-          print(f"  {'⚠ Precisa lotes' if NEED_BATCHES else '✓ Upload normal'}")
-          if NEED_BATCHES: print(f"  Lotes: {total_batches} × {BATCH_SIZE} segmentos")
+            f.write(f"SHARD_REPO={shard}\n")
           PYEOF
 
-      - name: Reescrever index.m3u8 com URLs CDN
-        if: env.IS_BATCH_MODE != 'true'
+      - name: Verificar se artefatos já existem no shard
+        continue-on-error: true
+        env:
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
+        run: |
+          python3 << 'PYEOF'
+          import os, urllib.request, urllib.error
+          
+          owner = os.environ['STORAGE_OWNER']
+          shard = os.environ['SHARD_REPO']
+          job_id = os.environ['JOB_ID']
+          
+          test_url = f"https://raw.githubusercontent.com/{owner}/{shard}/storage-main/{job_id}/hls/init.bin"
+          
+          try:
+            req = urllib.request.Request(test_url, method='HEAD')
+            with urllib.request.urlopen(req, timeout=10) as r:
+              print(f"  ⚠ {job_id} já existe no {shard} (HTTP {r.status}) — pulando upload")
+              raise SystemExit(0)
+          except urllib.error.HTTPError as e:
+            if e.code == 404:
+              print(f"  ✓ {job_id} não existe — prosseguindo com commit")
+              raise SystemExit(1)
+            else:
+              print(f"  ⚠ Verificação retornou HTTP {e.code} — continuando por segurança")
+              raise SystemExit(1)
+          except Exception as e:
+            print(f"  ⚠ Verificação falhou ({e}) — continuando")
+            raise SystemExit(1)
+          PYEOF
+
+      - name: Commit + push dos segmentos para o shard (com retry e config git performance)
+        env:
+          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
+        run: |
+          set -e
+          
+          # ── Config git para performance + delta ──────────────────────────
+          git config --global core.deltaBaseCacheLimit 2047m
+          git config --global core.looseObjects 0
+          git config --global pack.compression 9
+          git config --global repack.useDeltaBaseOffset true
+          
+          REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${SHARD_REPO}.git"
+
+          clone_with_retry() {
+            for attempt in 1 2 3; do
+              if git clone --depth=1 --filter=blob:none --single-branch --branch storage-main "$REPO_URL" /tmp/shard 2>/dev/null; then
+                return 0
+              fi
+              if [ $attempt -lt 3 ]; then
+                echo "  ⚠ Clone tentativa $attempt falhou — a retentar..."
+                sleep $((attempt * 5))
+              fi
+            done
+            git clone --depth=1 --filter=blob:none "$REPO_URL" /tmp/shard 2>/dev/null || return 1
+          }
+
+          clone_with_retry || {
+            echo "✗ Clone falhou após tentativas"
+            exit 1
+          }
+          
+          cd /tmp/shard
+          git checkout -B storage-main
+
+          mkdir -p "$JOB_ID/hls" "$JOB_ID/thumbs"
+          cp "$WORK_DIR"/hls/*.bin "$JOB_ID/hls/"
+          cp "$WORK_DIR"/master.m3u8 "$WORK_DIR"/nonces.json "$JOB_ID/" 2>/dev/null || true
+          if [ -d "$WORK_DIR/thumbs" ]; then
+            cp "$WORK_DIR"/thumbs/* "$JOB_ID/thumbs/" 2>/dev/null || true
+          fi
+
+          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
+          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit -m "job=${JOB_ID}"
+
+          # ── Retry inteligente no push com rebase em fast-forward ─────────
+          push_with_retry() {
+            local attempt=1
+            while [ $attempt -le 4 ]; do
+              if git push -u origin storage-main 2>&1; then
+                echo "✓ Push concluído (tentativa $attempt)"
+                return 0
+              fi
+              
+              local output=$(git push -u origin storage-main 2>&1 || true)
+              
+              if echo "$output" | grep -q "rejected.*fast-forward\|failed to push"; then
+                echo "  ⚠ Push rejeitado — a fazer rebase..."
+                git pull --rebase origin storage-main 2>/dev/null || {
+                  echo "  ⚠ Rebase falhou — ignorando conflitos (força push)"
+                  git rebase --abort 2>/dev/null || true
+                  git push --force-with-lease origin storage-main 2>&1 && return 0
+                }
+              else
+                local wait=$((attempt * 10))
+                echo "  ⚠ Push tentativa $attempt falhou — aguarda ${wait}s..."
+                sleep $wait
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+            
+            echo "✗ Push falhou após 4 tentativas"
+            return 1
+          }
+
+          push_with_retry || exit 1
+
+          rm -rf /tmp/shard
+          echo "✓ Commit em ${SHARD_REPO}: ${JOB_ID}"
+
+      - name: Reescrever index.m3u8 com URLs raw.githubusercontent.com
+        env:
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
         run: |
           python3 << 'PYEOF'
           import re, os
-          hls_dir     = os.environ['WORK_DIR'] + '/hls'
-          cdn_base    = os.environ['CDN_DOMAIN'].rstrip('/')
-          job_id      = os.environ['JOB_ID']
-          need_batches = os.environ.get('NEED_BATCHES', 'false') == 'true'
-          BATCH_SIZE  = 500
+          hls_dir  = os.environ['WORK_DIR'] + '/hls'
+          job_id   = os.environ['JOB_ID']
+          owner    = os.environ['STORAGE_OWNER']
+          shard    = os.environ['SHARD_REPO']
+          raw_base = f"https://raw.githubusercontent.com/{owner}/{shard}/storage-main/{job_id}"
 
           with open(hls_dir + '/index.m3u8') as f: content = f.read()
 
-          # init.bin sempre na release principal {job_id} — é metadata, não segmento
           content = re.sub(
             r'#EXT-X-MAP:URI="init\.mp4"',
-            f'#EXT-X-MAP:URI="{cdn_base}/{job_id}/hls/init.bin"',
+            f'#EXT-X-MAP:URI="{raw_base}/hls/init.bin"',
             content
           )
-
-          if need_batches:
-            # Cada segmento aponta para a release do seu lote: {job_id}-bN
-            # seg_number = int(nome) → lote = seg_number // BATCH_SIZE
-            def seg_url(m):
-              seg_name   = m.group(1)            # ex: seg00500
-              seg_number = int(seg_name[3:])     # ex: 500
-              batch_idx  = seg_number // BATCH_SIZE
-              release    = f"{job_id}-b{batch_idx}"
-              return f"{cdn_base}/{release}/hls/{seg_name}.bin"
-
-            content = re.sub(r'^(seg\d+)\.m4s$', seg_url, content, flags=re.MULTILINE)
-            print(f"✓ index.m3u8 reescrito com URLs por lote (-b0, -b1, ...) → {cdn_base}/{job_id}-bN/hls/")
-          else:
-            # Modo normal: release única {job_id}
-            content = re.sub(
-              r'^(seg\d+)\.m4s$',
-              lambda m: f"{cdn_base}/{job_id}/hls/{m.group(1)}.bin",
-              content, flags=re.MULTILINE
-            )
-            print(f"✓ index.m3u8 reescrito (release única) → {cdn_base}/{job_id}/hls/")
+          content = re.sub(
+            r'^(seg\d+)\.m4s$',
+            lambda m: f"{raw_base}/hls/{m.group(1)}.bin",
+            content, flags=re.MULTILINE
+          )
 
           with open(hls_dir + '/index.m3u8', 'w') as f: f.write(content)
+          print(f"✓ index.m3u8 reescrito → {raw_base}/hls/")
           PYEOF
 
       - name: Gerar master.m3u8
-        if: env.IS_BATCH_MODE != 'true'
+        env:
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
         run: |
           python3 << 'PYEOF'
           import os
-          cdn_base  = os.environ['CDN_DOMAIN'].rstrip('/')
           job_id    = os.environ['JOB_ID']
+          owner     = os.environ['STORAGE_OWNER']
+          shard     = os.environ['SHARD_REPO']
           work_dir  = os.environ['WORK_DIR']
           eff_w     = os.environ['EFF_WIDTH']
           eff_h     = os.environ['EFF_HEIGHT']
+          raw_base  = f"https://raw.githubusercontent.com/{owner}/{shard}/storage-main/{job_id}"
           hls_dir   = work_dir + '/hls'
           bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin')
           if bin_files:
@@ -1077,352 +923,156 @@ jobs:
             real_bitrate = int(os.environ.get('PROBE_BITRATE') or 2000000)
           master = '\n'.join(['#EXTM3U','#EXT-X-VERSION:6','',
             f'#EXT-X-STREAM-INF:BANDWIDTH={real_bitrate},RESOLUTION={eff_w}x{eff_h}',
-            f'{cdn_base}/{job_id}/hls/index.m3u8'])
+            f'{raw_base}/hls/index.m3u8'])
           with open(work_dir + '/master.m3u8', 'w') as f: f.write(master)
           print(f"✓ master.m3u8: {eff_w}x{eff_h} | {real_bitrate}bps")
           PYEOF
 
       - name: Gerar cdn_urls.json
-        if: env.IS_BATCH_MODE != 'true'
+        env:
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
         run: |
           python3 << 'PYEOF'
           import os, json
-          work_dir     = os.environ['WORK_DIR']
-          cdn_base     = os.environ['CDN_DOMAIN'].rstrip('/')
-          job_id       = os.environ['JOB_ID']
-          need_batches = os.environ.get('NEED_BATCHES', 'false') == 'true'
-          BATCH_SIZE   = 500
+          work_dir = os.environ['WORK_DIR']
+          job_id   = os.environ['JOB_ID']
+          owner    = os.environ['STORAGE_OWNER']
+          shard    = os.environ['SHARD_REPO']
+          raw_base = f"https://raw.githubusercontent.com/{owner}/{shard}/storage-main/{job_id}"
 
           nonces = json.load(open(work_dir + '/nonces.json'))
           thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
 
-          # Metadados e init.bin sempre na release principal {job_id}
           cdn_urls = [
-            f"{cdn_base}/{job_id}/master.m3u8",
-            f"{cdn_base}/{job_id}/nonces.json",
-            f"{cdn_base}/{job_id}/hls/index.m3u8",
-            f"{cdn_base}/{job_id}/hls/init.bin",
+            f"{raw_base}/master.m3u8",
+            f"{raw_base}/nonces.json",
+            f"{raw_base}/hls/index.m3u8",
+            f"{raw_base}/hls/init.bin",
           ]
 
-          # Segmentos: se batch, cada um aponta para {job_id}-bN; senão para {job_id}
           seg_names = sorted(bn for bn in nonces['nonces'] if bn != 'init.bin')
           for bn in seg_names:
-            seg_number = int(bn[3:bn.index('.')]) if '.' in bn else int(bn[3:])
-            if need_batches:
-              batch_idx = seg_number // BATCH_SIZE
-              release   = f"{job_id}-b{batch_idx}"
-            else:
-              release = job_id
-            cdn_urls.append(f"{cdn_base}/{release}/hls/{bn}")
+            cdn_urls.append(f"{raw_base}/hls/{bn}")
 
-          # Thumbnails: usa o nome real do ficheiro (extensão correta),
-          # em vez de assumir sempre .jpg — thumbs_manifest.json guarda o
-          # 'path' já com a extensão detectada (jpg/png/webp/gif/...).
-          cdn_urls += [f"{cdn_base}/{job_id}/thumbs/{os.path.basename(t['path'])}" for t in thumbs]
+          cdn_urls += [f"{raw_base}/thumbs/{os.path.basename(t['path'])}" for t in thumbs]
 
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
-          print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs {'(multi-release)' if need_batches else '(release única)'}")
+          print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs")
           PYEOF
 
-      - name: Upload metadados + init.bin + thumbs
-        if: env.IS_BATCH_MODE != 'true'
+      # ── Registar no EdgeOne ─────────────────────────────────────────────
+      - name: Registar no EdgeOne (Turso + KV)
+        continue-on-error: true
         env:
-          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
-          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
-          STORAGE_REPO:  ${{ secrets.STORAGE_GITHUB_REPO }}
+          METADATA:       ${{ inputs.metadata }}
+          SEASON_NUMBER:  ${{ inputs.season_number }}
+          EPISODE_NUMBER: ${{ inputs.episode_number }}
+          EPISODE_TITLE:  ${{ inputs.episode_title }}
+          FILE_INDICES:   ${{ inputs.file_indices }}
+          STORAGE_OWNER:  ${{ secrets.STORAGE_GITHUB_OWNER }}
         run: |
           python3 << 'PYEOF'
-          import os, subprocess, json, time
-          work_dir = os.environ['WORK_DIR']
-          storage_token = os.environ['STORAGE_TOKEN']
+          import json, os, urllib.request, urllib.error, datetime, time
+
+          pipeline_api = os.environ.get('PIPELINE_API','').rstrip('/')
+          if not pipeline_api: print('⚠ PIPELINE_API não configurado'); raise SystemExit(0)
+
+          work_dir     = os.environ['WORK_DIR']
+          job_id       = os.environ['JOB_ID']
+          quality      = os.environ.get('QUALITY_LABEL', '')
+          seg_dur      = int(os.environ.get('SEG_DURATION', '4') or '4')
           storage_owner = os.environ['STORAGE_OWNER']
-          storage_repo  = os.environ['STORAGE_REPO']
-          job_id = os.environ['JOB_ID']
-          quality = os.environ['QUALITY_LABEL']
-          github_env = os.environ['GITHUB_ENV']
+          shard_repo    = os.environ['SHARD_REPO']
+          raw_base      = f"https://raw.githubusercontent.com/{storage_owner}/{shard_repo}/storage-main/{job_id}"
 
-          meta_files = []
-          for fname, mime in [('master.m3u8','application/vnd.apple.mpegurl'),('nonces.json','application/json')]:
-            fpath = os.path.join(work_dir, fname)
-            if os.path.exists(fpath): meta_files.append((fpath, fname, mime))
+          try:    metadata = json.loads(os.environ.get('METADATA','{}'))
+          except: metadata = {}
 
-          hls_dir = work_dir + '/hls'
-          for fname, mime in [('index.m3u8','application/vnd.apple.mpegurl'),('init.bin','application/octet-stream')]:
-            fpath = os.path.join(hls_dir, fname)
-            if os.path.exists(fpath): meta_files.append((fpath, fname, mime))
+          probe = json.load(open(os.path.join(work_dir, 'probe_parsed.json')))
 
-          thumb_dir = os.path.join(work_dir, 'thumbs')
-          thumb_names = []
-          # ── FIX: suporte a múltiplas extensões de thumbnail ─────────────
-          # Antes só ficheiros ".jpg" eram considerados aqui — thumbs em
-          # webp/png/gif nunca eram sequer enviados (thumb_names ficava
-          # vazio para eles, então FAILED_THUMBS também não os detectava;
-          # simplesmente não subiam e o pipeline seguia calado).
-          MIME_BY_EXT = {
-            'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-            'webp': 'image/webp', 'gif': 'image/gif', 'bmp': 'image/bmp',
-            'tiff': 'image/tiff', 'heic': 'image/heic',
+          eff_w = int(os.environ.get('EFF_WIDTH', '0') or '0')
+          eff_h = int(os.environ.get('EFF_HEIGHT', '0') or '0')
+
+          nonces    = json.load(open(os.path.join(work_dir, 'nonces.json')))
+          seg_count = len([k for k in nonces['nonces'] if k != 'init.bin'])
+
+          thumbs_path   = os.path.join(work_dir, 'thumbs_manifest.json')
+          thumbs        = json.load(open(thumbs_path)) if os.path.exists(thumbs_path) else []
+          thumb_urls    = [f"{raw_base}/thumbs/{os.path.basename(t['path'])}" for t in thumbs]
+
+          cdn_urls_path = os.path.join(work_dir, 'cdn_urls.json')
+          cdn_urls      = json.load(open(cdn_urls_path)) if os.path.exists(cdn_urls_path) else []
+
+          content_id = metadata.get('contentId', job_id)
+
+          season_number_env  = os.environ.get('SEASON_NUMBER', '0') or '0'
+          episode_number_env = os.environ.get('EPISODE_NUMBER', '') or ''
+          episode_title_env  = os.environ.get('EPISODE_TITLE', '') or ''
+
+          body = {
+            'contentId':content_id,'title':metadata.get('title','Untitled'),'description':metadata.get('description',''),
+            'type':metadata.get('type','movie'),'year':int(metadata.get('year') or datetime.datetime.now().year),
+            'lang':metadata.get('lang','en'),'duration':round(probe.get('duration', 0)),'thumbnail':thumb_urls[0] if thumb_urls else '',
+            'thumbnails':thumb_urls,'qualities':[quality] if quality else [],'width':eff_w,'height':eff_h,'codec':'h264','fps':probe.get('fps', 24),
+            'bitrate':probe.get('bitrate', 0),'segmentCount':seg_count,'segDuration':seg_dur,'videoID':job_id,'cdnUrls':cdn_urls,
+            'encrypted':True,'encryption':'chacha20-chunk-v2','container':'fmp4','segExt':'bin',
+            'masterUrl':f"{raw_base}/master.m3u8",'noncesUrl':f"{raw_base}/nonces.json",
+            'storageRepo': shard_repo, 'storageOwner': storage_owner,
+            'seasonNumber':season_number_env,'episodeNumber':episode_number_env,'episodeTitle':episode_title_env,
           }
-          if os.path.isdir(thumb_dir):
-            for f in sorted(os.listdir(thumb_dir)):
-              ext = f.rsplit('.', 1)[-1].lower() if '.' in f else ''
-              if ext in MIME_BY_EXT:
-                meta_files.append((os.path.join(thumb_dir, f), f, MIME_BY_EXT[ext]))
-                thumb_names.append(f)
-
-          print(f"  Upload {len(meta_files)} metadados → Release {job_id}")
-
-          r = subprocess.run(['curl','-sf','-H',f'Authorization: Bearer {storage_token}',
-            '-H','Accept: application/vnd.github+json','-H','X-GitHub-Api-Version: 2022-11-28',
-            '-X','POST',f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases',
-            '-d',json.dumps({'tag_name':job_id,'name':job_id,'body':f'jobId={job_id} | {quality}','draft':False,'prerelease':False})],
-            capture_output=True, text=True)
-
-          if r.returncode != 0:
-            r = subprocess.run(['curl','-sf','-H',f'Authorization: Bearer {storage_token}',
-              '-H','Accept: application/vnd.github+json',
-              f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{job_id}'],
-              capture_output=True, text=True)
-
-          release = json.loads(r.stdout)
-          upload_url = release['upload_url'].split('{')[0]
-          existing = {a['name']: a['id'] for a in release.get('assets', [])}
-
-          # ── FIX: thumb 404 no CDN ────────────────────────────────────────
-          # Antes, este step fazia upload sem retry em 422 (nome duplicado por
-          # corrida entre jobs concorrentes) ou 429 (rate limit da API do
-          # GitHub). Uma falha aqui era só impressa (✗) e o job continuava
-          # normalmente — o step "Registar no EdgeOne" monta as URLs de thumb
-          # a partir do thumbs_manifest.json LOCAL, sem saber se o upload real
-          # deu certo. Resultado: Turso ficava com uma URL de thumbnail que
-          # nunca existiu na Release → 404 no catálogo, mesmo com o job
-          # marcado como sucesso.
-          # Agora: retry igual ao já usado no upload de segmentos (422 →
-          # apagar+reenviar; 429 → aguardar 60s+reenviar) e, se mesmo assim
-          # falhar, o nome do ficheiro é propagado via FAILED_THUMBS para o
-          # step de registo poder omiti-lo do Turso em vez de gravar uma URL
-          # morta.
-          def refresh_assets():
-            rr = subprocess.run(['curl','-sf','-H',f'Authorization: Bearer {storage_token}',
-              '-H','Accept: application/vnd.github+json',
-              f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{job_id}'],
-              capture_output=True, text=True)
+          payload = json.dumps(body).encode()
+          for attempt in range(1, 6):
+            req = urllib.request.Request(f"{pipeline_api}/api/pipeline/register", data=payload,
+              headers={'Content-Type':'application/json','X-API-Key':os.environ.get('ADMIN_API_KEY','')}, method='POST')
             try:
-              return {a['name']: a['id'] for a in json.loads(rr.stdout).get('assets', [])}
-            except Exception:
-              return {}
-
-          def do_upload(fpath, fname, mime):
-            return subprocess.run(['curl','-sf','-o','/dev/null','-w','%{http_code}','-X','POST',
-              '-H',f'Authorization: Bearer {storage_token}','-H',f'Content-Type: {mime}',
-              '--max-time','120',f'{upload_url}?name={fname}','--data-binary',f'@{fpath}'],
-              capture_output=True, text=True).stdout.strip()
-
-          ok = 0
-          failed_files = []
-
-          for fpath, fname, mime in meta_files:
-            if fname in existing:
-              subprocess.run(['curl','-sf','-X','DELETE','-H',f'Authorization: Bearer {storage_token}',
-                f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{existing[fname]}'], capture_output=True)
-              time.sleep(0.5)
-
-            code = do_upload(fpath, fname, mime)
-
-            if code == '201':
-              print(f"  ✓ {fname}"); ok += 1
-              continue
-
-            if code == '422':
-              print(f"  ⚠ {fname} 422 (duplicado) — a apagar e retentar...")
-              fresh = refresh_assets()
-              if fname in fresh:
-                subprocess.run(['curl','-sf','-X','DELETE','-H',f'Authorization: Bearer {storage_token}',
-                  f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{fresh[fname]}'], capture_output=True)
-                time.sleep(0.5)
-              code = do_upload(fpath, fname, mime)
-            elif code == '429':
-              print(f"  ⚠ {fname} rate limit — pausa 60s...")
-              time.sleep(60)
-              code = do_upload(fpath, fname, mime)
-
-            if code == '201':
-              print(f"  ✓ {fname} (após retry)"); ok += 1
-            else:
-              print(f"  ✗ {fname} HTTP {code} — FALHOU definitivamente")
-              failed_files.append(fname)
-
-          print(f"  ✅ {ok}/{len(meta_files)} metadados")
-
-          failed_thumbs   = [f for f in failed_files if f in thumb_names]
-          critical_failed = [f for f in failed_files if f not in thumb_names]
-
-          with open(github_env, 'a') as f:
-            f.write("METADATA_UPLOADED=true\n")
-            f.write(f"FAILED_THUMBS={','.join(failed_thumbs)}\n")
-            if critical_failed:
-              f.write("METADATA_CRITICAL_FAILED=true\n")
-              print(f"  ✗✗ Ficheiros críticos falharam: {critical_failed}")
+              with urllib.request.urlopen(req, timeout=30) as r: print(f"✓ Conteúdo registado ({r.status})"); break
+            except urllib.error.HTTPError as e:
+              if e.code < 500 and e.code != 429: print(f"  Erro cliente ({e.code})"); break
+              print(f"⚠ Tentativa {attempt} — HTTP {e.code}")
+            except Exception as e: print(f"⚠ Tentativa {attempt} — {e}")
+            if attempt < 5:
+              time.sleep([5,10,20,40][attempt-1])
+          print("✓ Registo concluído")
           PYEOF
 
-      - name: Empacotar segmentos em lotes
-        if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES == 'true'
+      - name: Notificar dispatcher (webhook FIFO)
+        if: success() || failure()
+        continue-on-error: true
         run: |
-          python3 << 'PYEOF'
-          import os, json, tarfile
-          hls_dir = os.environ['WORK_DIR'] + '/hls'
-          seg_files = sorted([f for f in os.listdir(hls_dir) if (f.endswith('.bin') or '.bin.part' in f) and f != 'init.bin'])
-          BATCH_SIZE = 500
-          batches = [seg_files[i:i+BATCH_SIZE] for i in range(0, len(seg_files), BATCH_SIZE)]
-          os.makedirs('/tmp/uploader_batches', exist_ok=True)
-          for bi, batch in enumerate(batches):
-            tar_path = f'/tmp/uploader_batches/batch_{bi:03d}.tar'
-            with tarfile.open(tar_path, 'w') as tar:
-              for fname in batch: tar.add(os.path.join(hls_dir, fname), arcname=fname)
-            print(f"  Batch {bi}: {len(batch)} segs ({os.path.getsize(tar_path)//(1024*1024)}MB)")
-          manifest = {'batches':len(batches), 'batch_size':BATCH_SIZE, 'total_segs':len(seg_files)}
-          json.dump(manifest, open('/tmp/uploader_batches/manifest.json','w'))
-          with open(os.environ['GITHUB_ENV'], 'a') as f: f.write(f"TOTAL_BATCHES={len(batches)}\n")
-          print(f"  ✓ {len(batches)} lotes criados")
-          PYEOF
+          if [ -z "$DISPATCHER_URL" ]; then
+            echo "⚠ DISPATCHER_URL não configurado — webhook ignorado"
+            exit 0
+          fi
+          EFFECTIVE_JOB_ID="${JOB_ID:-${{ inputs.job_id }}}"
+          if [ -z "$EFFECTIVE_JOB_ID" ]; then
+            echo "⚠ job_id indisponível — webhook ignorado (não há job pra notificar)"
+            exit 0
+          fi
+          if [ "${{ job.status }}" = "success" ]; then
+            WEBHOOK_STATUS="done"
+          else
+            WEBHOOK_STATUS="failed"
+          fi
+          WEBHOOK_URL="${DISPATCHER_URL%/}/webhook"
+          echo "→ POST ${WEBHOOK_URL} (job_id=${EFFECTIVE_JOB_ID}, status=${WEBHOOK_STATUS})"
 
-      - name: Upload artifact com lotes
-        if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: segs-${{ inputs.job_id }}
-          path: /tmp/uploader_batches/
-          retention-days: 5
+          HTTP_CODE=$(curl -s -o /tmp/wh_resp.txt -w '%{http_code}' -X POST \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ADMIN_API_KEY}" \
+            --max-time 20 --retry 3 --retry-delay 5 \
+            "${WEBHOOK_URL}" \
+            -d "{\"job_id\":\"${EFFECTIVE_JOB_ID}\",\"status\":\"${WEBHOOK_STATUS}\"}") || true
 
-      - name: Upload segmentos (modo normal)
-        if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true'
-        env:
-          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
-          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
-          STORAGE_REPO:  ${{ secrets.STORAGE_GITHUB_REPO }}
-        run: |
-          python3 << 'PYEOF'
-          import os, subprocess, json, time
-          storage_token = os.environ['STORAGE_TOKEN']
-          storage_owner = os.environ['STORAGE_OWNER']
-          storage_repo  = os.environ['STORAGE_REPO']
-          job_id = os.environ['JOB_ID']
-          hls_dir = os.environ['WORK_DIR'] + '/hls'
-          seg_files = sorted([f for f in os.listdir(hls_dir) if (f.endswith('.bin') or '.bin.part' in f) and f != 'init.bin'])
-          print(f"  Upload {len(seg_files)} segmentos")
-          r = subprocess.run(['curl','-sf','-H',f'Authorization: Bearer {storage_token}',
-            f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/tags/{job_id}'], capture_output=True, text=True)
-          release = json.loads(r.stdout)
-          upload_url = release['upload_url'].split('{')[0]
-          existing = {a['name']: a['id'] for a in release.get('assets', [])}
-          ok = 0
-          for fname in seg_files:
-            fpath = os.path.join(hls_dir, fname)
-            if fname in existing:
-              subprocess.run(['curl','-sf','-X','DELETE','-H',f'Authorization: Bearer {storage_token}',
-                f'https://api.github.com/repos/{storage_owner}/{storage_repo}/releases/assets/{existing[fname]}'], capture_output=True)
-              time.sleep(0.3)
-            r = subprocess.run(['curl','-sf','-o','/dev/null','-w','%{http_code}','-X','POST',
-              '-H',f'Authorization: Bearer {storage_token}','-H','Content-Type: application/octet-stream',
-              '--max-time','120',f'{upload_url}?name={fname}','--data-binary',f'@{fpath}'], capture_output=True, text=True)
-            if r.stdout.strip() == '201': ok += 1
-            else: print(f"  ✗ {fname} HTTP {r.stdout.strip()}")
-          print(f"  ✅ {ok}/{len(seg_files)} segmentos")
-          PYEOF
-
-      # ── Disparar lote 0 com parent_run_id ───────────────────────────────
-      - name: Disparar lote 0 (auto-recorrência)
-        if: env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES == 'true'
-        run: |
-          python3 << 'PYEOF'
-          import os, subprocess, json, time
-          job_id        = os.environ['JOB_ID']
-          total_batches = int(os.environ['TOTAL_BATCHES'])
-          dispatch_token = os.environ['DISPATCH_TOKEN']
-          github_repo   = os.environ['GITHUB_REPOSITORY']
-          parent_run_id = os.environ['GITHUB_RUN_ID']
-
-          # ── FIX: poster vazio em vídeos com upload em lotes ─────────────
-          # "Registar no EdgeOne" só roda no ÚLTIMO lote, que é uma run do
-          # Actions ISOLADA (runner novo, disco novo) — nunca teve acesso ao
-          # thumbs_manifest.json desta run principal. Resultado: thumb_urls
-          # ficava sempre [] e o poster gravado no Turso ficava vazio, mesmo
-          # com o thumb já upado e acessível directamente via CDN.
-          # Fix: como 'metadata' já atravessa intacto toda a cadeia de
-          # dispatch de lotes (cada lote reenvia o mesmo JSON que recebeu),
-          # injectamos aqui os thumb_urls (já filtrados pelos que falharam
-          # o upload) dentro de metadata['_thumbUrls']. Usa o nome REAL do
-          # ficheiro (thumbs_manifest.json['path']) para preservar a
-          # extensão correta (jpg/png/webp/gif/...) em vez de assumir .jpg.
-          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
-          thumbs_manifest_path = os.environ['WORK_DIR'] + '/thumbs_manifest.json'
-          failed_thumbs = set(f for f in os.environ.get('FAILED_THUMBS','').split(',') if f)
-          thumb_urls = []
-          if os.path.exists(thumbs_manifest_path):
-            thumbs = json.load(open(thumbs_manifest_path))
-            for t in thumbs:
-              fname = os.path.basename(t['path'])
-              if fname not in failed_thumbs:
-                thumb_urls.append(f"{cdn_base}/{job_id}/thumbs/{fname}")
-
-          try:
-            metadata = json.loads(os.environ.get('METADATA', '{}'))
-          except Exception:
-            metadata = {}
-          metadata['_thumbUrls'] = thumb_urls
-
-          payload = {
-            'ref': 'main',
-            'inputs': {
-              'job_id':        job_id,
-              'upload_mode':   'batch_upload',
-              'upload_batch':  '0',
-              'total_batches': str(total_batches),
-              'parent_run_id': parent_run_id,
-              'video_url':     '',
-              'metadata':      json.dumps(metadata),
-              'file_indices':  '',
-            }
-          }
-
-          for attempt in range(1, 5):
-            r = subprocess.run([
-              'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
-              '-H', f'Authorization: Bearer {dispatch_token}',
-              '-H', 'Accept: application/vnd.github+json',
-              '-H', 'X-GitHub-Api-Version: 2022-11-28',
-              f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
-              '-d', json.dumps(payload),
-            ], capture_output=True, text=True)
-            code = r.stdout.strip()
-            if code == '204':
-              print(f"  ✓ Lote 0/{total_batches} disparado (run={parent_run_id}) | {len(thumb_urls)} thumb(s) propagado(s)")
-              break
-            elif code.startswith('5') or code == '':
-              wait = [10, 30, 60][attempt - 1] if attempt <= 3 else 60
-              print(f"  ⚠ Tentativa {attempt}/4 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
-              time.sleep(wait)
-            else:
-              print(f"  ✗ Erro HTTP {code} (não retry): {r.stderr[:200]}")
-              break
-          else:
-            print(f"  ✗ Lote 0 não disparado após 4 tentativas — verificar GitHub API")
-          PYEOF
-        env:
-          DISPATCH_TOKEN:    ${{ secrets.STORAGE_GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_RUN_ID:     ${{ github.run_id }}
-          METADATA:          ${{ inputs.metadata }}
+          if [[ "$HTTP_CODE" =~ ^2 ]]; then
+            echo "✓ Webhook enviado (HTTP $HTTP_CODE)"
+          else
+            echo "✗ Webhook falhou (HTTP $HTTP_CODE) — não fatal, resposta:"
+            cat /tmp/wh_resp.txt 2>/dev/null || true
+          fi
 
       # ── Encadeamento do coordinator: disparar próximo episódio da fila ──
-      # Roda no fim de QUALQUER job em modo completo (não-batch_upload) que
-      # tenha recebido uma fila (coordinator_queue não vazia) — ou seja,
-      # todo episódio de série/anime/dorama disparado pelo Coordinator ou
-      # por este mesmo step num episódio anterior. Usa "always()" para que
-      # a falha de UM episódio (ex: encode falhou) não interrompa a cadeia
-      # inteira — o próximo episódio ainda é disparado.
       - name: '[Coordinator] Disparar próximo episódio da fila'
-        if: always() && env.IS_BATCH_MODE != 'true' && inputs.coordinator_queue != ''
+        if: always() && inputs.coordinator_queue != ''
         env:
           STORAGE_TOKEN:     ${{ secrets.STORAGE_GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -1480,478 +1130,9 @@ jobs:
             print(f"  ✗ Falha ao disparar próximo episódio após tentativas — cadeia interrompida em {next_child.get('job_id')}")
           PYEOF
 
-      # ── Eliminar artifact após último lote ──────────────────────────────
-      # O artifact segs-{job_id} é temporário (só serve para transferir
-      # segmentos do job principal para os jobs de batch). Depois do último
-      # lote fazer upload, o artifact já não é necessário e ocupa espaço
-      # no limite de storage do repositório (privado: 500MB free tier;
-      # público: sem limite prático). Eliminar aqui liberta espaço imediato.
-      - name: '[BATCH] Eliminar artifact temporário'
-        if: env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH == 'true'
-        continue-on-error: true
-        run: |
-          python3 << 'PYEOF'
-          import os, subprocess, json
-
-          github_repo    = os.environ['GITHUB_REPOSITORY']
-          dispatch_token = os.environ['DISPATCH_TOKEN']
-          job_id         = os.environ['JOB_ID']
-          artifact_name  = f"segs-{job_id}"
-
-          # Descobrir artifact ID pelo nome
-          r = subprocess.run([
-            'curl', '-sf',
-            '-H', f'Authorization: Bearer {dispatch_token}',
-            '-H', 'Accept: application/vnd.github+json',
-            '-H', 'X-GitHub-Api-Version: 2022-11-28',
-            f'https://api.github.com/repos/{github_repo}/actions/artifacts?name={artifact_name}&per_page=5',
-          ], capture_output=True, text=True)
-
-          try:
-            artifacts = json.loads(r.stdout).get('artifacts', [])
-          except Exception:
-            print(f"  ⚠ Não foi possível listar artifacts: {r.stdout[:200]}")
-            raise SystemExit(0)
-
-          if not artifacts:
-            print(f"  ⚠ Artifact '{artifact_name}' não encontrado (já eliminado?)")
-            raise SystemExit(0)
-
-          for art in artifacts:
-            art_id = art['id']
-            r2 = subprocess.run([
-              'curl', '-sf', '-X', 'DELETE',
-              '-H', f'Authorization: Bearer {dispatch_token}',
-              '-H', 'Accept: application/vnd.github+json',
-              '-H', 'X-GitHub-Api-Version: 2022-11-28',
-              f'https://api.github.com/repos/{github_repo}/actions/artifacts/{art_id}',
-            ], capture_output=True, text=True)
-            if r2.returncode == 0:
-              size_mb = art.get('size_in_bytes', 0) // (1024 * 1024)
-              print(f"  ✓ Artifact '{artifact_name}' eliminado (ID={art_id}, {size_mb}MB libertados)")
-            else:
-              print(f"  ⚠ Falha ao eliminar artifact ID={art_id}: {r2.stderr[:100]}")
-          PYEOF
-        env:
-          DISPATCH_TOKEN:     ${{ secrets.STORAGE_GITHUB_TOKEN }}
-          GITHUB_REPOSITORY:  ${{ github.repository }}
-
-      # ── Aquecer cache (Cloudflare Worker) — 2 passagens ─────────────────
-      # Roda apenas quando o conteúdo está completo e publicamente acessível
-      # (mesma condição do registo EdgeOne abaixo): modo normal sem batches,
-      # ou último lote do modo batch. Bate direto nas URLs públicas via
-      # Worker (https://cdn.pixgo.qzz.io/...) — sem tunnel, sem servidor
-      # local: a origem (GitHub Releases) já é pública desde o upload.
-      # 1ª passagem força os cache misses (Worker invocado, busca no GH).
-      # 2ª passagem confirma HIT — se não confirmar, fica registado no log
-      # mas não falha o job (cache eventualmente esquenta no 1º acesso real).
-      - name: Aquecer Cloudflare Cache (via Worker)
-        if: |
-          (env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true') ||
-          (env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH == 'true')
-        env:
-          CF_ZONE_ID:  ${{ secrets.CF_ZONE_ID }}
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        run: |
-          python3 << 'PYEOF'
-          import os, json, concurrent.futures, urllib.request as ur, urllib.error as ue, time, subprocess
-          from urllib.parse import urlparse
-
-          job_id   = os.environ['JOB_ID']
-          warm_c   = int(os.environ.get('WARM_C', '8') or '8')
-          work_dir = os.environ['WORK_DIR']
-          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
-
-          # Fonte das URLs: cdn_urls.json existe apenas no modo normal (gerado
-          # no mesmo job que processa o vídeo). No modo batch, cada lote roda
-          # numa run separada do Actions — não há cdn_urls.json para herdar.
-          # Nesse caso reconstruímos a partir dos .bin já extraídos/enviados
-          # no WORK_DIR local deste job (populados pelo step de extração do
-          # batch), cobrindo pelo menos o lote final — os lotes anteriores já
-          # tiveram seus segmentos enviados e ficam disponíveis para warm no
-          # 1º acesso real, ou podem ser quentes via Tiered Cache.
-          cdn_urls_path = os.path.join(work_dir, 'cdn_urls.json')
-          batch_index   = int(os.environ.get('BATCH_INDEX', '-1'))
-          is_batch      = os.environ.get('IS_BATCH_MODE', 'false') == 'true'
-          BATCH_SIZE    = 500
-
-          if os.path.exists(cdn_urls_path):
-            cdn_urls = json.load(open(cdn_urls_path))
-            print(f"  Fonte: cdn_urls.json ({len(cdn_urls)} URLs)")
-          else:
-            # Modo batch: cdn_urls.json não existe porque cada lote roda numa
-            # run isolada do Actions. Antes reconstruíamos só a partir dos
-            # .bin locais desta run — o que cobria apenas o ÚLTIMO lote e
-            # deixava todos os lotes anteriores frios (nunca aquecidos).
-            #
-            # Fix: o artifact segs-{job_id} inclui manifest.json com
-            # {batches, batch_size, total_segs} — escrito no step "Empacotar
-            # segmentos em lotes" do job principal. Esse artifact é baixado
-            # para /tmp/batches/ em toda run de lote (antes de ser eliminado
-            # no fim do ÚLTIMO lote). Usamos o manifest para reconstruir os
-            # nomes de TODOS os segmentos de TODOS os lotes — sem precisar
-            # dos ficheiros físicos, só da convenção seg{N:05d}.bin e da
-            # regra batch_idx = seg_number // batch_size já usada no resto
-            # do pipeline.
-            manifest_path = '/tmp/batches/manifest.json'
-            cdn_urls = []
-
-            if is_batch and os.path.exists(manifest_path):
-              manifest    = json.load(open(manifest_path))
-              total_segs  = manifest['total_segs']
-              m_batch_sz  = manifest['batch_size']
-              for seg_n in range(total_segs):
-                b_idx   = seg_n // m_batch_sz
-                release = f"{job_id}-b{b_idx}"
-                cdn_urls.append(f"{cdn_base}/{release}/hls/seg{seg_n:05d}.bin")
-              print(f"  Fonte: manifest.json — {total_segs} segs em {manifest['batches']} lotes reconstruídos")
-            else:
-              # Fallback: sem manifest disponível (ou modo não-batch sem
-              # cdn_urls.json) — cobre pelo menos os .bin locais desta run.
-              hls_dir   = os.path.join(work_dir, 'hls')
-              bin_files = []
-              if os.path.isdir(hls_dir):
-                bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin'))
-              for f in bin_files:
-                if is_batch and batch_index >= 0:
-                  release = f"{job_id}-b{batch_index}"
-                else:
-                  release = job_id
-                cdn_urls.append(f"{cdn_base}/{release}/hls/{f}")
-              print(f"  ⚠ Fonte: fallback local — {len(bin_files)} segs (release {job_id}-b{batch_index}) apenas — manifest.json indisponível")
-
-            # Manifestos sempre na release principal
-            cdn_urls += [
-              f"{cdn_base}/{job_id}/master.m3u8",
-              f"{cdn_base}/{job_id}/nonces.json",
-              f"{cdn_base}/{job_id}/hls/index.m3u8",
-            ]
-            cdn_urls = list(dict.fromkeys(cdn_urls))
-
-          if not cdn_urls:
-            print('⚠ Nenhuma URL para aquecer')
-            raise SystemExit(0)
-
-          # ── Cloudflare Cache Purge by Prefix ────────────────────────────
-          # Purge by Prefix é mais eficiente que Purge by URL para conteúdo
-          # em batch — cobre todos os assets do job_id com 1-2 requests.
-          # Disponível no Free tier. Limite: 100 prefixos por request.
-          # Após purge, o Tiered Cache upper-tier faz MISS controlado na
-          # próxima request e popula todos os PoPs subsequentes.
-          cf_zone  = os.environ.get('CF_ZONE_ID', '').strip()
-          cf_token = os.environ.get('CF_API_TOKEN', '').strip()
-
-          if cf_zone and cf_token:
-            # FIX #2 ────────────────────────────────────────────────────
-            # A API purge_cache por "prefixes" da Cloudflare exige o prefixo
-            # SEM o esquema (http/https) — apenas "host/path". A versão
-            # anterior fazia '/'.join(url.split('/')[:4]) + '/', o que
-            # preservava "https://" no resultado (ex.:
-            # "https://cdn.pixgo.qzz.io/abc-b0/") e a API respondia sempre
-            # com o erro 1119 "URI schemes must not be provided", zerando
-            # 100% dos purges. Usamos urlparse para extrair só netloc +
-            # primeiro segmento do path.
-            prefixes = set()
-            for u in cdn_urls:
-              parsed = urlparse(u)
-              path_parts = [p for p in parsed.path.split('/') if p]
-              if path_parts:
-                prefix = f"{parsed.netloc}/{path_parts[0]}/"
-              else:
-                prefix = f"{parsed.netloc}/"
-              prefixes.add(prefix)
-            # Sempre incluir o prefixo raiz do job_id (manifestos + thumbs)
-            root_parsed = urlparse(f"{cdn_base}/{job_id}/")
-            prefixes.add(f"{root_parsed.netloc}{root_parsed.path}")
-            prefixes = list(prefixes)
-
-            print(f"  Prefixos a purgar: {prefixes}")
-
-            # Purge by Prefix — máximo 30 por request no free tier
-            chunk_size = 30
-            purge_ok = 0
-            for i in range(0, len(prefixes), chunk_size):
-              chunk = prefixes[i:i+chunk_size]
-              r = subprocess.run([
-                'curl', '-sf', '-X', 'POST',
-                '-H', f'Authorization: Bearer {cf_token}',
-                '-H', 'Content-Type: application/json',
-                f'https://api.cloudflare.com/client/v4/zones/{cf_zone}/purge_cache',
-                '-d', json.dumps({'prefixes': chunk}),
-              ], capture_output=True, text=True)
-              try:
-                resp = json.loads(r.stdout)
-                if resp.get('success'):
-                  purge_ok += len(chunk)
-                  print(f"  ✓ Purge {len(chunk)} prefixos OK")
-                else:
-                  print(f"  ⚠ Purge falhou: {resp.get('errors', '')}")
-              except Exception:
-                print(f"  ⚠ Purge parse error: {r.stdout[:200]}")
-
-            print(f"✓ CF Cache Purge by Prefix: {purge_ok}/{len(prefixes)} prefixos purgados")
-            time.sleep(3)
-          else:
-            print("  ⚠ CF_ZONE_ID ou CF_API_TOKEN não configurados — purge ignorado")
-
-          # ── Warm HTTP (2 passagens) ──────────────────────────────────────
-          # Após purge, bate nas URLs para popular o Tiered Cache upper-tier.
-          # O upper-tier serve todos os PoPs subsequentes sem tocar o GitHub.
-          def fetch_url(url):
-            try:
-              req = ur.Request(url, headers={'User-Agent': 'StreamVault-Warm/1.0'})
-              with ur.urlopen(req, timeout=120) as r:
-                body      = r.read()
-                # FIX: worker v7+ usa caches.default (Cache API) em vez do
-                # cache de edge nativo da Cloudflare — esse caminho nunca
-                # escreve 'cf-cache-status' (só existe quando o edge nativo
-                # serve sem invocar o Worker, o que nunca acontece aqui). O
-                # worker expõe 'X-Cdn-Cache' (HIT/MISS) explicitamente;
-                # lemos esse header em vez do nativo.
-                cf_status = r.headers.get('x-cdn-cache', r.headers.get('cf-cache-status', 'UNKNOWN'))
-                cors      = r.headers.get('access-control-allow-origin', '')
-                cc        = r.headers.get('cache-control', 'none')
-                return {'url': url, 'status': cf_status, 'http': r.status, 'size': len(body), 'cors': cors, 'cc': cc}
-            except ue.HTTPError as e:
-              return {'url': url, 'status': 'ERROR', 'http': e.code, 'error': f'HTTP {e.code}'}
-            except Exception as e:
-              return {'url': url, 'status': 'ERROR', 'error': str(e)}
-
-          def warm_pass(urls, label):
-            hits = misses = errors = no_cors = 0
-            with concurrent.futures.ThreadPoolExecutor(max_workers=warm_c) as ex:
-              results = list(ex.map(fetch_url, urls))
-            for r in results:
-              if r['status'] == 'ERROR':
-                errors += 1
-                if errors <= 5:
-                  print(f"  ✗ ERRO: {r['url'].split('/')[-1]} — {r.get('error','')}")
-              else:
-                if not r.get('cors'):
-                  no_cors += 1
-                  if no_cors <= 3:
-                    print(f"  ⚠ sem CORS header: {r['url'].split('/')[-1]}")
-                if r['status'] == 'HIT':
-                  hits += 1
-                else:
-                  misses += 1
-            print(f"✓ {label}: {misses} MISS | {hits} HIT | {errors} erros | {no_cors} sem CORS")
-            return hits, misses, errors, no_cors
-
-          print(f"Aquecendo {len(cdn_urls)} URLs via Worker (concorrência {warm_c}) — job {job_id}")
-          hits1, misses1, errors1, noc1 = warm_pass(cdn_urls, '1ª passagem')
-
-          if errors1 == len(cdn_urls):
-            print("✗ Todas as URLs falharam — verificar se o Worker está activo na rota cdn.pixgo.qzz.io/*")
-            raise SystemExit(0)
-
-          if noc1 > 0:
-            print(f"⚠ {noc1} URL(s) sem header CORS — verificar deploy do Worker")
-
-          time.sleep(5)
-          hits2, misses2, errors2, noc2 = warm_pass(cdn_urls, '2ª passagem')
-
-          if hits2 == len(cdn_urls):
-            print(f"✅ Cache aquecido com sucesso — {hits2}/{len(cdn_urls)} HITs confirmados")
-          elif hits2 > 0:
-            print(f"⚠ Cache parcialmente aquecido — {hits2}/{len(cdn_urls)} HITs (resto esquenta no 1º acesso real)")
-          else:
-            print(f"⚠ 0 HITs na 2ª passagem — cache não confirmado, mas job continua (não fatal)")
-          PYEOF
-
-      # ── Registar no EdgeOne ─────────────────────────────────────────────
-      - name: Registar no EdgeOne (Turso + KV)
-        if: |
-          (env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true') ||
-          (env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH == 'true')
-        continue-on-error: true
-        env:
-          METADATA:       ${{ inputs.metadata }}
-          SEASON_NUMBER:  ${{ inputs.season_number }}
-          EPISODE_NUMBER: ${{ inputs.episode_number }}
-          EPISODE_TITLE:  ${{ inputs.episode_title }}
-          FILE_INDICES:   ${{ inputs.file_indices }}
-        run: |
-          python3 << 'PYEOF'
-          import json, os, urllib.request, urllib.error, datetime, time
-
-          pipeline_api = os.environ.get('PIPELINE_API','').rstrip('/')
-          if not pipeline_api: print('⚠ PIPELINE_API não configurado'); raise SystemExit(0)
-
-          work_dir = os.environ['WORK_DIR']
-          cdn_base = os.environ['CDN_DOMAIN'].rstrip('/')
-          job_id   = os.environ['JOB_ID']
-          quality  = os.environ.get('QUALITY_LABEL', '')
-          seg_dur  = int(os.environ.get('SEG_DURATION', '4') or '4')
-
-          try:    metadata = json.loads(os.environ.get('METADATA','{}'))
-          except: metadata = {}
-
-          # probe_parsed.json e cdn_urls.json só existem no modo normal — são
-          # gerados no mesmo job que processa o vídeo. No modo batch (último
-          # lote), cada lote roda numa run isolada do Actions, sem disco
-          # herdado do job principal. Degradamos graciosamente em vez de
-          # falhar: usamos o que existe localmente, com defaults seguros
-          # para o resto. O registo ainda funciona — só com menos precisão
-          # em campos não-críticos (duration, bitrate, fps).
-          probe_path = os.path.join(work_dir, 'probe_parsed.json')
-          if os.path.exists(probe_path):
-            probe = json.load(open(probe_path))
-          else:
-            print('  ⚠ probe_parsed.json ausente (modo batch) — usando defaults')
-            probe = {'duration': 0, 'fps': 24, 'bitrate': 0}
-
-          eff_w_env = os.environ.get('EFF_WIDTH')
-          eff_h_env = os.environ.get('EFF_HEIGHT')
-          eff_w = int(eff_w_env) if eff_w_env else 0
-          eff_h = int(eff_h_env) if eff_h_env else 0
-
-          nonces_path = os.path.join(work_dir, 'nonces.json')
-          if os.path.exists(nonces_path):
-            nonces = json.load(open(nonces_path))
-            seg_count = len([k for k in nonces['nonces'] if k != 'init.bin'])
-          else:
-            print('  ⚠ nonces.json ausente — segmentCount não pode ser confirmado localmente')
-            seg_count = 0
-
-          # ── FIX: poster vazio/404 em vídeos com upload em lotes + suporte
-          #        a múltiplas extensões de thumbnail ──────────────────────
-          # Causas cobertas aqui:
-          #
-          # 1) thumbs_manifest.json só confirma que a imagem existe
-          #    LOCALMENTE — não que o upload para a Release do GitHub deu
-          #    certo. FAILED_THUMBS vem do step de upload de metadados e
-          #    lista os ficheiros que falharam definitivamente (mesmo após
-          #    retry de 422/429).
-          #
-          # 2) Em vídeos que precisam de upload em lotes (NEED_BATCHES),
-          #    este step só corre no ÚLTIMO lote, numa run isolada sem
-          #    acesso a thumbs_manifest.json. O step "Disparar lote 0" já
-          #    propaga os thumb_urls (filtrados) via metadata['_thumbUrls'],
-          #    que atravessa intacto toda a cadeia de dispatch. Damos
-          #    prioridade a essa chave; só caímos para o thumbs_manifest.json
-          #    local quando ela não existe (modo sem lotes).
-          #
-          # 3) thumbs_manifest.json guarda o 'path' já com a extensão REAL
-          #    detectada (jpg/png/webp/gif/...) — usamos os.path.basename()
-          #    em vez de assumir sempre "thumb_{i}.jpg".
-          if '_thumbUrls' in metadata:
-            thumb_urls = metadata['_thumbUrls']
-          else:
-            thumbs_path = os.path.join(work_dir, 'thumbs_manifest.json')
-            thumbs = json.load(open(thumbs_path)) if os.path.exists(thumbs_path) else []
-            failed_thumbs = set(f for f in os.environ.get('FAILED_THUMBS','').split(',') if f)
-            thumb_urls = []
-            for t in thumbs:
-              fname = os.path.basename(t['path'])
-              if fname not in failed_thumbs:
-                thumb_urls.append(f"{cdn_base}/{job_id}/thumbs/{fname}")
-
-          cdn_urls_path = os.path.join(work_dir, 'cdn_urls.json')
-          if os.path.exists(cdn_urls_path):
-            cdn_urls = json.load(open(cdn_urls_path))
-          else:
-            print('  ⚠ cdn_urls.json ausente (modo batch) — registo sem lista detalhada de URLs')
-            cdn_urls = [
-              f"{cdn_base}/{job_id}/master.m3u8",
-              f"{cdn_base}/{job_id}/nonces.json",
-              f"{cdn_base}/{job_id}/hls/index.m3u8",
-            ]
-
-          content_id = metadata.get('contentId', job_id)
-
-          # ── FIX: episódios sobrescrevendo dados uns dos outros ──────────
-          # Antes, 'videoID' usava sempre content_id — que é o MESMO para
-          # todos os episódios de uma série (ex: "sugar"). Isso fazia com
-          # que o stealth_playlist (masterUrl/segmentCount/etc, guardado no
-          # KV chaveado por videoID) do episódio 2 sobrescrevesse o do
-          # episódio 1. Agora usamos job_id, que já é único por episódio
-          # (ex: "sugar-s01-ep01-b1"), sem regressão para filmes (onde
-          # job_id == content_id por definição).
-          #
-          # Também passamos season_number/episode_number/episode_title, que
-          # já estavam disponíveis nas envs deste step mas nunca eram
-          # incluídos no payload — sem eles a API não tinha como criar as
-          # linhas season/episode correspondentes.
-          season_number_env  = os.environ.get('SEASON_NUMBER', '0') or '0'
-          episode_number_env = os.environ.get('EPISODE_NUMBER', '') or ''
-          episode_title_env  = os.environ.get('EPISODE_TITLE', '') or ''
-
-          body = {
-            'contentId':content_id,'title':metadata.get('title','Untitled'),'description':metadata.get('description',''),
-            'type':metadata.get('type','movie'),'year':int(metadata.get('year') or datetime.datetime.now().year),
-            'lang':metadata.get('lang','en'),'duration':round(probe.get('duration', 0)),'thumbnail':thumb_urls[0] if thumb_urls else '',
-            'thumbnails':thumb_urls,'qualities':[quality] if quality else [],'width':eff_w,'height':eff_h,'codec':'h264','fps':probe.get('fps', 24),
-            'bitrate':probe.get('bitrate', 0),'segmentCount':seg_count,'segDuration':seg_dur,'videoID':job_id,'cdnUrls':cdn_urls,
-            'encrypted':True,'encryption':'chacha20-chunk-v2','container':'fmp4','segExt':'bin',
-            'masterUrl':f"{cdn_base}/{job_id}/master.m3u8",'noncesUrl':f"{cdn_base}/{job_id}/nonces.json",
-            'seasonNumber':season_number_env,'episodeNumber':episode_number_env,'episodeTitle':episode_title_env,
-          }
-          payload = json.dumps(body).encode()
-          for attempt in range(1, 6):
-            req = urllib.request.Request(f"{pipeline_api}/api/pipeline/register", data=payload,
-              headers={'Content-Type':'application/json','X-API-Key':os.environ.get('ADMIN_API_KEY','')}, method='POST')
-            try:
-              with urllib.request.urlopen(req, timeout=30) as r: print(f"✓ Conteúdo registado ({r.status})"); break
-            except urllib.error.HTTPError as e:
-              if e.code < 500 and e.code != 429: print(f"  Erro cliente ({e.code})"); break
-              print(f"⚠ Tentativa {attempt} — HTTP {e.code}")
-            except Exception as e: print(f"⚠ Tentativa {attempt} — {e}")
-            if attempt < 5:
-              time.sleep([5,10,20,40][attempt-1])
-          print("✓ Registo concluído")
-          PYEOF
-
-      - name: Notificar dispatcher (webhook FIFO)
-        if: |
-          (success() || failure()) && (
-            (env.IS_BATCH_MODE != 'true' && env.NEED_BATCHES != 'true') ||
-            (env.IS_BATCH_MODE == 'true' && env.IS_LAST_BATCH == 'true') ||
-            failure()
-          )
-        continue-on-error: true
-        run: |
-          # FIX: dispatcher (Render) não vive na mesma origem que PIPELINE_API
-          # (EdgeOne) — usa o secret dedicado DISPATCHER_URL.
-          if [ -z "$DISPATCHER_URL" ]; then
-            echo "⚠ DISPATCHER_URL não configurado — webhook ignorado"
-            exit 0
-          fi
-          # Fix #3: JOB_ID pode estar vazio se o step "Detectar modo" falhou
-          # antes de escrever para GITHUB_ENV. Usa inputs.job_id como fallback
-          # garantido — é resolvido em tempo de compilação do workflow pelo
-          # Actions, independente de qualquer step ter rodado ou não.
-          EFFECTIVE_JOB_ID="${JOB_ID:-${{ inputs.job_id }}}"
-          if [ -z "$EFFECTIVE_JOB_ID" ]; then
-            echo "⚠ job_id indisponível — webhook ignorado (não há job pra notificar)"
-            exit 0
-          fi
-          if [ "${{ job.status }}" = "success" ]; then
-            WEBHOOK_STATUS="done"
-          else
-            WEBHOOK_STATUS="failed"
-          fi
-          WEBHOOK_URL="${DISPATCHER_URL%/}/webhook"
-          echo "→ POST ${WEBHOOK_URL} (job_id=${EFFECTIVE_JOB_ID}, status=${WEBHOOK_STATUS})"
-
-          HTTP_CODE=$(curl -s -o /tmp/wh_resp.txt -w '%{http_code}' -X POST \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: ${ADMIN_API_KEY}" \
-            --max-time 20 --retry 3 --retry-delay 5 \
-            "${WEBHOOK_URL}" \
-            -d "{\"job_id\":\"${EFFECTIVE_JOB_ID}\",\"status\":\"${WEBHOOK_STATUS}\"}") || true
-
-          if [[ "$HTTP_CODE" =~ ^2 ]]; then
-            echo "✓ Webhook enviado (HTTP $HTTP_CODE)"
-          else
-            echo "✗ Webhook falhou (HTTP $HTTP_CODE) — não fatal, resposta:"
-            cat /tmp/wh_resp.txt 2>/dev/null || true
-          fi
-
       - name: Cleanup
         if: always()
         run: |
           rm -rf "$WORK_DIR"
-          rm -rf /tmp/batches/ 2>/dev/null || true
           rm -f /tmp/wh_resp.txt
           echo "✓ Workspace limpo"
