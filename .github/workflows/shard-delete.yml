@@ -1,0 +1,38 @@
+name: StreamVault Shard Delete
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'job_id a remover (pasta no shard)'
+        required: true
+      shard_repo:
+        description: 'ex: streamvault-storage-02'
+        required: true
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: git rm no shard
+        env:
+          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
+        run: |
+          set -e
+          REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${{ inputs.shard_repo }}.git"
+
+          git clone --depth=1 --filter=blob:none --branch storage-main "$REPO_URL" /tmp/shard
+          cd /tmp/shard
+
+          if [ ! -d "${{ inputs.job_id }}" ]; then
+            echo "⚠ ${{ inputs.job_id }} não existe em ${{ inputs.shard_repo }} — nada a fazer"
+            exit 0
+          fi
+
+          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site rm -r "${{ inputs.job_id }}"
+          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit -m "delete job=${{ inputs.job_id }}"
+          git push origin storage-main
+          echo "✓ ${{ inputs.job_id }} removido de ${{ inputs.shard_repo }}"
+
+          rm -rf /tmp/shard
