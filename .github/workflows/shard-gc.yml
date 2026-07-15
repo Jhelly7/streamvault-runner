@@ -1,0 +1,107 @@
+name: StreamVault Shard GC
+
+# Squash semanal do histórico de cada shard de storage — liberta o espaço de
+# objetos removidos por shard-delete.yml (git rm sozinho NUNCA encolhe o
+# repo; os blobs continuam no histórico até haver um squash/orphan branch).
+#
+# FIX: lista de shards deixou de ser hardcoded (streamvault-storage-01, -02).
+# pick_shard() em process.yml cria -03, -04, ... dinamicamente conforme os
+# anteriores enchem — uma lista fixa aqui ia deixar de apanhar esses shards
+# silenciosamente (sem erro, sem aviso — só objetos mortos a acumular para
+# sempre nos shards novos). Agora a lista vem de GET /users/{owner}/repos,
+# filtrada pelo prefixo "streamvault-storage-".
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 4 * * 0'   # domingo 04:00 UTC
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.list.outputs.shards }}
+    steps:
+      - name: Descobrir shards via API
+        id: list
+        env:
+          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess, json
+
+          owner = os.environ['STORAGE_OWNER']
+          token = os.environ['STORAGE_TOKEN']
+          prefix = 'streamvault-storage-'
+
+          shards = []
+          page = 1
+          while True:
+            r = subprocess.run([
+              'curl', '-sf',
+              '-H', f'Authorization: Bearer {token}',
+              '-H', 'Accept: application/vnd.github+json',
+              '-H', 'X-GitHub-Api-Version: 2022-11-28',
+              f'https://api.github.com/users/{owner}/repos?per_page=100&page={page}',
+            ], capture_output=True, text=True)
+
+            if r.returncode != 0:
+              print(f"✗ Falha a listar repos (page {page}): {r.stderr[:200]}")
+              break
+
+            repos = json.loads(r.stdout)
+            if not repos:
+              break
+
+            for repo in repos:
+              name = repo.get('name', '')
+              if name.startswith(prefix):
+                shards.append(name)
+
+            if len(repos) < 100:
+              break
+            page += 1
+
+          shards.sort()
+          print(f"✓ {len(shards)} shard(s) encontrado(s): {shards}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"shards={json.dumps(shards)}\n")
+          PYEOF
+
+  squash:
+    needs: discover
+    if: needs.discover.outputs.shards != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.discover.outputs.shards) }}
+    steps:
+      - name: Squash de histórico — ${{ matrix.shard }}
+        env:
+          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
+        run: |
+          set -e
+          REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${{ matrix.shard }}.git"
+
+          git clone --depth=1 --branch storage-main "$REPO_URL" /tmp/s 2>/dev/null || {
+            echo "⚠ ${{ matrix.shard }}: branch storage-main não existe ou repo vazio — nada a fazer"
+            exit 0
+          }
+          cd /tmp/s
+
+          BEFORE_KB=$(du -sk .git | cut -f1)
+
+          git checkout --orphan tmp-squash
+          git add -A
+          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit -m "squash $(date -u +%F)"
+          git branch -D storage-main
+          git branch -m storage-main
+          git push origin storage-main --force
+
+          cd /tmp
+          rm -rf /tmp/s
+          echo "✓ ${{ matrix.shard }}: squash concluído (histórico anterior tinha ~${BEFORE_KB}KB em .git — GitHub liberta os objetos órfãos com atraso, não instantâneo)"
