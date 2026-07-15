@@ -788,87 +788,14 @@ jobs:
             raise SystemExit(1)
           PYEOF
 
-      - name: Commit + push dos segmentos para o shard (com retry e config git performance)
-        env:
-          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
-          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
-        run: |
-          set -e
-          
-          # ── Config git para performance + delta ──────────────────────────
-          git config --global core.deltaBaseCacheLimit 2047m
-          git config --global core.looseObjects 0
-          git config --global pack.compression 9
-          git config --global repack.useDeltaBaseOffset true
-          
-          REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${SHARD_REPO}.git"
-
-          clone_with_retry() {
-            for attempt in 1 2 3; do
-              if git clone --depth=1 --filter=blob:none --single-branch --branch storage-main "$REPO_URL" /tmp/shard 2>/dev/null; then
-                return 0
-              fi
-              if [ $attempt -lt 3 ]; then
-                echo "  ⚠ Clone tentativa $attempt falhou — a retentar..."
-                sleep $((attempt * 5))
-              fi
-            done
-            git clone --depth=1 --filter=blob:none "$REPO_URL" /tmp/shard 2>/dev/null || return 1
-          }
-
-          clone_with_retry || {
-            echo "✗ Clone falhou após tentativas"
-            exit 1
-          }
-          
-          cd /tmp/shard
-          git checkout -B storage-main
-
-          mkdir -p "$JOB_ID/hls" "$JOB_ID/thumbs"
-          cp "$WORK_DIR"/hls/*.bin "$JOB_ID/hls/"
-          cp "$WORK_DIR"/master.m3u8 "$WORK_DIR"/nonces.json "$JOB_ID/" 2>/dev/null || true
-          if [ -d "$WORK_DIR/thumbs" ]; then
-            cp "$WORK_DIR"/thumbs/* "$JOB_ID/thumbs/" 2>/dev/null || true
-          fi
-
-          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
-          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit -m "job=${JOB_ID}"
-
-          # ── Retry inteligente no push com rebase em fast-forward ─────────
-          push_with_retry() {
-            local attempt=1
-            while [ $attempt -le 4 ]; do
-              if git push -u origin storage-main 2>&1; then
-                echo "✓ Push concluído (tentativa $attempt)"
-                return 0
-              fi
-              
-              local output=$(git push -u origin storage-main 2>&1 || true)
-              
-              if echo "$output" | grep -q "rejected.*fast-forward\|failed to push"; then
-                echo "  ⚠ Push rejeitado — a fazer rebase..."
-                git pull --rebase origin storage-main 2>/dev/null || {
-                  echo "  ⚠ Rebase falhou — ignorando conflitos (força push)"
-                  git rebase --abort 2>/dev/null || true
-                  git push --force-with-lease origin storage-main 2>&1 && return 0
-                }
-              else
-                local wait=$((attempt * 10))
-                echo "  ⚠ Push tentativa $attempt falhou — aguarda ${wait}s..."
-                sleep $wait
-              fi
-              
-              attempt=$((attempt + 1))
-            done
-            
-            echo "✗ Push falhou após 4 tentativas"
-            return 1
-          }
-
-          push_with_retry || exit 1
-
-          rm -rf /tmp/shard
-          echo "✓ Commit em ${SHARD_REPO}: ${JOB_ID}"
+      # ── FIX CIRÚRGICO ──────────────────────────────────────────────────
+      # Estes dois steps (reescrever index.m3u8 + gerar master.m3u8) foram
+      # MOVIDOS para ANTES do "Commit + push". Na ordem antiga, o commit
+      # tentava copiar $WORK_DIR/master.m3u8 e hls/index.m3u8 (reescrito)
+      # ANTES de estes ficheiros existirem — o cp falhava silenciosamente
+      # (`2>/dev/null || true`) e nunca eram enviados para o shard, daí o
+      # 404 em master.m3u8. Só dependem de SHARD_REPO (já definido acima)
+      # e dos artefactos já gerados nos steps de encode/encriptação.
 
       - name: Reescrever index.m3u8 com URLs raw.githubusercontent.com
         env:
@@ -959,6 +886,95 @@ jobs:
           json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
           print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs")
           PYEOF
+
+      - name: Commit + push dos segmentos para o shard (com retry e config git performance)
+        env:
+          STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
+          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
+        run: |
+          set -e
+          
+          # ── Config git para performance + delta ──────────────────────────
+          git config --global core.deltaBaseCacheLimit 2047m
+          git config --global core.looseObjects 0
+          git config --global pack.compression 9
+          git config --global repack.useDeltaBaseOffset true
+          
+          REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${SHARD_REPO}.git"
+
+          clone_with_retry() {
+            for attempt in 1 2 3; do
+              if git clone --depth=1 --filter=blob:none --single-branch --branch storage-main "$REPO_URL" /tmp/shard 2>/dev/null; then
+                return 0
+              fi
+              if [ $attempt -lt 3 ]; then
+                echo "  ⚠ Clone tentativa $attempt falhou — a retentar..."
+                sleep $((attempt * 5))
+              fi
+            done
+            git clone --depth=1 --filter=blob:none "$REPO_URL" /tmp/shard 2>/dev/null || return 1
+          }
+
+          clone_with_retry || {
+            echo "✗ Clone falhou após tentativas"
+            exit 1
+          }
+          
+          cd /tmp/shard
+          git checkout -B storage-main
+
+          mkdir -p "$JOB_ID/hls" "$JOB_ID/thumbs"
+
+          # FIX: hls/index.m3u8 (reescrito) e master.m3u8 já existem neste
+          # ponto (gerados nos steps acima, antes do commit) — por isso já
+          # não usamos `2>/dev/null || true` a esconder um cp que falha.
+          # Se algum destes ficheiros faltar agora, é um erro real e deve
+          # abortar o job (set -e), não passar em silêncio como antes.
+          cp "$WORK_DIR"/hls/*.bin "$JOB_ID/hls/"
+          cp "$WORK_DIR"/hls/index.m3u8 "$JOB_ID/hls/"
+          cp "$WORK_DIR"/master.m3u8 "$WORK_DIR"/nonces.json "$JOB_ID/"
+          if [ -d "$WORK_DIR/thumbs" ]; then
+            cp "$WORK_DIR"/thumbs/* "$JOB_ID/thumbs/" 2>/dev/null || true
+          fi
+
+          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
+          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit -m "job=${JOB_ID}"
+
+          # ── Retry inteligente no push com rebase em fast-forward ─────────
+          push_with_retry() {
+            local attempt=1
+            while [ $attempt -le 4 ]; do
+              if git push -u origin storage-main 2>&1; then
+                echo "✓ Push concluído (tentativa $attempt)"
+                return 0
+              fi
+              
+              local output=$(git push -u origin storage-main 2>&1 || true)
+              
+              if echo "$output" | grep -q "rejected.*fast-forward\|failed to push"; then
+                echo "  ⚠ Push rejeitado — a fazer rebase..."
+                git pull --rebase origin storage-main 2>/dev/null || {
+                  echo "  ⚠ Rebase falhou — ignorando conflitos (força push)"
+                  git rebase --abort 2>/dev/null || true
+                  git push --force-with-lease origin storage-main 2>&1 && return 0
+                }
+              else
+                local wait=$((attempt * 10))
+                echo "  ⚠ Push tentativa $attempt falhou — aguarda ${wait}s..."
+                sleep $wait
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+            
+            echo "✗ Push falhou após 4 tentativas"
+            return 1
+          }
+
+          push_with_retry || exit 1
+
+          rm -rf /tmp/shard
+          echo "✓ Commit em ${SHARD_REPO}: ${JOB_ID}"
 
       # ── Registar no EdgeOne ─────────────────────────────────────────────
       - name: Registar no EdgeOne (Turso + KV)
