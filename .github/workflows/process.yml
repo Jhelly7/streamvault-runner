@@ -647,6 +647,29 @@ jobs:
           print(f"✓ {len(thumbs)} thumbnail(s)")
           PYEOF
 
+      # ── FIX ESPAÇO EM DISCO ────────────────────────────────────────────
+      # O vídeo fonte ($WORK_DIR/incoming, potencialmente vários GB) só era
+      # apagado no Cleanup final, depois de já ter coexistido em disco com
+      # os segmentos HLS, os .bin encriptados, E o clone do shard (que fazia
+      # checkout completo do repo, por vezes perto do limite de 3.5GB). A
+      # soma destes três consumos é o que esgotava o disco do runner (erro
+      # "No space left on device" a meio do push, inclusive na escrita do
+      # próprio log de diagnóstico do runner). Neste ponto o vídeo fonte já
+      # não é necessário — probe, encode e extracção de thumbnail já
+      # consumiram-no — por isso é seguro remover agora, antes da
+      # encriptação e do clone do shard.
+      - name: Libertar espaço — remover vídeo fonte e temporários de torrent
+        if: always()
+        run: |
+          echo "Espaço em disco antes da limpeza:"
+          df -h "$WORK_DIR" 2>/dev/null | tail -1 || true
+          rm -rf "$WORK_DIR/incoming"
+          rm -f /tmp/input.torrent /tmp/coord.torrent
+          rm -rf /tmp/coord_meta
+          echo "✓ Vídeo fonte e ficheiros temporários de torrent removidos"
+          echo "Espaço em disco depois da limpeza:"
+          df -h "$WORK_DIR" 2>/dev/null | tail -1 || true
+
       - name: Encriptar segmentos → .bin
         run: |
           python3 << 'PYEOF'
@@ -887,91 +910,93 @@ jobs:
           print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs")
           PYEOF
 
-      - name: Commit + push dos segmentos para o shard (com retry e config git performance)
+      # ── FIX CIRÚRGICO ──────────────────────────────────────────────────
+      # PROBLEMA REAL (confirmado pelo log): quando o push é rejeitado por
+      # não ser fast-forward (outro job concorrente já publicou no mesmo
+      # shard), o step antigo tentava rebase e, se falhasse, fazia
+      # `git push --force-with-lease`. Um force-push sobrescreve o branch
+      # remoto com o snapshot local — que foi clonado ANTES do commit do
+      # outro job — apagando esse commit (incluindo os thumbs dele). É
+      # exactamente isso que produzia "às vezes aceite, às vezes
+      # rejeitado": não era falha no upload em si, era perda de dados por
+      # corrida entre jobs a escrever no mesmo shard.
+      #
+      # FIX: nunca mais fazer force-push. Em caso de rejeição, apaga o
+      # clone local, reclona o HEAD mais recente do shard, reaplica o
+      # commit deste job em cima desse HEAD actualizado, e tenta o push de
+      # novo. Como cada tentativa parte sempre do estado remoto mais
+      # recente e só adiciona a própria pasta $JOB_ID (nunca remove nada),
+      # nenhum job consegue apagar o trabalho de outro — o push só falha
+      # se dois jobs colidirem no MESMO job_id, o que não deve acontecer.
+      #
+      # Também usa `sparse-checkout` para nunca fazer checkout do conteúdo
+      # já existente no shard (que pode estar perto do limite de 3.5GB) —
+      # cada clone só materializa a pasta do próprio job_id, o que resolve
+      # o consumo de disco que causava o "No space left on device".
+      - name: Commit + push dos segmentos para o shard (sem force-push, sparse-checkout)
         env:
           STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
           STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
         run: |
           set -e
-          
-          # ── Config git para performance + delta ──────────────────────────
+
           git config --global core.deltaBaseCacheLimit 2047m
           git config --global core.looseObjects 0
           git config --global pack.compression 9
           git config --global repack.useDeltaBaseOffset true
-          
+          git config --global advice.detachedHead false
+
           REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${SHARD_REPO}.git"
 
-          clone_with_retry() {
-            for attempt in 1 2 3; do
-              if git clone --depth=1 --filter=blob:none --single-branch --branch storage-main "$REPO_URL" /tmp/shard 2>/dev/null; then
-                return 0
-              fi
-              if [ $attempt -lt 3 ]; then
-                echo "  ⚠ Clone tentativa $attempt falhou — a retentar..."
-                sleep $((attempt * 5))
-              fi
-            done
-            git clone --depth=1 --filter=blob:none "$REPO_URL" /tmp/shard 2>/dev/null || return 1
+          prepare_and_commit() {
+            rm -rf /tmp/shard
+            # --no-checkout + sparse-checkout: nunca materializa o conteúdo
+            # já existente no shard, só a pasta deste job. Clone rápido e
+            # leve independentemente do tamanho actual do shard.
+            git clone --depth=1 --filter=blob:none --no-checkout \
+              --single-branch --branch storage-main "$REPO_URL" /tmp/shard
+            cd /tmp/shard
+            git sparse-checkout init --cone
+            git sparse-checkout set "$JOB_ID"
+            git checkout storage-main
+
+            mkdir -p "$JOB_ID/hls" "$JOB_ID/thumbs"
+
+            cp "$WORK_DIR"/hls/*.bin "$JOB_ID/hls/"
+            cp "$WORK_DIR"/hls/index.m3u8 "$JOB_ID/hls/"
+            cp "$WORK_DIR"/master.m3u8 "$WORK_DIR"/nonces.json "$JOB_ID/"
+            if [ -d "$WORK_DIR/thumbs" ] && [ -n "$(ls -A "$WORK_DIR/thumbs" 2>/dev/null)" ]; then
+              cp "$WORK_DIR"/thumbs/* "$JOB_ID/thumbs/"
+            else
+              echo "  ⚠ Sem thumbnails geradas em $WORK_DIR/thumbs — a prosseguir sem thumb"
+            fi
+
+            git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
+            git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit -m "job=${JOB_ID}"
           }
 
-          clone_with_retry || {
-            echo "✗ Clone falhou após tentativas"
-            exit 1
-          }
-          
-          cd /tmp/shard
-          git checkout -B storage-main
-
-          mkdir -p "$JOB_ID/hls" "$JOB_ID/thumbs"
-
-          # FIX: hls/index.m3u8 (reescrito) e master.m3u8 já existem neste
-          # ponto (gerados nos steps acima, antes do commit) — por isso já
-          # não usamos `2>/dev/null || true` a esconder um cp que falha.
-          # Se algum destes ficheiros faltar agora, é um erro real e deve
-          # abortar o job (set -e), não passar em silêncio como antes.
-          cp "$WORK_DIR"/hls/*.bin "$JOB_ID/hls/"
-          cp "$WORK_DIR"/hls/index.m3u8 "$JOB_ID/hls/"
-          cp "$WORK_DIR"/master.m3u8 "$WORK_DIR"/nonces.json "$JOB_ID/"
-          if [ -d "$WORK_DIR/thumbs" ]; then
-            cp "$WORK_DIR"/thumbs/* "$JOB_ID/thumbs/" 2>/dev/null || true
-          fi
-
-          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
-          git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit -m "job=${JOB_ID}"
-
-          # ── Retry inteligente no push com rebase em fast-forward ─────────
-          push_with_retry() {
+          push_with_refetch_retry() {
+            local max_attempts=6
             local attempt=1
-            while [ $attempt -le 4 ]; do
-              if git push -u origin storage-main 2>&1; then
-                echo "✓ Push concluído (tentativa $attempt)"
+            while [ $attempt -le $max_attempts ]; do
+              echo "→ Tentativa $attempt/$max_attempts — commit sobre o HEAD actual do shard..."
+              prepare_and_commit
+              if git push origin storage-main; then
+                echo "✓ Push concluído (tentativa $attempt) — nenhum dado de outros jobs foi descartado"
                 return 0
               fi
-              
-              local output=$(git push -u origin storage-main 2>&1 || true)
-              
-              if echo "$output" | grep -q "rejected.*fast-forward\|failed to push"; then
-                echo "  ⚠ Push rejeitado — a fazer rebase..."
-                git pull --rebase origin storage-main 2>/dev/null || {
-                  echo "  ⚠ Rebase falhou — ignorando conflitos (força push)"
-                  git rebase --abort 2>/dev/null || true
-                  git push --force-with-lease origin storage-main 2>&1 && return 0
-                }
-              else
-                local wait=$((attempt * 10))
-                echo "  ⚠ Push tentativa $attempt falhou — aguarda ${wait}s..."
-                sleep $wait
-              fi
-              
+              cd /
+              local wait=$((attempt * 8))
+              echo "  ⚠ Push rejeitado (outro job concorrente publicou entretanto no mesmo shard)"
+              echo "  ⚠ Sem force-push — a reclonar HEAD actualizado e reaplicar o commit em ${wait}s..."
+              sleep $wait
               attempt=$((attempt + 1))
             done
-            
-            echo "✗ Push falhou após 4 tentativas"
+            echo "✗ Push falhou após ${max_attempts} tentativas — dados de outros jobs preservados (nunca houve force-push)"
             return 1
           }
 
-          push_with_retry || exit 1
+          push_with_refetch_retry || exit 1
 
           rm -rf /tmp/shard
           echo "✓ Commit em ${SHARD_REPO}: ${JOB_ID}"
@@ -1150,5 +1175,7 @@ jobs:
         if: always()
         run: |
           rm -rf "$WORK_DIR"
-          rm -f /tmp/wh_resp.txt
+          rm -rf /tmp/shard
+          rm -f /tmp/wh_resp.txt /tmp/input.torrent /tmp/coord.torrent
+          rm -rf /tmp/coord_meta
           echo "✓ Workspace limpo"
