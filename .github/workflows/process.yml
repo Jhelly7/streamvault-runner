@@ -1052,7 +1052,28 @@ jobs:
           # esse lote é reclonado e reaplicado (não o job inteiro).
           BATCH_SIZE=250
 
+          # ─────────────────────────────────────────────────────────────
+          # FIX CIRÚRGICO #7: "Unable to read current working directory"
+          # ─────────────────────────────────────────────────────────────
+          # PROBLEMA: push_batch() termina cada tentativa dentro de
+          # `/tmp/shard` (por causa do `cd /tmp/shard` no início do loop).
+          # Quando o push falha e o retry chama fresh_clone(), a primeira
+          # coisa que fresh_clone() fazia era `rm -rf /tmp/shard` — MAS
+          # o processo bash ainda estava com o cwd dentro desse mesmo
+          # diretório. Apagar o próprio diretório de trabalho corrente do
+          # shell invalida o cwd do processo: todos os comandos seguintes
+          # (git clone, mkdir, cp) passam a falhar com
+          # "fatal: Unable to read current working directory" / "cannot
+          # create directory" — exatamente a cascata de erros observada
+          # no lote 4 (mkdir e cp falhando antes mesmo do clone, depois
+          # `git clone` e `cd /tmp/shard` falhando pelo mesmo motivo).
+          #
+          # SOLUÇÃO: sair para um diretório seguro (`cd /`) SEMPRE no
+          # início de fresh_clone(), antes de qualquer `rm -rf /tmp/shard`.
+          # Isto garante que o cwd do shell nunca é apagado enquanto está
+          # a ser usado, independentemente de onde a função é chamada.
           fresh_clone() {
+            cd / || cd "$HOME" || true
             rm -rf /tmp/shard
             # SPARSE-CHECKOUT: clone --no-checkout + sparse-checkout init
             # garante que só a pasta $JOB_ID é materializada, não o resto
