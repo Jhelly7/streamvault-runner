@@ -816,7 +816,7 @@ jobs:
             eligible = []
             n = 1
             while n <= MAX_SHARDS_TO_SCAN:
-              repo = f'streamvault-storage-{n:02d}'
+              repo = f'compiled{n:02d}'
 
               if repo in shard_cache:
                 size_kb = shard_cache[repo]
@@ -849,7 +849,7 @@ jobs:
               return chosen
 
             # Nenhum shard existente tem espaço — criar o próximo da sequência
-            new_repo = f'streamvault-storage-{n:02d}'
+            new_repo = f'compiled{n:02d}'
             print(f"  → nenhum shard com espaço livre, a criar {new_repo}...")
             if not create_repo(new_repo):
               raise SystemExit(1)
@@ -1014,15 +1014,46 @@ jobs:
 
           git config --global core.deltaBaseCacheLimit 2047m
           git config --global core.looseObjects 0
-          git config --global pack.compression 9
+          # FIX CIRÚRGICO #5: pack.compression=9 desperdiçava CPU tentando
+          # comprimir ficheiros .bin já encriptados com ChaCha20 (dados de
+          # alta entropia, praticamente incompressíveis) — isto arrastava o
+          # tempo de `git push` em jobs com muitos segmentos (~2000+) até o
+          # GitHub cortar a ligação a meio ("RPC failed; HTTP 500 ...
+          # unexpected disconnect"). pack.window=0 desliga também a procura
+          # de deltas entre segmentos (igualmente inútil em dados encriptados
+          # distintos). http.postBuffer e http.lowSpeed* evitam timeouts em
+          # pushes grandes via HTTPS.
+          git config --global pack.compression 0
+          git config --global pack.window 0
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
           git config --global repack.useDeltaBaseOffset true
           git config --global advice.detachedHead false
 
           REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${SHARD_REPO}.git"
 
-          prepare_and_commit() {
+          # ─────────────────────────────────────────────────────────────
+          # FIX CIRÚRGICO #6: ENVIO EM LOTES (BATCHED PUSH)
+          # ─────────────────────────────────────────────────────────────
+          # PROBLEMA: um único `git push` com ~2000 segmentos gera um pack
+          # grande o suficiente para o GitHub cortar a ligação a meio
+          # ("RPC failed; HTTP 500 ... unexpected disconnect"), mesmo após
+          # o fix #5 (compressão). O retry antigo reenviava o job INTEIRO
+          # a cada tentativa — se falhasse sempre pelo mesmo motivo
+          # (payload grande demais), 8 tentativas = 8 falhas garantidas.
+          #
+          # SOLUÇÃO: dividir os ficheiros em lotes de BATCH_SIZE e fazer
+          # um commit+push por lote, reaproveitando o MESMO clone entre
+          # lotes bem-sucedidos (não reclona do zero a cada lote). Cada
+          # lote com sucesso fica permanentemente no shard — se um lote
+          # posterior falhar, os lotes anteriores não se perdem (nada é
+          # reenviado). Em caso de rejeição/erro de um lote específico, só
+          # esse lote é reclonado e reaplicado (não o job inteiro).
+          BATCH_SIZE=250
+
+          fresh_clone() {
             rm -rf /tmp/shard
-            
             # SPARSE-CHECKOUT: clone --no-checkout + sparse-checkout init
             # garante que só a pasta $JOB_ID é materializada, não o resto
             # do shard (que pode ter 3.5GB). Clone rápido e leve.
@@ -1033,11 +1064,11 @@ jobs:
               git clone --depth=1 --filter=blob:none --no-checkout \
                 "$REPO_URL" /tmp/shard 2>&1
             }
-            
+
             cd /tmp/shard
             git sparse-checkout init --cone
             git sparse-checkout set "$JOB_ID" 2>/dev/null || true
-            
+
             # Tenta fazer checkout da branch storage-main se existe
             git checkout storage-main 2>/dev/null || \
             {
@@ -1047,56 +1078,89 @@ jobs:
             }
 
             mkdir -p "$JOB_ID/hls" "$JOB_ID/thumbs"
-
-            cp "$WORK_DIR"/hls/*.bin "$JOB_ID/hls/"
-            cp "$WORK_DIR"/hls/index.m3u8 "$JOB_ID/hls/"
-            cp "$WORK_DIR"/master.m3u8 "$WORK_DIR"/nonces.json "$JOB_ID/"
-            if [ -d "$WORK_DIR/thumbs" ] && [ -n "$(ls -A "$WORK_DIR/thumbs" 2>/dev/null)" ]; then
-              cp "$WORK_DIR"/thumbs/* "$JOB_ID/thumbs/"
-            fi
-
-            git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
-            git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit -m "job=${JOB_ID}" || true
           }
 
-          push_with_refetch_retry() {
-            # max_attempts=8 e jitter aleatório no backoff: sob alta concorrência
-            # (muitos jobs a escrever no mesmo shard), um backoff determinístico
-            # (attempt*8) faz todos os jobs colidentes retentarem exactamente ao
-            # mesmo tempo, colidindo outra vez (thundering herd). O jitter
-            # desincroniza os retries.
+          # push_batch: copia os ficheiros do lote, commit, push. Em falha,
+          # reclona (traz já os lotes anteriores, persistidos remotamente)
+          # e reaplica APENAS este lote — nunca os lotes já enviados.
+          push_batch() {
+            local batch_num="$1" total_batches="$2"
+            shift 2
+            local files=("$@")
             local max_attempts=8
             local attempt=1
-            
+
             while [ $attempt -le $max_attempts ]; do
-              echo "→ Tentativa $attempt/$max_attempts — commit sobre o HEAD actual do shard..."
-              prepare_and_commit
-              
+              cd /tmp/shard
+              for rel in "${files[@]}"; do
+                mkdir -p "$JOB_ID/$(dirname "$rel")"
+                cp "$WORK_DIR/$rel" "$JOB_ID/$rel"
+              done
+
+              git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
+              git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit \
+                -m "job=${JOB_ID} lote=${batch_num}/${total_batches}" || true
+
+              echo "→ Lote $batch_num/$total_batches (${#files[@]} ficheiros) — tentativa $attempt/$max_attempts..."
               if git push origin storage-main 2>&1; then
-                echo "✓ Push concluído (tentativa $attempt)"
-                echo "✓ Nenhum dado de outros jobs foi descartado (sem force-push)"
+                echo "✓ Lote $batch_num/$total_batches enviado (tentativa $attempt)"
                 return 0
               fi
-              
-              cd /
+
               local base_wait=$((attempt * 8))
               local jitter=$((RANDOM % 10))
               local wait=$((base_wait + jitter))
-              echo "  ⚠ Push rejeitado (outro job concorrente publicou entretanto no mesmo shard)"
-              echo "  ⚠ Sem force-push — a reclonar HEAD actualizado e reaplicar o commit em ${wait}s (base ${base_wait}s + jitter ${jitter}s)..."
+              echo "  ⚠ Push do lote $batch_num falhou (rejeição concorrente ou erro RPC) — sem force-push"
+              echo "  ⚠ A reclonar HEAD actualizado e reaplicar SÓ este lote em ${wait}s (base ${base_wait}s + jitter ${jitter}s)..."
               sleep $wait
+              fresh_clone
               attempt=$((attempt + 1))
             done
-            
-            echo "✗ Push falhou após ${max_attempts} tentativas"
-            echo "✗ Dados de outros jobs preservados (nunca houve force-push)"
+
+            echo "✗ Lote $batch_num/$total_batches falhou após ${max_attempts} tentativas"
             return 1
           }
 
-          push_with_refetch_retry || exit 1
+          # Monta a lista ordenada de ficheiros a enviar (caminhos relativos a $WORK_DIR)
+          FILES_TO_SEND=()
+          while IFS= read -r -d '' f; do
+            FILES_TO_SEND+=("hls/$(basename "$f")")
+          done < <(find "$WORK_DIR/hls" -maxdepth 1 -type f -print0 | sort -z)
 
+          FILES_TO_SEND+=("master.m3u8" "nonces.json")
+
+          if [ -d "$WORK_DIR/thumbs" ] && [ -n "$(ls -A "$WORK_DIR/thumbs" 2>/dev/null)" ]; then
+            while IFS= read -r -d '' f; do
+              FILES_TO_SEND+=("thumbs/$(basename "$f")")
+            done < <(find "$WORK_DIR/thumbs" -maxdepth 1 -type f -print0 | sort -z)
+          fi
+
+          TOTAL=${#FILES_TO_SEND[@]}
+          NUM_BATCHES=$(( (TOTAL + BATCH_SIZE - 1) / BATCH_SIZE ))
+          echo "→ $TOTAL ficheiro(s) a enviar em $NUM_BATCHES lote(s) de até $BATCH_SIZE"
+
+          fresh_clone
+
+          idx=0
+          batch_num=0
+          while [ $idx -lt $TOTAL ]; do
+            batch_num=$((batch_num + 1))
+            batch=("${FILES_TO_SEND[@]:idx:BATCH_SIZE}")
+
+            if ! push_batch "$batch_num" "$NUM_BATCHES" "${batch[@]}"; then
+              cd /
+              rm -rf /tmp/shard
+              echo "✗ Envio interrompido no lote $batch_num/$NUM_BATCHES"
+              echo "✗ Lotes anteriores já persistidos no shard (sem force-push, nada foi perdido)"
+              exit 1
+            fi
+
+            idx=$((idx + BATCH_SIZE))
+          done
+
+          cd /
           rm -rf /tmp/shard
-          echo "✓ Commit em ${SHARD_REPO}: ${JOB_ID}"
+          echo "✓ Todos os $NUM_BATCHES lote(s) enviados para ${SHARD_REPO}: ${JOB_ID}"
 
       # ── Registar no EdgeOne ─────────────────────────────────────────────
       - name: Registar no EdgeOne (Turso + KV)
