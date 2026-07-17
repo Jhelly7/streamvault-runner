@@ -700,13 +700,12 @@ jobs:
       # FIX CIRÚRGICO #2 e #3: LIBERTAR ESPAÇO ANTES DE CLONE
       # ═══════════════════════════════════════════════════════════════════
       # O vídeo fonte ($WORK_DIR/incoming, potencialmente vários GB) e
-      # ficheiros temporários de torrent DEVEM ser apagados ANTES do
-      # `git clone` do shard. Caso contrário, o disco pode encher:
+      # ficheiros temporários de torrent DEVEM ser apagados ANTES de
+      # qualquer operação Git subsequente. Caso contrário, o disco pode
+      # encher:
       #   - Vídeo bruto: ~5-10 GB
       #   - HLS segmentos: ~3 GB (após encode)
-      #   - Shard clone: ~3.5 GB (limite do repo)
-      #   Total: ~11+ GB (mas runner tem ~14 GB free)
-      # Remover o vídeo aqui garante espaço para o clone sparse-checkout.
+      #   Total: pode exceder os ~14 GB livres do runner.
 
       - name: Libertar espaço — remover vídeo fonte e temporários de torrent
         if: always()
@@ -864,35 +863,45 @@ jobs:
             f.write(f"SHARD_REPO={shard}\n")
           PYEOF
 
-      - name: Verificar se artefatos já existem no shard
-        continue-on-error: true
-        env:
-          STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
+      # ═══════════════════════════════════════════════════════════════════
+      # FIX CIRÚRGICO #8: BRANCH EXCLUSIVA POR JOB — elimina a causa raiz
+      # ═══════════════════════════════════════════════════════════════════
+      # PROBLEMA DE FUNDO: todo o retry/backoff/reclone/batch anteriores
+      # (#1, #2, #6, #7) só reduziam a PROBABILIDADE de colisão quando
+      # vários jobs escreviam na mesma branch (`storage-main`) do mesmo
+      # shard. Com jobs suficientes em paralelo, alguns non-fast-forward
+      # são estatisticamente garantidos, e cada um deles custa um
+      # reclone completo + reaplicação do lote.
+      #
+      # SOLUÇÃO: cada job escreve numa branch órfã exclusiva, cujo nome é
+      # uma função pura do job_id. Como nenhum outro job — passado,
+      # presente ou futuro — jamais escreve nessa branch, dois jobs
+      # paralelos NUNCA colidem, independentemente de terem escolhido o
+      # mesmo shard. Isto elimina a necessidade de:
+      #   - clonar o conteúdo existente do shard (sem sparse-checkout,
+      #     sem --filter=blob:none) — a branch é nova, sem histórico
+      #     partilhado com outros jobs;
+      #   - detectar e tratar non-fast-forward (não pode acontecer);
+      #   - verificar antecipadamente se o job já existe no shard (o
+      #     nome da branch já garante exclusividade).
+      # A única coisa que uma nova execução do MESMO job_id pode
+      # encontrar é a branch da SUA PRÓPRIA execução anterior — nesse
+      # caso um push --force é seguro (ver step de commit+push), porque
+      # só sobrescreve dados desse mesmo job, nunca de outro.
+
+      - name: Definir branch exclusiva do job
         run: |
           python3 << 'PYEOF'
-          import os, urllib.request, urllib.error
-          
-          owner = os.environ['STORAGE_OWNER']
-          shard = os.environ['SHARD_REPO']
+          import os, re
           job_id = os.environ['JOB_ID']
-          
-          test_url = f"https://raw.githubusercontent.com/{owner}/{shard}/storage-main/{job_id}/hls/init.bin"
-          
-          try:
-            req = urllib.request.Request(test_url, method='HEAD')
-            with urllib.request.urlopen(req, timeout=10) as r:
-              print(f"  ⚠ {job_id} já existe no {shard} (HTTP {r.status}) — pulando upload")
-              raise SystemExit(0)
-          except urllib.error.HTTPError as e:
-            if e.code == 404:
-              print(f"  ✓ {job_id} não existe — prosseguindo com commit")
-              raise SystemExit(1)
-            else:
-              print(f"  ⚠ Verificação retornou HTTP {e.code} — continuando por segurança")
-              raise SystemExit(1)
-          except Exception as e:
-            print(f"  ⚠ Verificação falhou ({e}) — continuando")
-            raise SystemExit(1)
+          safe = re.sub(r'[^A-Za-z0-9._-]', '-', job_id)
+          safe = re.sub(r'\.{2,}', '.', safe).strip('.-')
+          if not safe:
+            safe = 'job'
+          branch = f"job-{safe}"
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"JOB_BRANCH={branch}\n")
+          print(f"✓ Branch exclusiva do job: {branch}")
           PYEOF
 
       # ── Reescrever index.m3u8 antes do commit ──────────────────────────
@@ -906,7 +915,8 @@ jobs:
           job_id   = os.environ['JOB_ID']
           owner    = os.environ['STORAGE_OWNER']
           shard    = os.environ['SHARD_REPO']
-          raw_base = f"https://raw.githubusercontent.com/{owner}/{shard}/storage-main/{job_id}"
+          branch   = os.environ['JOB_BRANCH']
+          raw_base = f"https://raw.githubusercontent.com/{owner}/{shard}/{branch}/{job_id}"
 
           with open(hls_dir + '/index.m3u8') as f: content = f.read()
 
@@ -934,10 +944,11 @@ jobs:
           job_id    = os.environ['JOB_ID']
           owner     = os.environ['STORAGE_OWNER']
           shard     = os.environ['SHARD_REPO']
+          branch    = os.environ['JOB_BRANCH']
           work_dir  = os.environ['WORK_DIR']
           eff_w     = os.environ['EFF_WIDTH']
           eff_h     = os.environ['EFF_HEIGHT']
-          raw_base  = f"https://raw.githubusercontent.com/{owner}/{shard}/storage-main/{job_id}"
+          raw_base  = f"https://raw.githubusercontent.com/{owner}/{shard}/{branch}/{job_id}"
           hls_dir   = work_dir + '/hls'
           bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin')
           if bin_files:
@@ -964,7 +975,8 @@ jobs:
           job_id   = os.environ['JOB_ID']
           owner    = os.environ['STORAGE_OWNER']
           shard    = os.environ['SHARD_REPO']
-          raw_base = f"https://raw.githubusercontent.com/{owner}/{shard}/storage-main/{job_id}"
+          branch   = os.environ['JOB_BRANCH']
+          raw_base = f"https://raw.githubusercontent.com/{owner}/{shard}/{branch}/{job_id}"
 
           nonces = json.load(open(work_dir + '/nonces.json'))
           thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
@@ -987,25 +999,32 @@ jobs:
           PYEOF
 
       # ═══════════════════════════════════════════════════════════════════
-      # FIX CIRÚRGICO #1 e #2: COMMIT + PUSH SEM FORCE-PUSH
+      # FIX CIRÚRGICO #8 (cont.): COMMIT + PUSH NA BRANCH EXCLUSIVA
       # ═══════════════════════════════════════════════════════════════════
-      # PROBLEMA #1: `git push --force-with-lease` sobrescreve o branch
-      # remoto com o snapshot local, deletando commits de outros jobs
-      # quando dois jobs escrevem no mesmo shard concorrentemente.
+      # Sem clone do conteúdo existente do shard (não há histórico
+      # partilhado a respeitar), sem sparse-checkout, sem detecção de
+      # non-fast-forward — nada disso é possível acontecer nesta branch.
+      # Mantém-se o envio em lotes (BATCH_SIZE) por robustez em pushes
+      # grandes (~2000+ segmentos): um pack demasiado grande pode ainda
+      # levar o GitHub a cortar a ligação a meio ("RPC failed; HTTP 500
+      # ... unexpected disconnect"), mas como cada lote fica
+      # permanentemente commitado localmente, o retry de um lote nunca
+      # reenvia os anteriores.
       #
-      # PROBLEMA #2: `git clone --filter=blob:none` + checkout do shard
-      # inteiro enche o disco quando o shard tem 3.5GB.
+      # Em caso de falha de push, o retry é uma repetição simples do
+      # MESMO `git push` — nunca um reclone — porque não há mais ninguém
+      # a escrever nesta branch: qualquer falha só pode ser transitória
+      # (rede, 5xx do GitHub).
       #
-      # SOLUÇÃO:
-      # - Usar `sparse-checkout` para só materializar a pasta $JOB_ID
-      # - Em caso de rejeição (non-fast-forward), NUNCA fazer force-push
-      # - Em vez disso: delete clone, reclone HEAD actualizado, reaplique
-      #   commit, retry push
-      # - Máximo 6 tentativas com backoff exponencial (8s, 16s, 24s, ...)
-      # - Como cada tentativa parte do HEAD remoto e só adiciona $JOB_ID,
-      #   nenhum job consegue apagar o trabalho de outro
+      # push --force é usado deliberadamente e é seguro aqui: ao
+      # contrário do cenário antigo (branch `storage-main` partilhada,
+      # onde force apagaria trabalho de outros jobs), esta branch só é
+      # tocada pelas execuções deste MESMO job_id. Se este job for
+      # reexecutado manualmente e a branch já existir de uma tentativa
+      # anterior parcial, o force apenas substitui os dados desse mesmo
+      # job — nunca de outro.
 
-      - name: Commit + push dos segmentos para o shard (sem force-push, sparse-checkout)
+      - name: Commit + push dos segmentos para o shard (branch exclusiva do job)
         env:
           STORAGE_TOKEN: ${{ secrets.STORAGE_GITHUB_TOKEN }}
           STORAGE_OWNER: ${{ secrets.STORAGE_GITHUB_OWNER }}
@@ -1014,15 +1033,13 @@ jobs:
 
           git config --global core.deltaBaseCacheLimit 2047m
           git config --global core.looseObjects 0
-          # FIX CIRÚRGICO #5: pack.compression=9 desperdiçava CPU tentando
-          # comprimir ficheiros .bin já encriptados com ChaCha20 (dados de
-          # alta entropia, praticamente incompressíveis) — isto arrastava o
-          # tempo de `git push` em jobs com muitos segmentos (~2000+) até o
-          # GitHub cortar a ligação a meio ("RPC failed; HTTP 500 ...
-          # unexpected disconnect"). pack.window=0 desliga também a procura
-          # de deltas entre segmentos (igualmente inútil em dados encriptados
-          # distintos). http.postBuffer e http.lowSpeed* evitam timeouts em
-          # pushes grandes via HTTPS.
+          # pack.compression=9 desperdiçava CPU tentando comprimir
+          # ficheiros .bin já encriptados com ChaCha20 (dados de alta
+          # entropia, praticamente incompressíveis). pack.window=0
+          # desliga também a procura de deltas entre segmentos
+          # (igualmente inútil em dados encriptados distintos).
+          # http.postBuffer e http.lowSpeed* evitam timeouts em pushes
+          # grandes via HTTPS.
           git config --global pack.compression 0
           git config --global pack.window 0
           git config --global http.postBuffer 524288000
@@ -1032,112 +1049,36 @@ jobs:
           git config --global advice.detachedHead false
 
           REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${SHARD_REPO}.git"
-
-          # ─────────────────────────────────────────────────────────────
-          # FIX CIRÚRGICO #6: ENVIO EM LOTES (BATCHED PUSH)
-          # ─────────────────────────────────────────────────────────────
-          # PROBLEMA: um único `git push` com ~2000 segmentos gera um pack
-          # grande o suficiente para o GitHub cortar a ligação a meio
-          # ("RPC failed; HTTP 500 ... unexpected disconnect"), mesmo após
-          # o fix #5 (compressão). O retry antigo reenviava o job INTEIRO
-          # a cada tentativa — se falhasse sempre pelo mesmo motivo
-          # (payload grande demais), 8 tentativas = 8 falhas garantidas.
-          #
-          # SOLUÇÃO: dividir os ficheiros em lotes de BATCH_SIZE e fazer
-          # um commit+push por lote, reaproveitando o MESMO clone entre
-          # lotes bem-sucedidos (não reclona do zero a cada lote). Cada
-          # lote com sucesso fica permanentemente no shard — se um lote
-          # posterior falhar, os lotes anteriores não se perdem (nada é
-          # reenviado). Em caso de rejeição/erro de um lote específico, só
-          # esse lote é reclonado e reaplicado (não o job inteiro).
           BATCH_SIZE=250
 
-          # ─────────────────────────────────────────────────────────────
-          # FIX CIRÚRGICO #7: "Unable to read current working directory"
-          # ─────────────────────────────────────────────────────────────
-          # PROBLEMA: push_batch() termina cada tentativa dentro de
-          # `/tmp/shard` (por causa do `cd /tmp/shard` no início do loop).
-          # Quando o push falha e o retry chama fresh_clone(), a primeira
-          # coisa que fresh_clone() fazia era `rm -rf /tmp/shard` — MAS
-          # o processo bash ainda estava com o cwd dentro desse mesmo
-          # diretório. Apagar o próprio diretório de trabalho corrente do
-          # shell invalida o cwd do processo: todos os comandos seguintes
-          # (git clone, mkdir, cp) passam a falhar com
-          # "fatal: Unable to read current working directory" / "cannot
-          # create directory" — exatamente a cascata de erros observada
-          # no lote 4 (mkdir e cp falhando antes mesmo do clone, depois
-          # `git clone` e `cd /tmp/shard` falhando pelo mesmo motivo).
-          #
-          # SOLUÇÃO: sair para um diretório seguro (`cd /`) SEMPRE no
-          # início de fresh_clone(), antes de qualquer `rm -rf /tmp/shard`.
-          # Isto garante que o cwd do shell nunca é apagado enquanto está
-          # a ser usado, independentemente de onde a função é chamada.
-          fresh_clone() {
-            cd / || cd "$HOME" || true
-            rm -rf /tmp/shard
-            # SPARSE-CHECKOUT: clone --no-checkout + sparse-checkout init
-            # garante que só a pasta $JOB_ID é materializada, não o resto
-            # do shard (que pode ter 3.5GB). Clone rápido e leve.
-            git clone --depth=1 --filter=blob:none --no-checkout \
-              --single-branch --branch storage-main "$REPO_URL" /tmp/shard 2>&1 || \
-            {
-              # Se a branch não existe (primeiro push), tenta com HEAD
-              git clone --depth=1 --filter=blob:none --no-checkout \
-                "$REPO_URL" /tmp/shard 2>&1
-            }
+          rm -rf /tmp/shard
+          mkdir -p /tmp/shard
+          cd /tmp/shard
+          git init -q
+          git checkout -q -b "$JOB_BRANCH"
+          git remote add origin "$REPO_URL"
+          mkdir -p "$JOB_ID/hls" "$JOB_ID/thumbs"
 
-            cd /tmp/shard
-            git sparse-checkout init --cone
-            git sparse-checkout set "$JOB_ID" 2>/dev/null || true
-
-            # Tenta fazer checkout da branch storage-main se existe
-            git checkout storage-main 2>/dev/null || \
-            {
-              # Se não existe, cria a partir do HEAD (primeiro push)
-              git checkout -b storage-main 2>/dev/null || \
-              git checkout HEAD 2>/dev/null || true
-            }
-
-            mkdir -p "$JOB_ID/hls" "$JOB_ID/thumbs"
-          }
-
-          # push_batch: copia os ficheiros do lote, commit, push. Em falha,
-          # reclona (traz já os lotes anteriores, persistidos remotamente)
-          # e reaplica APENAS este lote — nunca os lotes já enviados.
-          push_batch() {
+          # push_with_retry: repete o MESMO push em caso de falha
+          # transitória. --force é seguro porque a branch é exclusiva
+          # deste job_id (ver comentário acima).
+          push_with_retry() {
             local batch_num="$1" total_batches="$2"
-            shift 2
-            local files=("$@")
             local max_attempts=8
             local attempt=1
-
             while [ $attempt -le $max_attempts ]; do
-              cd /tmp/shard
-              for rel in "${files[@]}"; do
-                mkdir -p "$JOB_ID/$(dirname "$rel")"
-                cp "$WORK_DIR/$rel" "$JOB_ID/$rel"
-              done
-
-              git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
-              git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit \
-                -m "job=${JOB_ID} lote=${batch_num}/${total_batches}" || true
-
-              echo "→ Lote $batch_num/$total_batches (${#files[@]} ficheiros) — tentativa $attempt/$max_attempts..."
-              if git push origin storage-main 2>&1; then
+              echo "→ Lote $batch_num/$total_batches — push tentativa $attempt/$max_attempts..."
+              if git push -q --force origin "$JOB_BRANCH" 2>&1; then
                 echo "✓ Lote $batch_num/$total_batches enviado (tentativa $attempt)"
                 return 0
               fi
-
               local base_wait=$((attempt * 8))
               local jitter=$((RANDOM % 10))
               local wait=$((base_wait + jitter))
-              echo "  ⚠ Push do lote $batch_num falhou (rejeição concorrente ou erro RPC) — sem force-push"
-              echo "  ⚠ A reclonar HEAD actualizado e reaplicar SÓ este lote em ${wait}s (base ${base_wait}s + jitter ${jitter}s)..."
+              echo "  ⚠ Push do lote $batch_num falhou (rede/RPC transitório — branch exclusiva, sem colisão possível) — retry em ${wait}s..."
               sleep $wait
-              fresh_clone
               attempt=$((attempt + 1))
             done
-
             echo "✗ Lote $batch_num/$total_batches falhou após ${max_attempts} tentativas"
             return 1
           }
@@ -1158,9 +1099,7 @@ jobs:
 
           TOTAL=${#FILES_TO_SEND[@]}
           NUM_BATCHES=$(( (TOTAL + BATCH_SIZE - 1) / BATCH_SIZE ))
-          echo "→ $TOTAL ficheiro(s) a enviar em $NUM_BATCHES lote(s) de até $BATCH_SIZE"
-
-          fresh_clone
+          echo "→ $TOTAL ficheiro(s) a enviar em $NUM_BATCHES lote(s) de até $BATCH_SIZE na branch $JOB_BRANCH"
 
           idx=0
           batch_num=0
@@ -1168,11 +1107,20 @@ jobs:
             batch_num=$((batch_num + 1))
             batch=("${FILES_TO_SEND[@]:idx:BATCH_SIZE}")
 
-            if ! push_batch "$batch_num" "$NUM_BATCHES" "${batch[@]}"; then
+            cd /tmp/shard
+            for rel in "${batch[@]}"; do
+              mkdir -p "$JOB_ID/$(dirname "$rel")"
+              cp "$WORK_DIR/$rel" "$JOB_ID/$rel"
+            done
+
+            git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
+            git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit \
+              -m "job=${JOB_ID} lote=${batch_num}/${NUM_BATCHES}" -q || true
+
+            if ! push_with_retry "$batch_num" "$NUM_BATCHES"; then
               cd /
               rm -rf /tmp/shard
               echo "✗ Envio interrompido no lote $batch_num/$NUM_BATCHES"
-              echo "✗ Lotes anteriores já persistidos no shard (sem force-push, nada foi perdido)"
               exit 1
             fi
 
@@ -1181,7 +1129,7 @@ jobs:
 
           cd /
           rm -rf /tmp/shard
-          echo "✓ Todos os $NUM_BATCHES lote(s) enviados para ${SHARD_REPO}: ${JOB_ID}"
+          echo "✓ Todos os $NUM_BATCHES lote(s) enviados para ${SHARD_REPO}@${JOB_BRANCH}: ${JOB_ID}"
 
       # ── Registar no EdgeOne ─────────────────────────────────────────────
       - name: Registar no EdgeOne (Turso + KV)
@@ -1206,7 +1154,8 @@ jobs:
           seg_dur      = int(os.environ.get('SEG_DURATION', '4') or '4')
           storage_owner = os.environ['STORAGE_OWNER']
           shard_repo    = os.environ['SHARD_REPO']
-          raw_base      = f"https://raw.githubusercontent.com/{storage_owner}/{shard_repo}/storage-main/{job_id}"
+          job_branch    = os.environ['JOB_BRANCH']
+          raw_base      = f"https://raw.githubusercontent.com/{storage_owner}/{shard_repo}/{job_branch}/{job_id}"
 
           try:    metadata = json.loads(os.environ.get('METADATA','{}'))
           except: metadata = {}
@@ -1240,7 +1189,7 @@ jobs:
             'bitrate':probe.get('bitrate', 0),'segmentCount':seg_count,'segDuration':seg_dur,'videoID':job_id,'cdnUrls':cdn_urls,
             'encrypted':True,'encryption':'chacha20-chunk-v2','container':'fmp4','segExt':'bin',
             'masterUrl':f"{raw_base}/master.m3u8",'noncesUrl':f"{raw_base}/nonces.json",
-            'storageRepo': shard_repo, 'storageOwner': storage_owner,
+            'storageRepo': shard_repo, 'storageOwner': storage_owner, 'storageBranch': job_branch,
             'seasonNumber':season_number_env,'episodeNumber':episode_number_env,'episodeTitle':episode_title_env,
           }
           payload = json.dumps(body).encode()
