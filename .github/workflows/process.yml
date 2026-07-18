@@ -122,9 +122,25 @@ jobs:
 
           print(f"Coordinator: {metadata.get('title','?')} S{season_num:02d} | {url[:70]}...")
 
-          ses = lt.session({'listen_interfaces': '0.0.0.0:6882'})
+          # DHT_SETTINGS: 'enable_dht' NÃO estava a ser definido em lado
+          # nenhum (nem na criação da sessão nem no apply_settings
+          # seguinte) — sem isto, dependendo do build do libtorrent, o
+          # DHT pode nunca arrancar, ficando o coordinator dependente só
+          # dos trackers do magnet. Documentado como requisito explícito
+          # em arvidn/libtorrent#7749 ("DHT seeding in python"). Também
+          # substitui add_dht_router() (deprecated, gera warning) pelo
+          # equivalente moderno via settings pack: 'dht_bootstrap_nodes'.
+          ses = lt.session({
+            'listen_interfaces':       '0.0.0.0:6882',
+            'enable_dht':              True,
+            'enable_lsd':              True,
+            'use_dht_as_fallback':     True,
+            'dht_restrict_routing_ips': False,
+            'dht_bootstrap_nodes':     'router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881,dht.aelitis.com:6881',
+          })
           try: ses.apply_settings({'connections_limit':200,'active_downloads':1,'active_seeds':0})
           except Exception as e: print(f"  apply_settings parcial: {e}")
+          print(f"  DHT ativo: {ses.is_dht_running()}")
 
           os.makedirs('/tmp/coord_meta', exist_ok=True)
 
@@ -145,12 +161,6 @@ jobs:
 
           print("  Aguardando metadados...")
           t0 = time.time()
-          try:
-            ses.add_dht_router("router.bittorrent.com", 6881)
-            ses.add_dht_router("router.utorrent.com", 6881)
-            ses.add_dht_router("dht.transmissionbt.com", 6881)
-          except Exception as e:
-            print(f"  ⚠ add_dht_router parcial: {e}")
 
           METADATA_TIMEOUT = 900
           while not handle.status().has_metadata:
@@ -162,7 +172,8 @@ jobs:
             elapsed = int(time.time() - t0)
             if elapsed % 15 == 0 and elapsed > 0:
               st = handle.status()
-              print(f"  ... {elapsed}s | peers: {st.num_peers}")
+              dht_nodes = ses.status().dht_nodes if hasattr(ses.status(), 'dht_nodes') else '?'
+              print(f"  ... {elapsed}s | peers: {st.num_peers} | dht_nodes: {dht_nodes}")
 
           info = handle.get_torrent_info()
           fs   = info.files()
@@ -335,9 +346,22 @@ jobs:
           dest_dir = os.environ['WORK_DIR'] + '/incoming'
           MAX_WAIT = 3600
 
-          ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
+          # Ver comentário DHT_SETTINGS no step do coordinator — mesma
+          # correção: 'enable_dht' nunca era definido, e este bloco nem
+          # sequer chamava add_dht_router, dependendo só dos trackers do
+          # magnet e do DHT default (que pode estar desligado consoante
+          # o build do libtorrent).
+          ses = lt.session({
+            'listen_interfaces':       '0.0.0.0:6881',
+            'enable_dht':              True,
+            'enable_lsd':              True,
+            'use_dht_as_fallback':     True,
+            'dht_restrict_routing_ips': False,
+            'dht_bootstrap_nodes':     'router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881,dht.aelitis.com:6881',
+          })
           try: ses.apply_settings({'connections_limit':200,'active_downloads':1,'active_seeds':0})
           except Exception as e: print(f"⚠ apply_settings parcial: {e}")
+          print(f"  DHT ativo: {ses.is_dht_running()}")
 
           params = lt.add_torrent_params()
           params.save_path = dest_dir
