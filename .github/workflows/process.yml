@@ -42,10 +42,6 @@ on:
         description: 'Índices dos ficheiros no torrent'
         required: false
         default: ''
-      coordinator_queue:
-        description: 'INTERNO: fila JSON de episódios pendentes (chaining directo via GitHub API, sem passar pelo dispatcher Render)'
-        required: false
-        default: ''
 
 jobs:
   process:
@@ -271,38 +267,53 @@ jobs:
             print("ERRO: STORAGE_TOKEN ou GITHUB_REPOSITORY indisponíveis")
             sys.exit(1)
 
-          first_child, *rest_children = children
-          first_child['coordinator_queue'] = json.dumps(rest_children)
+          # ─────────────────────────────────────────────────────────────
+          # DISPATCH PARALELO — cada episódio escreve na sua própria
+          # branch exclusiva (job-<job_id>), portanto não há mais razão
+          # para o encadeamento FIFO (coordinator_queue) que existia só
+          # para serializar episódios e evitar colisões de push na
+          # branch partilhada storage-main. Essa causa já não existe,
+          # então todos os episódios são disparados de imediato.
+          def dispatch_child(child, index, total):
+            for attempt in range(1, 5):
+              r = subprocess.run([
+                'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
+                '-H', f'Authorization: Bearer {storage_token}',
+                '-H', 'Accept: application/vnd.github+json',
+                '-H', 'X-GitHub-Api-Version: 2022-11-28',
+                f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
+                '-d', json.dumps({'ref': 'main', 'inputs': child}),
+              ], capture_output=True, text=True)
+              code = r.stdout.strip()
+              if code == '204':
+                print(f"  ✓ Episódio {index}/{total} disparado: {child['job_id']}")
+                return True
+              elif code.startswith('5') or code == '':
+                wait = [10, 30, 60][attempt-1] if attempt <= 3 else 60
+                print(f"  ⚠ Episódio {index}/{total} tentativa {attempt}/4 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
+                time.sleep(wait)
+              else:
+                print(f"  ✗ Episódio {index}/{total} erro HTTP {code} (não retry)")
+                return False
+            print(f"  ✗ Episódio {index}/{total} falhou após 4 tentativas")
+            return False
 
-          ok = False
-          for attempt in range(1, 5):
-            r = subprocess.run([
-              'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
-              '-H', f'Authorization: Bearer {storage_token}',
-              '-H', 'Accept: application/vnd.github+json',
-              '-H', 'X-GitHub-Api-Version: 2022-11-28',
-              f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
-              '-d', json.dumps({'ref': 'main', 'inputs': first_child}),
-            ], capture_output=True, text=True)
-            code = r.stdout.strip()
-            if code == '204':
-              print(f"  ✓ Episódio 1/{len(children)} disparado: {first_child['job_id']}")
-              print(f"  ✓ {len(rest_children)} episódio(s) encadeado(s) na fila")
-              ok = True
-              break
-            elif code.startswith('5') or code == '':
-              wait = [10, 30, 60][attempt-1] if attempt <= 3 else 60
-              print(f"  ⚠ Tentativa {attempt}/4 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
-              time.sleep(wait)
-            else:
-              print(f"  ✗ Erro HTTP {code} (não retry)")
-              break
+          ok_count = 0
+          for i, child in enumerate(children, start=1):
+            if dispatch_child(child, i, len(children)):
+              ok_count += 1
+            # Pequeno espaçamento entre chamadas — não serializa o
+            # processamento (cada job filho corre em paralelo assim que
+            # é aceite), apenas evita disparar todos os POSTs no mesmo
+            # instante e acionar o secondary rate-limit de abuso da API
+            # do GitHub em séries com muitos episódios.
+            if i < len(children):
+              time.sleep(1.5)
 
-          if not ok:
-            print("✗ Falha ao disparar primeiro episódio — coordinator abortado")
+          fail_count = len(children) - ok_count
+          print(f"\n✅ Coordinator: {ok_count}/{len(children)} episódio(s) disparados em paralelo" + (f" | ✗ {fail_count} falha(s)" if fail_count else ""))
+          if ok_count == 0:
             sys.exit(1)
-
-          print(f"\n✅ Coordinator: cadeia FIFO iniciada — {len(children)} episódio(s)")
           sys.exit(0)
           PYEOF
 
@@ -1241,66 +1252,6 @@ jobs:
             echo "✗ Webhook falhou (HTTP $HTTP_CODE) — não fatal, resposta:"
             cat /tmp/wh_resp.txt 2>/dev/null || true
           fi
-
-      # ── Encadeamento do coordinator: disparar próximo episódio da fila ──
-      - name: '[Coordinator] Disparar próximo episódio da fila'
-        if: always() && inputs.coordinator_queue != ''
-        env:
-          STORAGE_TOKEN:     ${{ secrets.STORAGE_GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          COORDINATOR_QUEUE: ${{ inputs.coordinator_queue }}
-        run: |
-          python3 << 'PYEOF'
-          import os, json, subprocess, time
-
-          queue_raw = os.environ.get('COORDINATOR_QUEUE', '').strip()
-          if not queue_raw:
-            print("  Fila vazia — nada a encadear")
-            raise SystemExit(0)
-
-          try:
-            queue = json.loads(queue_raw)
-          except Exception as e:
-            print(f"  ✗ coordinator_queue inválida: {e}")
-            raise SystemExit(0)
-
-          if not queue:
-            print("  ✓ Fila vazia — coordinator concluído (último episódio já disparado)")
-            raise SystemExit(0)
-
-          next_child, *rest = queue
-          next_child = dict(next_child)
-          next_child['coordinator_queue'] = json.dumps(rest)
-
-          storage_token = os.environ['STORAGE_TOKEN']
-          github_repo   = os.environ['GITHUB_REPOSITORY']
-
-          ok = False
-          for attempt in range(1, 5):
-            r = subprocess.run([
-              'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
-              '-H', f'Authorization: Bearer {storage_token}',
-              '-H', 'Accept: application/vnd.github+json',
-              '-H', 'X-GitHub-Api-Version: 2022-11-28',
-              f'https://api.github.com/repos/{github_repo}/actions/workflows/process.yml/dispatches',
-              '-d', json.dumps({'ref': 'main', 'inputs': next_child}),
-            ], capture_output=True, text=True)
-            code = r.stdout.strip()
-            if code == '204':
-              print(f"  ✓ Próximo episódio disparado: {next_child.get('job_id')} | fila restante: {len(rest)}")
-              ok = True
-              break
-            elif code.startswith('5') or code == '':
-              wait = [10, 30, 60][attempt-1] if attempt <= 3 else 60
-              print(f"  ⚠ Tentativa {attempt}/4 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
-              time.sleep(wait)
-            else:
-              print(f"  ✗ Erro HTTP {code} (não retry): {r.stdout[:200]}")
-              break
-
-          if not ok:
-            print(f"  ✗ Falha ao disparar próximo episódio após tentativas — cadeia interrompida em {next_child.get('job_id')}")
-          PYEOF
 
       - name: Cleanup
         if: always()
