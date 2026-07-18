@@ -130,6 +130,8 @@ jobs:
           # em arvidn/libtorrent#7749 ("DHT seeding in python"). Também
           # substitui add_dht_router() (deprecated, gera warning) pelo
           # equivalente moderno via settings pack: 'dht_bootstrap_nodes'.
+          # alert_mask ativa todas as categorias de alertas — necessário
+          # para saber SE um tracker respondeu/recusou, não só "peers: 0".
           ses = lt.session({
             'listen_interfaces':       '0.0.0.0:6882',
             'enable_dht':              True,
@@ -137,10 +139,29 @@ jobs:
             'use_dht_as_fallback':     True,
             'dht_restrict_routing_ips': False,
             'dht_bootstrap_nodes':     'router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881,dht.aelitis.com:6881',
+            'alert_mask':              0xffffffff,
           })
           try: ses.apply_settings({'connections_limit':200,'active_downloads':1,'active_seeds':0})
           except Exception as e: print(f"  apply_settings parcial: {e}")
-          print(f"  DHT ativo: {ses.is_dht_running()}")
+
+          def log_alerts(ses):
+            """Lê e imprime alertas de tracker pendentes. Devolve True se
+            algum tracker respondeu com sucesso (mesmo que com 0 peers)."""
+            tracker_replied = False
+            for a in ses.pop_alerts():
+              name = type(a).__name__
+              try:
+                msg = a.message()
+              except Exception:
+                msg = str(a)
+              if 'tracker_error' in name:
+                print(f"  ✗ {name}: {msg}")
+              elif 'tracker_reply' in name:
+                tracker_replied = True
+                print(f"  ✓ {name}: {msg}")
+              elif 'tracker_warning' in name:
+                print(f"  ⚠ {name}: {msg}")
+            return tracker_replied
 
           os.makedirs('/tmp/coord_meta', exist_ok=True)
 
@@ -161,19 +182,28 @@ jobs:
 
           print("  Aguardando metadados...")
           t0 = time.time()
+          tracker_replied = False
+          EARLY_FAIL_TIMEOUT = 180  # 3min sem NENHUM sinal = torrent morto
 
           METADATA_TIMEOUT = 900
           while not handle.status().has_metadata:
-            if time.time() - t0 > METADATA_TIMEOUT:
+            if log_alerts(ses):
+              tracker_replied = True
+            elapsed = int(time.time() - t0)
+            st = handle.status()
+            dht_nodes = ses.status().dht_nodes if hasattr(ses.status(), 'dht_nodes') else 0
+            if (elapsed > EARLY_FAIL_TIMEOUT and st.num_peers == 0
+                and not tracker_replied and dht_nodes == 0):
+              print(f"ERRO: {EARLY_FAIL_TIMEOUT}s sem peers, sem resposta de tracker e sem nós DHT — torrent sem seeders/trackers vivos. A abortar cedo (não esperar até {METADATA_TIMEOUT}s).")
+              ses.remove_torrent(handle)
+              sys.exit(1)
+            if elapsed > METADATA_TIMEOUT:
               print(f"ERRO: timeout metadados ({METADATA_TIMEOUT}s)")
               ses.remove_torrent(handle)
               sys.exit(1)
             ses.wait_for_alert(1000)
-            elapsed = int(time.time() - t0)
             if elapsed % 15 == 0 and elapsed > 0:
-              st = handle.status()
-              dht_nodes = ses.status().dht_nodes if hasattr(ses.status(), 'dht_nodes') else '?'
-              print(f"  ... {elapsed}s | peers: {st.num_peers} | dht_nodes: {dht_nodes}")
+              print(f"  ... {elapsed}s | peers: {st.num_peers} | dht_nodes: {dht_nodes} | tracker_ok: {tracker_replied}")
 
           info = handle.get_torrent_info()
           fs   = info.files()
@@ -351,6 +381,10 @@ jobs:
           # sequer chamava add_dht_router, dependendo só dos trackers do
           # magnet e do DHT default (que pode estar desligado consoante
           # o build do libtorrent).
+          # alert_mask ativa TODAS as categorias de alertas — sem isto
+          # não há como saber SE um tracker respondeu, recusou, ou nunca
+          # foi contactado: o loop anterior corria 3600s totalmente às
+          # cegas (só 1 print, no início, se pct nunca mudasse de 0%).
           ses = lt.session({
             'listen_interfaces':       '0.0.0.0:6881',
             'enable_dht':              True,
@@ -358,10 +392,31 @@ jobs:
             'use_dht_as_fallback':     True,
             'dht_restrict_routing_ips': False,
             'dht_bootstrap_nodes':     'router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881,dht.aelitis.com:6881',
+            'alert_mask':              0xffffffff,
           })
           try: ses.apply_settings({'connections_limit':200,'active_downloads':1,'active_seeds':0})
           except Exception as e: print(f"⚠ apply_settings parcial: {e}")
-          print(f"  DHT ativo: {ses.is_dht_running()}")
+
+          def log_alerts(ses):
+            """Lê e imprime alertas de tracker/DHT pendentes. Devolve True se
+            algum tracker respondeu com sucesso (mesmo que com 0 peers)."""
+            tracker_replied = False
+            for a in ses.pop_alerts():
+              name = type(a).__name__
+              try:
+                msg = a.message()
+              except Exception:
+                msg = str(a)
+              if 'tracker_error' in name:
+                print(f"  ✗ {name}: {msg}")
+              elif 'tracker_reply' in name:
+                tracker_replied = True
+                print(f"  ✓ {name}: {msg}")
+              elif 'tracker_warning' in name:
+                print(f"  ⚠ {name}: {msg}")
+              elif 'tracker_announce' in name:
+                print(f"  → {name}: {msg}")
+            return tracker_replied
 
           params = lt.add_torrent_params()
           params.save_path = dest_dir
@@ -402,20 +457,27 @@ jobs:
               print("  ⚠ Sem metadados — descarregando tudo (fallback)")
 
           print(f"  Destino: {dest_dir}")
-          last_pct    = -1
-          start_t     = time.time()
-          stall_t     = time.time()
-          stall_bytes = 0
+          last_pct       = -1
+          last_log_t     = 0
+          start_t        = time.time()
+          stall_t        = time.time()
+          stall_bytes    = 0
+          tracker_replied = False
+          EARLY_FAIL_TIMEOUT = 180  # 3min sem NENHUM sinal (peers/dht/tracker) = torrent morto
 
           while True:
             s   = handle.status()
-            pct = int(s.progress * 100)
-            if pct != last_pct:
-              dl_kb   = s.download_rate // 1024
-              peers   = s.num_peers
-              elapsed = int(time.time() - start_t)
-              print(f"  [{elapsed:4d}s] {pct:3d}% | {dl_kb:6d} KB/s | peers: {peers}")
-              last_pct = pct
+            if log_alerts(ses):
+              tracker_replied = True
+            pct     = int(s.progress * 100)
+            elapsed = int(time.time() - start_t)
+            if pct != last_pct or elapsed - last_log_t >= 30:
+              dl_kb     = s.download_rate // 1024
+              peers     = s.num_peers
+              dht_nodes = ses.status().dht_nodes if hasattr(ses.status(), 'dht_nodes') else '?'
+              print(f"  [{elapsed:4d}s] {pct:3d}% | {dl_kb:6d} KB/s | peers: {peers} | dht_nodes: {dht_nodes} | tracker_ok: {tracker_replied}")
+              last_pct   = pct
+              last_log_t = elapsed
             current_bytes = int(s.progress * (s.total_wanted or 1))
             if current_bytes > stall_bytes:
               stall_bytes = current_bytes
@@ -426,6 +488,17 @@ jobs:
             if s.is_seeding or s.progress >= 1.0:
               print(f"✓ Download completo ({int(time.time()-start_t)}s)")
               break
+            # FALHA RÁPIDA: sem peers, sem resposta de tracker e sem nós
+            # DHT após EARLY_FAIL_TIMEOUT — o torrent está morto (sem
+            # seeders/trackers funcionais). Sem isto, cada job destes
+            # queimava os 3600s inteiros do MAX_WAIT às cegas — ao
+            # multiplicar por N episódios de uma série, isto esgota
+            # rapidamente os minutos do plano GitHub Actions.
+            if (elapsed > EARLY_FAIL_TIMEOUT and s.num_peers == 0
+                and not tracker_replied
+                and (not hasattr(ses.status(), 'dht_nodes') or ses.status().dht_nodes == 0)):
+              print(f"✗ {EARLY_FAIL_TIMEOUT}s sem peers, sem resposta de tracker e sem nós DHT — torrent sem seeders/trackers vivos. A abortar cedo (não esperar até {MAX_WAIT}s).")
+              sys.exit(1)
             if (time.time() - start_t) > MAX_WAIT:
               print(f'⚠ Timeout após {MAX_WAIT}s — progresso: {pct}%')
               if pct == 0: sys.exit(1)
